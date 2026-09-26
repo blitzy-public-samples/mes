@@ -27,8 +27,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -45,6 +47,7 @@ import com.qcadoo.mes.orders.constants.OrdersConstants;
 import com.qcadoo.mes.orders.constants.ProductionLineScheduleFields;
 import com.qcadoo.mes.orders.constants.ProductionLineSchedulePositionFields;
 import com.qcadoo.mes.orders.listeners.ProductionLinePositionNewData;
+import com.qcadoo.mes.technologies.constants.TechnologiesConstants;
 import com.qcadoo.model.api.DataDefinition;
 import com.qcadoo.model.api.DataDefinitionService;
 import com.qcadoo.model.api.Entity;
@@ -76,14 +79,23 @@ import com.qcadoo.model.api.search.SearchRestrictions;
  * <li>With no predecessor the caches start empty and the scheduling services use their own database lookups.</li>
  * <li>Every candidate list and predecessor is read before the first executor call. The moved position is never recomputed, and
  * each position is recomputed at most once.</li>
+ * <li>After those reads and before the first scheduling service or executor call, the orders of all candidates of the call are
+ * loaded with one query, and the technologies of those orders with one more query, each over the distinct ids in chain order.
+ * A call without candidates runs neither query.</li>
+ * <li>Each candidate is recomputed with its loaded order, passed to the scheduling services and put into the order cache, and
+ * with the loaded technology of that order, passed to the executor.</li>
  * </ul>
- * The service joins the caller's transaction. When a candidate has no order, or the executor produces no data for the chain's
- * production line (including when the schedule names no known calculation basis), it throws
- * {@link ProductionMaintenanceGanttMoveService.MoveRejectedException} with
- * {@link ProductionMaintenanceGanttMoveService#RECOMPUTE_FAILED_KEY}.
+ * The service joins the caller's transaction. It throws {@link ProductionMaintenanceGanttMoveService.MoveRejectedException} with
+ * {@link ProductionMaintenanceGanttMoveService#RECOMPUTE_FAILED_KEY}:
+ * <ul>
+ * <li>before any executor call, when a candidate has no order, an order has no technology, or the load does not return a
+ * candidate's order or its technology;</li>
+ * <li>when the executor produces no data for the chain's production line, including when the schedule names no known
+ * calculation basis.</li>
+ * </ul>
  * <p>
  * Example, as called by the move service after it saved the moved position:
- * 
+ *
  * <pre>
  * productionMaintenanceGanttRecomputeService.recompute(schedule, savedPosition, originLine, vacatedStart, targetLine,
  *         moveRequest.getDateFrom());
@@ -110,7 +122,7 @@ public class ProductionMaintenanceGanttRecomputeService {
 
     /**
      * Recomputes positions after the affected start on the origin and destination rows of a moved position.
-     * 
+     *
      * @param schedule
      *            production line schedule that holds the moved position
      * @param movedPosition
@@ -160,17 +172,22 @@ public class ProductionMaintenanceGanttRecomputeService {
         }
         List<Entity> destinationCandidates = findCandidates(positionDD, schedule, destinationLine, movedPositionId, slotStart);
 
+        List<Entity> chainCandidates = new ArrayList<Entity>(originCandidates);
+        chainCandidates.addAll(destinationCandidates);
+        CandidateReferences references = loadCandidateReferences(chainCandidates);
+
         if (originLine != null) {
             Map<Long, Date> originFinishCache = new HashMap<Long, Date>();
             Map<Long, Entity> originOrderCache = new HashMap<Long, Entity>();
             seedCaches(originPredecessor, originLine, originFinishCache, originOrderCache);
-            processChain(schedule, basis, originLine, originCandidates, originFinishCache, originOrderCache);
+            processChain(schedule, basis, originLine, originCandidates, references, originFinishCache, originOrderCache);
         }
 
         Map<Long, Date> destinationFinishCache = new HashMap<Long, Date>();
         Map<Long, Entity> destinationOrderCache = new HashMap<Long, Entity>();
         seedCaches(movedPosition, destinationLine, destinationFinishCache, destinationOrderCache);
-        processChain(schedule, basis, destinationLine, destinationCandidates, destinationFinishCache, destinationOrderCache);
+        processChain(schedule, basis, destinationLine, destinationCandidates, references, destinationFinishCache,
+                destinationOrderCache);
     }
 
     private void recomputeSameRow(final DataDefinition positionDD, final Entity schedule,
@@ -181,6 +198,7 @@ public class ProductionMaintenanceGanttRecomputeService {
 
         List<Entity> candidates = findCandidates(positionDD, schedule, line, movedPositionId, affectedStart);
         Entity predecessor = findPredecessor(positionDD, schedule, line, movedPositionId, affectedStart);
+        CandidateReferences references = loadCandidateReferences(candidates);
 
         List<Entity> beforeAnchor = new ArrayList<Entity>();
         List<Entity> afterAnchor = new ArrayList<Entity>();
@@ -196,9 +214,9 @@ public class ProductionMaintenanceGanttRecomputeService {
         Map<Long, Date> finishCache = new HashMap<Long, Date>();
         Map<Long, Entity> orderCache = new HashMap<Long, Entity>();
         seedCaches(predecessor, line, finishCache, orderCache);
-        processChain(schedule, basis, line, beforeAnchor, finishCache, orderCache);
+        processChain(schedule, basis, line, beforeAnchor, references, finishCache, orderCache);
         seedCaches(movedPosition, line, finishCache, orderCache);
-        processChain(schedule, basis, line, afterAnchor, finishCache, orderCache);
+        processChain(schedule, basis, line, afterAnchor, references, finishCache, orderCache);
     }
 
     /**
@@ -250,28 +268,81 @@ public class ProductionMaintenanceGanttRecomputeService {
     }
 
     /**
-     * Recomputes the given positions one after another on one production line, sharing the chain caches.
+     * Loads the orders of the given candidates with one query and the technologies of those orders with one more query, each
+     * over the distinct ids in candidate order, and returns them mapped by id. An empty candidate list runs neither query.
+     *
+     * @throws ProductionMaintenanceGanttMoveService.MoveRejectedException
+     *             with {@link ProductionMaintenanceGanttMoveService#RECOMPUTE_FAILED_KEY} when a candidate has no order, a loaded
+     *             order has no technology, or the load does not return an order or a technology
      */
-    private void processChain(final Entity schedule, final DurationOfOrderCalculatedOnBasis basis, final Entity line,
-            final List<Entity> candidates, final Map<Long, Date> finishCache, final Map<Long, Entity> orderCache) {
-        LOG.debug("Recomputing {} production line schedule positions on production line {}", candidates.size(), line.getId());
-        Date scheduleStartTime = schedule.getDateField(ProductionLineScheduleFields.START_TIME);
+    private CandidateReferences loadCandidateReferences(final List<Entity> candidates) {
+        Map<Long, Entity> ordersById = new HashMap<Long, Entity>();
+        Map<Long, Entity> technologiesById = new HashMap<Long, Entity>();
+        if (candidates.isEmpty()) {
+            return new CandidateReferences(ordersById, technologiesById);
+        }
+
+        Set<Long> orderIds = new LinkedHashSet<Long>();
         for (Entity candidate : candidates) {
-            recomputePosition(basis, line, scheduleStartTime, candidate, finishCache, orderCache);
+            Entity order = requirePresent(candidate.getBelongsToField(ProductionLineSchedulePositionFields.ORDER));
+            orderIds.add(order.getId());
+        }
+        putByIds(getOrderDD(), orderIds, ordersById);
+
+        Set<Long> technologyIds = new LinkedHashSet<Long>();
+        for (Long orderId : orderIds) {
+            Entity loadedOrder = requirePresent(ordersById.get(orderId));
+            Entity technology = requirePresent(loadedOrder.getBelongsToField(OrderFields.TECHNOLOGY));
+            technologyIds.add(technology.getId());
+        }
+        putByIds(getTechnologyDD(), technologyIds, technologiesById);
+
+        for (Long technologyId : technologyIds) {
+            requirePresent(technologiesById.get(technologyId));
+        }
+
+        LOG.debug("Loaded {} orders and {} technologies of {} production line schedule positions to recompute", new Object[] {
+                ordersById.size(), technologiesById.size(), candidates.size() });
+        return new CandidateReferences(ordersById, technologiesById);
+    }
+
+    /**
+     * Reads the entities of the data definition whose id is one of the given ids with one query and puts each into the map
+     * under its id.
+     */
+    private void putByIds(final DataDefinition dataDefinition, final Set<Long> ids, final Map<Long, Entity> entitiesById) {
+        List<Entity> entities = dataDefinition.find().add(SearchRestrictions.in(L_ID, ids)).list().getEntities();
+        for (Entity entity : entities) {
+            entitiesById.put(entity.getId(), entity);
         }
     }
 
     /**
-     * Recomputes one position on the given production line with the executor service of the calculation basis, updates the
-     * chain caches with its new finish date and order, and saves it through the same executor service.
+     * Recomputes the given positions one after another on one production line, sharing the chain caches.
+     */
+    private void processChain(final Entity schedule, final DurationOfOrderCalculatedOnBasis basis, final Entity line,
+            final List<Entity> candidates, final CandidateReferences references, final Map<Long, Date> finishCache,
+            final Map<Long, Entity> orderCache) {
+        LOG.debug("Recomputing {} production line schedule positions on production line {}", candidates.size(), line.getId());
+        Date scheduleStartTime = schedule.getDateField(ProductionLineScheduleFields.START_TIME);
+        for (Entity candidate : candidates) {
+            recomputePosition(basis, line, scheduleStartTime, candidate, references, finishCache, orderCache);
+        }
+    }
+
+    /**
+     * Recomputes one position on the given production line with its loaded order and the loaded technology of that order,
+     * using the executor service of the calculation basis, updates the chain caches with its new finish date and loaded
+     * order, and saves it through the same executor service.
      */
     private void recomputePosition(final DurationOfOrderCalculatedOnBasis basis, final Entity line, final Date scheduleStartTime,
-            final Entity candidate, final Map<Long, Date> finishCache, final Map<Long, Entity> orderCache) {
-        Entity order = requirePresent(candidate.getBelongsToField(ProductionLineSchedulePositionFields.ORDER));
+            final Entity candidate, final CandidateReferences references, final Map<Long, Date> finishCache,
+            final Map<Long, Entity> orderCache) {
+        Entity order = references.orderOf(candidate);
         Date finishDate = productionLineScheduleService.getFinishDate(finishCache, scheduleStartTime, line, order);
         finishDate = productionLineScheduleService.getFinishDateWithChildren(candidate, finishDate);
         Entity previousOrder = productionLineScheduleService.getPreviousOrder(orderCache, line, finishDate);
-        Entity technology = order.getBelongsToField(OrderFields.TECHNOLOGY);
+        Entity technology = references.technologyOf(order);
 
         Map<Long, ProductionLinePositionNewData> positionNewData = new HashMap<Long, ProductionLinePositionNewData>();
         if (DurationOfOrderCalculatedOnBasis.TIME_CONSUMING_TECHNOLOGY == basis) {
@@ -324,6 +395,46 @@ public class ProductionMaintenanceGanttRecomputeService {
     private DataDefinition getPositionDD() {
         return dataDefinitionService.get(OrdersConstants.PLUGIN_IDENTIFIER,
                 OrdersConstants.MODEL_PRODUCTION_LINE_SCHEDULE_POSITION);
+    }
+
+    private DataDefinition getOrderDD() {
+        return dataDefinitionService.get(OrdersConstants.PLUGIN_IDENTIFIER, OrdersConstants.MODEL_ORDER);
+    }
+
+    private DataDefinition getTechnologyDD() {
+        return dataDefinitionService.get(TechnologiesConstants.PLUGIN_IDENTIFIER, TechnologiesConstants.MODEL_TECHNOLOGY);
+    }
+
+    /**
+     * The orders of the candidates of one recompute call and the technologies of those orders, as loaded by
+     * {@code loadCandidateReferences}, mapped by id. Every candidate of the call has its order in the map, and every such order
+     * has its technology in the map.
+     */
+    private static final class CandidateReferences {
+
+        private final Map<Long, Entity> ordersById;
+
+        private final Map<Long, Entity> technologiesById;
+
+        private CandidateReferences(final Map<Long, Entity> ordersById, final Map<Long, Entity> technologiesById) {
+            this.ordersById = ordersById;
+            this.technologiesById = technologiesById;
+        }
+
+        /**
+         * Returns the loaded order whose id is the id of the candidate's order.
+         */
+        private Entity orderOf(final Entity candidate) {
+            return ordersById.get(candidate.getBelongsToField(ProductionLineSchedulePositionFields.ORDER).getId());
+        }
+
+        /**
+         * Returns the loaded technology whose id is the id of the given loaded order's technology.
+         */
+        private Entity technologyOf(final Entity order) {
+            return technologiesById.get(order.getBelongsToField(OrderFields.TECHNOLOGY).getId());
+        }
+
     }
 
 }

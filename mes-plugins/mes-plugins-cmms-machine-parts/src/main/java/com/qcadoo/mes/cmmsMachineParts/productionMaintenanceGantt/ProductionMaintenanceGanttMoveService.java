@@ -24,14 +24,17 @@
 package com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt;
 
 import java.sql.SQLException;
+import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.Date;
+import java.util.Deque;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
+import org.apache.commons.lang3.StringEscapeUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.json.JSONObject;
 import org.slf4j.Logger;
@@ -65,7 +68,7 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * <li>loads the position named by the move request and requires it to belong to the production line schedule named under
  * {@link ProductionMaintenanceGanttChartItemResolver#CONTEXT_SCHEDULE_ID} in the component context;</li>
  * <li>requires that schedule to be in the {@link ScheduleStateStringValues#DRAFT} state;</li>
- * <li>loads the production line whose number equals the target row name;</li>
+ * <li>loads the one production line whose number equals the target row name; none or several reject;</li>
  * <li>runs {@link ProductionMaintenanceGanttMoveValidator#validate(Entity, Entity, GanttChartMoveRequest)} against the position
  * as stored;</li>
  * <li>saves the position with the target production line and the dropped start and end through
@@ -80,21 +83,28 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * transaction back, leaving no change of the move persisted; a conflict detected by the database at commit propagates to the
  * caller as well.
  * <p>
- * Example, as called from a {@code moveItem} listener that runs outside any transaction:
+ * Example, as called from a {@code moveItem} listener that runs outside any transaction, such as
+ * {@link com.qcadoo.mes.cmmsMachineParts.listeners.ProductionMaintenanceGanttListeners}. The {@code try} block holds only the
+ * {@code move} call, and {@code acceptMove} runs after it, outside the conflict classification:
  *
  * <pre>
  * try {
  *     productionMaintenanceGanttMoveService.move(moveRequest);
- *     gantt.acceptMove();
  * } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
  *     gantt.rejectMove(e.getMessageKey(), e.getArgs());
+ *
+ *     return;
  * } catch (RuntimeException e) {
  *     if (ProductionMaintenanceGanttMoveService.isConcurrencyConflict(e)) {
  *         gantt.rejectMove(ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY);
- *     } else {
- *         throw e;
+ *
+ *         return;
  *     }
+ *
+ *     throw e;
  * }
+ *
+ * gantt.acceptMove();
  * </pre>
  */
 @Service
@@ -111,6 +121,9 @@ public class ProductionMaintenanceGanttMoveService {
 
     /** SQLSTATE reported by the database for a serialization failure. */
     private static final String SERIALIZATION_FAILURE_SQL_STATE = "40001";
+
+    /** Largest number of production lines loaded by the lookup of the target row's production line. */
+    private static final int TARGET_LINE_LOOKUP_LIMIT = 2;
 
     private static final Logger LOG = LoggerFactory.getLogger(ProductionMaintenanceGanttMoveService.class);
 
@@ -162,11 +175,17 @@ public class ProductionMaintenanceGanttMoveService {
             throw staleBoardRejection("schedule no longer in draft", schedule.getId());
         }
 
-        Entity targetLine = findProductionLineByNumber(request.getTargetRowName());
+        List<Entity> targetLines = findProductionLinesByNumber(request.getTargetRowName());
 
-        if (targetLine == null) {
+        if (targetLines.isEmpty()) {
             throw staleBoardRejection("no production line for target row", request.getTargetRowName());
         }
+
+        if (targetLines.size() > 1) {
+            throw staleBoardRejection("several production lines for target row", request.getTargetRowName());
+        }
+
+        Entity targetLine = targetLines.get(0);
 
         Optional<ProductionMaintenanceGanttMoveValidator.MoveRejection> rejection = productionMaintenanceGanttMoveValidator
                 .validate(position, targetLine, request);
@@ -190,15 +209,19 @@ public class ProductionMaintenanceGanttMoveService {
 
         recompute(schedule, savedPosition, originLine, vacatedStart, targetLine, request.getDateFrom());
 
-        LOG.debug("Gantt move of production line schedule position {} to production line {} saved and recomputed",
+        LOG.debug("Gantt move of production line schedule position {} to production line {} saved and recomputed, commit pending",
                 savedPosition.getId(), targetLine.getId());
     }
 
     /**
-     * Returns true when the throwable, or any throwable in its cause chain, is a {@link ConcurrencyFailureException} (which
+     * Returns true when the throwable, or any throwable reachable from it through {@link Throwable#getCause()} and
+     * {@link SQLException#getNextException()} links in any combination, is a {@link ConcurrencyFailureException} (which
      * includes {@link org.springframework.dao.OptimisticLockingFailureException} and
-     * {@link org.springframework.dao.CannotSerializeTransactionException}), or a {@link SQLException} whose SQLSTATE, or the
-     * SQLSTATE of an exception in its {@link SQLException#getNextException()} chain, is {@code 40001}.
+     * {@link org.springframework.dao.CannotSerializeTransactionException}), or a {@link SQLException} whose SQLSTATE is
+     * {@code 40001}. Each reachable throwable is inspected once, so cyclic cause and next-exception links terminate.
+     * <p>
+     * Example: for an SQL exception whose next exception is also its cause, and whose next exception has a {@code 40001} SQL
+     * exception as its cause, the method returns true.
      *
      * @param throwable
      *            the throwable to inspect, may be null
@@ -206,43 +229,46 @@ public class ProductionMaintenanceGanttMoveService {
      */
     public static boolean isConcurrencyConflict(final Throwable throwable) {
         Set<Throwable> visited = Collections.newSetFromMap(new IdentityHashMap<Throwable, Boolean>());
-        Throwable current = throwable;
+        Deque<Throwable> pending = new ArrayDeque<Throwable>();
 
-        while (current != null && visited.add(current)) {
-            if (current instanceof ConcurrencyFailureException) {
+        pushIfPresent(pending, throwable);
+
+        while (!pending.isEmpty()) {
+            Throwable current = pending.pop();
+
+            if (!visited.add(current)) {
+                continue;
+            }
+
+            if (current instanceof ConcurrencyFailureException || isSerializationFailure(current)) {
                 return true;
             }
 
-            if (current instanceof SQLException && isSerializationFailure((SQLException) current, visited)) {
-                return true;
-            }
+            pushIfPresent(pending, current.getCause());
 
-            current = current.getCause();
+            if (current instanceof SQLException) {
+                pushIfPresent(pending, ((SQLException) current).getNextException());
+            }
         }
 
         return false;
     }
 
     /**
-     * Returns true when the SQL exception, or an exception in its next-exception chain, reports the serialization failure
-     * SQLSTATE. Exceptions of the next-exception chain are added to the visited set.
+     * Returns true when the throwable is an {@link SQLException} whose SQLSTATE is {@code 40001}.
      */
-    private static boolean isSerializationFailure(final SQLException sqlException, final Set<Throwable> visited) {
-        if (SERIALIZATION_FAILURE_SQL_STATE.equals(sqlException.getSQLState())) {
-            return true;
+    private static boolean isSerializationFailure(final Throwable throwable) {
+        return throwable instanceof SQLException
+                && SERIALIZATION_FAILURE_SQL_STATE.equals(((SQLException) throwable).getSQLState());
+    }
+
+    /**
+     * Pushes the throwable onto the pending throwables when it is not null.
+     */
+    private static void pushIfPresent(final Deque<Throwable> pending, final Throwable throwable) {
+        if (throwable != null) {
+            pending.push(throwable);
         }
-
-        SQLException next = sqlException.getNextException();
-
-        while (next != null && visited.add(next)) {
-            if (SERIALIZATION_FAILURE_SQL_STATE.equals(next.getSQLState())) {
-                return true;
-            }
-
-            next = next.getNextException();
-        }
-
-        return false;
     }
 
     /**
@@ -302,12 +328,31 @@ public class ProductionMaintenanceGanttMoveService {
     }
 
     /**
-     * Returns an {@link #OPTIMISTIC_LOCK_KEY} rejection and logs the failed precondition at debug level.
+     * Returns an {@link #OPTIMISTIC_LOCK_KEY} rejection and logs the failed precondition at debug level, with its subject
+     * encoded by {@link #toLogValue(Object)}.
      */
     private MoveRejectedException staleBoardRejection(final String failedPrecondition, final Object subject) {
-        LOG.debug("Gantt move rejected with the optimistic lock message: {} ({})", failedPrecondition, subject);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Gantt move rejected with the optimistic lock message: {} ({})", failedPrecondition, toLogValue(subject));
+        }
 
         return new MoveRejectedException(OPTIMISTIC_LOCK_KEY);
+    }
+
+    /**
+     * Returns {@link String#valueOf(Object)} of the value with Java string escaping applied: carriage returns, line feeds, tabs
+     * and other control characters become escape sequences such as {@code \r}, {@code \n} and {@code \t}, characters outside
+     * printable ASCII become unicode escapes, and quotes and backslashes are escaped. A number keeps its digits and null gives
+     * {@code "null"}.
+     * <p>
+     * Example: the row name {@code "L2"} followed by a line feed and {@code "forged"} gives {@code L2\nforged} on one line.
+     *
+     * @param value
+     *            the value to log, may be null
+     * @return the encoded value, never null and free of line breaks
+     */
+    static String toLogValue(final Object value) {
+        return StringEscapeUtils.escapeJava(String.valueOf(value));
     }
 
     /**
@@ -332,15 +377,16 @@ public class ProductionMaintenanceGanttMoveService {
     }
 
     /**
-     * Returns the production line with the given number, or null when the number is null or no production line has it.
+     * Returns at most {@link #TARGET_LINE_LOOKUP_LIMIT} production lines whose number equals the given number, or an empty
+     * list when the number is null.
      */
-    private Entity findProductionLineByNumber(final String number) {
+    private List<Entity> findProductionLinesByNumber(final String number) {
         if (number == null) {
-            return null;
+            return Collections.emptyList();
         }
 
-        return getProductionLineDD().find().add(SearchRestrictions.eq(ProductionLineFields.NUMBER, number)).setMaxResults(1)
-                .uniqueResult();
+        return getProductionLineDD().find().add(SearchRestrictions.eq(ProductionLineFields.NUMBER, number))
+                .setMaxResults(TARGET_LINE_LOOKUP_LIMIT).list().getEntities();
     }
 
     private DataDefinition getPositionDD() {

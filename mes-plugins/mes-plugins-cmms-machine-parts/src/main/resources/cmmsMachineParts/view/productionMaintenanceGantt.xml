@@ -57,5 +57,10 @@
 		<option type="fixedHeight" value="true" />
 		<option type="header" value="false" />
 	</component>
+	<hooks>
+		<beforeRender
+			class="com.qcadoo.mes.cmmsMachineParts.listeners.ProductionMaintenanceGanttListeners"
+			method="fillTitle" />
+	</hooks>
 
 </view>

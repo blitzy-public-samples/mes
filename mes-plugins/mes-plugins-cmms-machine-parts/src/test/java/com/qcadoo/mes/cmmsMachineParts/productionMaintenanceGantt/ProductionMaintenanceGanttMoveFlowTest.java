@@ -38,6 +38,7 @@ import static org.mockito.BDDMockito.given;
 import static org.mockito.Matchers.any;
 import static org.mockito.Matchers.anyString;
 import static org.mockito.Matchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -65,7 +66,6 @@ import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
-import org.mockito.AdditionalAnswers;
 import org.mockito.Matchers;
 import org.mockito.Mock;
 import org.mockito.Mockito;
@@ -78,7 +78,6 @@ import com.qcadoo.localization.api.utils.DateUtils;
 import com.qcadoo.mes.basic.ParameterService;
 import com.qcadoo.mes.basic.ShiftsService;
 import com.qcadoo.mes.cmmsMachineParts.constants.CmmsMachinePartsConstants;
-import com.qcadoo.mes.cmmsMachineParts.constants.PlannedEventFields;
 import com.qcadoo.mes.cmmsMachineParts.listeners.ProductionMaintenanceGanttListeners;
 import com.qcadoo.mes.orders.DefaultProductionLineScheduleServicePPSImpl;
 import com.qcadoo.mes.orders.DefaultProductionLineScheduleServicePSImpl;
@@ -99,6 +98,7 @@ import com.qcadoo.mes.orders.states.constants.ScheduleStateStringValues;
 import com.qcadoo.mes.orders.validators.ProductionLineSchedulePositionValidators;
 import com.qcadoo.mes.productionLines.constants.ProductionLineFields;
 import com.qcadoo.mes.productionLines.constants.ProductionLinesConstants;
+import com.qcadoo.mes.technologies.constants.TechnologiesConstants;
 import com.qcadoo.mes.technologies.constants.TechnologyFields;
 import com.qcadoo.model.api.DataDefinition;
 import com.qcadoo.model.api.DataDefinitionService;
@@ -107,6 +107,7 @@ import com.qcadoo.model.api.search.SearchCriteriaBuilder;
 import com.qcadoo.model.api.search.SearchCriterion;
 import com.qcadoo.model.api.search.SearchOrder;
 import com.qcadoo.model.api.search.SearchOrders;
+import com.qcadoo.model.api.search.SearchQueryBuilder;
 import com.qcadoo.model.api.search.SearchRestrictions;
 import com.qcadoo.model.api.search.SearchResult;
 import com.qcadoo.model.internal.api.DataAccessService;
@@ -131,26 +132,36 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * {@link DisabledSchedulingPsImplementation}, or a Mockito spy of {@link DefaultProductionLineScheduleServicePSImpl} or
  * {@link DefaultProductionLineScheduleServicePPSImpl}. {@link PluginUtilsService} is initialised with a mocked
  * {@link PluginStateResolver}, and {@link SearchRestrictions} converts entities through a mocked {@link DataAccessService}
- * that returns them unchanged.
+ * into references holding only the entity's id: belongs-to criteria built from distinct entities with one id are equal, and a
+ * belongs-to criterion selects the rows whose field holds an entity with that id.
  * <p>
  * Mocked: the data definitions, {@link ShiftsService} (the nearest working date of a start is the start itself),
  * {@link ParameterService}, {@link PluginManager} (every plugin disabled), {@link TranslationService} and the
  * {@link GanttChartComponentState} whose {@code getMoveRequest()} returns the move request. The position data definition
  * answers {@code find()} with a builder that records its criteria, orders and maximum result count, and selects the fixture
- * positions satisfying every recorded criterion in their current state, sorted by the recorded orders. The production line and
- * planned event data definitions answer the same way. Unknown criteria, unknown orders and unknown builder methods fail the
- * test. The order data definition answers every query with an entity without finish date.
+ * positions satisfying every recorded criterion in their current state, sorted by the recorded orders. The production line data
+ * definition answers the same way. The order and technology data definitions answer the same way over the fixture orders
+ * and technologies, accepting only an {@code id in} criterion over the orders of a2 and b2 or over the technologies of those
+ * orders. Unknown criteria, unknown orders and unknown builder methods fail the test. The planned event data definition
+ * answers {@code find(String)} of {@link ProductionMaintenanceGanttChartItemResolver#SHUTDOWN_EVENTS_QUERY} bound with the
+ * move's slot, requires shutdown and the id of the target row with the fixture's planned event rows, and fails on
+ * {@code find()}, on any other query and on any other parameter.
  * <p>
  * Fixture, on 2026-10-01: draft schedule 7 starting at 06:00, calculated on the time consuming technology basis, with
- * production line change allowed. Production lines A (id 1) and B (id 2), both production and active. Row A: a1 06:00-08:00
- * (order ORD-A1), the moved position m 08:00-10:00 (order ORD-M), a2 10:30-12:00 (order ORD-A2). Row B: b1 06:00-09:00 (order
- * ORD-B1), b2 12:00-13:00 (order ORD-B2). No planned event exists. The move request drops m on row B from 10:00 to 12:00, as
- * rendered on row A as ORD-M from 08:00 to 10:00. The recording implementation starts each recomputed position 15 minutes
- * after the finish date it receives and gives it a duration of 60 minutes.
+ * production line change allowed. Production lines A (id 1) and B (id 2), both production and active; the production line
+ * table holds entities of A and B distinct from the ones the positions reference. Row A: a1 06:00-08:00 (order ORD-A1), the
+ * moved position m 08:00-10:00 (order ORD-M), a2 10:30-12:00 (order ORD-A2). Row B: b1 06:00-09:00 (order ORD-B1), b2
+ * 12:00-13:00 (order ORD-B2). Schedule 8 holds, on row A, oA1 07:00-07:30 (order ORD-OA1) and oA2 11:00-11:30 (order
+ * ORD-OA2) and, on row B, oB1 09:00-09:30 (order ORD-OB1) and oB2 12:30-13:00 (order ORD-OB2), each order with its own
+ * technology. No planned event exists. The move request drops m on row B from 10:00 to 12:00, as rendered on row A as ORD-M
+ * from 08:00 to 10:00. The recording implementation starts each recomputed position 15 minutes after the finish date it
+ * receives and gives it a duration of 60 minutes.
  */
 public class ProductionMaintenanceGanttMoveFlowTest {
 
     private static final Long SCHEDULE_ID = 7L;
+
+    private static final Long OTHER_SCHEDULE_ID = 8L;
 
     private static final Long LINE_A_ID = 1L;
 
@@ -165,6 +176,14 @@ public class ProductionMaintenanceGanttMoveFlowTest {
     private static final Long POSITION_B1_ID = 21L;
 
     private static final Long POSITION_B2_ID = 22L;
+
+    private static final Long OTHER_POSITION_A1_ID = 14L;
+
+    private static final Long OTHER_POSITION_A2_ID = 15L;
+
+    private static final Long OTHER_POSITION_B1_ID = 23L;
+
+    private static final Long OTHER_POSITION_B2_ID = 24L;
 
     private static final String LINE_A_NUMBER = "A";
 
@@ -192,6 +211,22 @@ public class ProductionMaintenanceGanttMoveFlowTest {
 
     private static final String B2_END = "2026-10-01 13:00:00";
 
+    private static final String OTHER_A1_START = "2026-10-01 07:00:00";
+
+    private static final String OTHER_A1_END = "2026-10-01 07:30:00";
+
+    private static final String OTHER_A2_START = "2026-10-01 11:00:00";
+
+    private static final String OTHER_A2_END = "2026-10-01 11:30:00";
+
+    private static final String OTHER_B1_START = "2026-10-01 09:00:00";
+
+    private static final String OTHER_B1_END = "2026-10-01 09:30:00";
+
+    private static final String OTHER_B2_START = "2026-10-01 12:30:00";
+
+    private static final String OTHER_B2_END = "2026-10-01 13:00:00";
+
     private static final String SLOT_FROM = "2026-10-01 10:00:00";
 
     private static final String SLOT_TO = "2026-10-01 12:00:00";
@@ -203,6 +238,10 @@ public class ProductionMaintenanceGanttMoveFlowTest {
     private static final String RECOMPUTED_B2_START = "2026-10-01 12:15:00";
 
     private static final String RECOMPUTED_B2_END = "2026-10-01 13:15:00";
+
+    private static final String RECOMPUTED_SAME_ROW_A2_START = "2026-10-01 12:15:00";
+
+    private static final String RECOMPUTED_SAME_ROW_A2_END = "2026-10-01 13:15:00";
 
     private static final String PRODUCTION_SCHEDULING_PLUGIN = "productionScheduling";
 
@@ -228,11 +267,21 @@ public class ProductionMaintenanceGanttMoveFlowTest {
 
     private static final String ORDER_B2_NUMBER = "ORD-B2";
 
+    private static final String ORDER_OTHER_A1_NUMBER = "ORD-OA1";
+
+    private static final String ORDER_OTHER_A2_NUMBER = "ORD-OA2";
+
+    private static final String ORDER_OTHER_B1_NUMBER = "ORD-OB1";
+
+    private static final String ORDER_OTHER_B2_NUMBER = "ORD-OB2";
+
     private static final String ORDERS_FOR_SUBPRODUCTS_GENERATION_PLUGIN = "ordersForSubproductsGeneration";
 
     private static final Long CHANGEOVER_ID = 31L;
 
     private ProductionMaintenanceGanttListeners listeners;
+
+    private ProductionMaintenanceGanttChartItemResolver resolver;
 
     private ProductionLineScheduleServicePSExecutorService psExecutorService;
 
@@ -244,7 +293,7 @@ public class ProductionMaintenanceGanttMoveFlowTest {
     private DataDefinitionService dataDefinitionService;
 
     @Mock
-    private DataDefinition positionDD, productionLineDD, plannedEventDD, orderDD;
+    private DataDefinition positionDD, productionLineDD, plannedEventDD, orderDD, technologyDD;
 
     @Mock
     private ShiftsService shiftsService;
@@ -277,9 +326,9 @@ public class ProductionMaintenanceGanttMoveFlowTest {
 
     private PluginUtilsService previousPluginUtilsService;
 
-    private Entity schedule, parameter, changeover, orderAggregate;
+    private Entity schedule, otherSchedule, parameter, changeover;
 
-    private Entity lineA, lineB;
+    private Entity lineA, lineB, lineAByNumber, lineBByNumber;
 
     private Entity orderA1, orderMoved, orderA2, orderB1, orderB2;
 
@@ -287,10 +336,15 @@ public class ProductionMaintenanceGanttMoveFlowTest {
 
     private Entity positionA1, movedPosition, positionA2, positionB1, positionB2;
 
+    private Entity otherPositionA1, otherPositionA2, otherPositionB1, otherPositionB2;
+
     private final List<Entity> positions = new ArrayList<Entity>();
 
     private final List<Entity> productionLines = new ArrayList<Entity>();
 
+    /**
+     * Projection rows of the planned events the shutdown events query selects; the fixture has none.
+     */
     private final List<Entity> plannedEvents = new ArrayList<Entity>();
 
     /**
@@ -302,7 +356,7 @@ public class ProductionMaintenanceGanttMoveFlowTest {
     public void init() throws Exception {
         MockitoAnnotations.initMocks(this);
 
-        given(dataAccessService.convertToDatabaseEntity(any(Entity.class))).willAnswer(AdditionalAnswers.returnsFirstArg());
+        given(dataAccessService.convertToDatabaseEntity(any(Entity.class))).willAnswer(new DatabaseReferenceAnswer());
 
         previousDataAccessService = swapSearchRestrictionsDataAccessService(dataAccessService);
         previousPluginUtilsService = getPluginUtilsServiceInstance();
@@ -334,21 +388,21 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         stubDateField(schedule, ProductionLineScheduleFields.START_TIME, date(SCHEDULE_START));
         stubBooleanField(schedule, ProductionLineScheduleFields.ALLOW_PRODUCTION_LINE_CHANGE, true);
 
+        otherSchedule = mockEntity(OTHER_SCHEDULE_ID);
+
         parameter = mockEntity(1L);
 
         stubBooleanField(parameter, ParameterFieldsO.CAN_CHANGE_PROD_LINE_FOR_ACCEPTED_ORDERS, false);
 
         changeover = mockEntity(CHANGEOVER_ID);
 
-        orderAggregate = mockEntity();
-
-        stubDateField(orderAggregate, OrderFields.FINISH_DATE, null);
-
         lineA = productionLine(LINE_A_ID, LINE_A_NUMBER);
         lineB = productionLine(LINE_B_ID, LINE_B_NUMBER);
+        lineAByNumber = productionLine(LINE_A_ID, LINE_A_NUMBER);
+        lineBByNumber = productionLine(LINE_B_ID, LINE_B_NUMBER);
 
-        productionLines.add(lineA);
-        productionLines.add(lineB);
+        productionLines.add(lineAByNumber);
+        productionLines.add(lineBByNumber);
 
         technologyMoved = technology(41L);
         technologyA2 = technology(42L);
@@ -366,11 +420,24 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         positionB1 = position("positionB1", POSITION_B1_ID, lineB, orderB1, B1_START, B1_END);
         positionB2 = position("positionB2", POSITION_B2_ID, lineB, orderB2, B2_START, B2_END);
 
+        otherPositionA1 = position(otherSchedule, "otherPositionA1", OTHER_POSITION_A1_ID, lineA, order(56L,
+                ORDER_OTHER_A1_NUMBER, technology(44L)), OTHER_A1_START, OTHER_A1_END);
+        otherPositionA2 = position(otherSchedule, "otherPositionA2", OTHER_POSITION_A2_ID, lineA, order(57L,
+                ORDER_OTHER_A2_NUMBER, technology(45L)), OTHER_A2_START, OTHER_A2_END);
+        otherPositionB1 = position(otherSchedule, "otherPositionB1", OTHER_POSITION_B1_ID, lineB, order(58L,
+                ORDER_OTHER_B1_NUMBER, technology(46L)), OTHER_B1_START, OTHER_B1_END);
+        otherPositionB2 = position(otherSchedule, "otherPositionB2", OTHER_POSITION_B2_ID, lineB, order(59L,
+                ORDER_OTHER_B2_NUMBER, technology(47L)), OTHER_B2_START, OTHER_B2_END);
+
         positions.add(positionA1);
         positions.add(movedPosition);
         positions.add(positionA2);
         positions.add(positionB1);
         positions.add(positionB2);
+        positions.add(otherPositionA1);
+        positions.add(otherPositionA2);
+        positions.add(otherPositionB1);
+        positions.add(otherPositionB2);
     }
 
     private void stubDataDefinitions() {
@@ -381,26 +448,28 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         given(dataDefinitionService.get(CmmsMachinePartsConstants.PLUGIN_IDENTIFIER, CmmsMachinePartsConstants.MODEL_PLANNED_EVENT))
                 .willReturn(plannedEventDD);
         given(dataDefinitionService.get(OrdersConstants.PLUGIN_IDENTIFIER, OrdersConstants.MODEL_ORDER)).willReturn(orderDD);
+        given(dataDefinitionService.get(TechnologiesConstants.PLUGIN_IDENTIFIER, TechnologiesConstants.MODEL_TECHNOLOGY))
+                .willReturn(technologyDD);
 
         FixtureFindAnswer positionFindAnswer = new FixtureFindAnswer(positions, positionConditions(), positionOrders());
         FixtureFindAnswer productionLineFindAnswer = new FixtureFindAnswer(productionLines, productionLineConditions(),
                 new LinkedHashMap<SearchOrder, Comparator<Entity>>());
-        FixtureFindAnswer plannedEventFindAnswer = new FixtureFindAnswer(plannedEvents, plannedEventConditions(),
-                plannedEventOrders());
+        FixtureFindAnswer orderFindAnswer = new FixtureFindAnswer(Arrays.asList(orderA1, orderMoved, orderA2, orderB1, orderB2),
+                idInConditions(Arrays.asList(orderA2.getId(), orderB2.getId())),
+                new LinkedHashMap<SearchOrder, Comparator<Entity>>());
+        FixtureFindAnswer technologyFindAnswer = new FixtureFindAnswer(Arrays.asList(technologyMoved, technologyA2,
+                technologyB2), idInConditions(Arrays.asList(technologyA2.getId(), technologyB2.getId())),
+                new LinkedHashMap<SearchOrder, Comparator<Entity>>());
 
         given(positionDD.get(MOVED_POSITION_ID)).willReturn(movedPosition);
         given(positionDD.save(movedPosition)).willReturn(movedPosition);
         given(positionDD.find()).willAnswer(positionFindAnswer);
         given(productionLineDD.find()).willAnswer(productionLineFindAnswer);
-        given(plannedEventDD.find()).willAnswer(plannedEventFindAnswer);
-        given(orderDD.find()).willAnswer(new Answer<SearchCriteriaBuilder>() {
-
-            @Override
-            public SearchCriteriaBuilder answer(final InvocationOnMock invocation) {
-                return mock(SearchCriteriaBuilder.class, new AggregateCriteriaBuilderAnswer(orderAggregate));
-            }
-
-        });
+        given(plannedEventDD.find()).willAnswer(new FailingAnswer("criteria find() of the planned event data definition"));
+        given(plannedEventDD.find(anyString())).willAnswer(
+                new ShutdownEventsFindAnswer(plannedEvents, shutdownEventsQueryParameters(LINE_B_ID)));
+        given(orderDD.find()).willAnswer(orderFindAnswer);
+        given(technologyDD.find()).willAnswer(technologyFindAnswer);
     }
 
     private void stubServices() {
@@ -419,7 +488,7 @@ public class ProductionMaintenanceGanttMoveFlowTest {
     }
 
     private void wireServices() {
-        ProductionMaintenanceGanttChartItemResolver resolver = new ProductionMaintenanceGanttChartItemResolver();
+        resolver = new ProductionMaintenanceGanttChartItemResolver();
 
         setField(resolver, "dataDefinitionService", dataDefinitionService);
         setField(resolver, "translationService", translationService);
@@ -464,11 +533,19 @@ public class ProductionMaintenanceGanttMoveFlowTest {
 
         setField(listeners, "productionMaintenanceGanttMoveService", moveService);
 
-        GanttChartMoveRequest moveRequest = new GanttChartMoveRequest(item, LINE_B_NUMBER, LINE_A_NUMBER,
-                resolver.positionLabel(movedPosition), MOVED_START, MOVED_END, date(SLOT_FROM), date(SLOT_TO), context(
-                        ProductionMaintenanceGanttChartItemResolver.CONTEXT_SCHEDULE_ID, String.valueOf(SCHEDULE_ID)));
+        GanttChartMoveRequest moveRequest = moveRequest(LINE_B_NUMBER);
 
         given(gantt.getMoveRequest()).willReturn(moveRequest);
+    }
+
+    /**
+     * Returns the move request that drops m on the given row from 10:00 to 12:00, as rendered on row A as ORD-M from 08:00 to
+     * 10:00, with the fixture schedule in the component context.
+     */
+    private GanttChartMoveRequest moveRequest(final String targetRowName) {
+        return new GanttChartMoveRequest(item, targetRowName, LINE_A_NUMBER, resolver.positionLabel(movedPosition), MOVED_START,
+                MOVED_END, date(SLOT_FROM), date(SLOT_TO), context(ProductionMaintenanceGanttChartItemResolver.CONTEXT_SCHEDULE_ID,
+                        String.valueOf(SCHEDULE_ID)));
     }
 
 
@@ -499,16 +576,19 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         assertPositionTimes(positionB2, RECOMPUTED_B2_START, RECOMPUTED_B2_END);
         assertNotRecomputed(positionA1, A1_START, A1_END);
         assertNotRecomputed(positionB1, B1_START, B1_END);
+        assertOtherSchedulePositionsNotRecomputed(calls);
+        assertDownstreamRowsUnchanged();
 
-        assertSame(lineB, movedPosition.getBelongsToField(ProductionLineSchedulePositionFields.PRODUCTION_LINE));
+        assertOnLine(movedPosition, LINE_B_ID);
         assertPositionTimes(movedPosition, SLOT_FROM, SLOT_TO);
 
         verify(positionDD).save(movedPosition);
         verify(positionDD, times(3)).find();
         verify(positionDD, never()).fastSave(any(Entity.class));
-        verify(plannedEventDD).find();
-        verify(orderDD, never()).find();
-        verify(shiftsService).getNearestWorkingDate(new DateTime(date(SLOT_FROM)), lineB);
+        verify(plannedEventDD).find(ProductionMaintenanceGanttChartItemResolver.SHUTDOWN_EVENTS_QUERY);
+        verify(orderDD).find();
+        verify(technologyDD).find();
+        verify(shiftsService).getNearestWorkingDate(new DateTime(date(SLOT_FROM)), lineBByNumber);
         verify(pluginManager, times(2)).isPluginEnabled(ORDERS_FOR_SUBPRODUCTS_GENERATION_PLUGIN);
     }
 
@@ -618,24 +698,113 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         assertPositionTimes(positionB2, RECOMPUTED_B2_START, RECOMPUTED_B2_END);
         assertNotRecomputed(positionA1, A1_START, A1_END);
         assertNotRecomputed(positionB1, B1_START, B1_END);
+        assertOtherSchedulePositionsNotRecomputed(calls);
+        assertDownstreamRowsUnchanged();
+    }
+
+    @Test
+    public final void shouldRecomputeLaterSameRowMoveAsOneChain() {
+        // given: the move request drops m on row A from 10:00 to 12:00; the shutdown events query binds row A, and a2 is the
+        // only candidate whose order and technology are loaded
+        GanttChartMoveRequest sameRowMoveRequest = moveRequest(LINE_A_NUMBER);
+
+        usePsImplementations(recordingPsImplementation);
+        given(gantt.getMoveRequest()).willReturn(sameRowMoveRequest);
+        doAnswer(new ShutdownEventsFindAnswer(plannedEvents, shutdownEventsQueryParameters(LINE_A_ID))).when(plannedEventDD)
+                .find(anyString());
+        doAnswer(new FixtureFindAnswer(Arrays.asList(orderA1, orderMoved, orderA2, orderB1, orderB2),
+                idInConditions(Collections.singletonList(orderA2.getId())), new LinkedHashMap<SearchOrder, Comparator<Entity>>()))
+                .when(orderDD).find();
+        doAnswer(new FixtureFindAnswer(Arrays.asList(technologyMoved, technologyA2, technologyB2),
+                idInConditions(Collections.singletonList(technologyA2.getId())),
+                new LinkedHashMap<SearchOrder, Comparator<Entity>>())).when(technologyDD).find();
+
+        // when
+        listeners.moveItem(view, gantt, new String[0]);
+
+        // then: one chain on row A recomputes only a2, chained from m's new end and order
+        verify(gantt).acceptMove();
+        verify(gantt, never()).rejectMove(anyString(), Matchers.<String> anyVararg());
+
+        List<RecordedCall> calls = recordingPsImplementation.getCalls();
+
+        assertEquals(2, calls.size());
+        assertCreateCall(calls.get(0), lineA, date(SLOT_TO), positionA2, technologyA2, orderMoved);
+        assertSaveCall(calls.get(1), positionA2, date(RECOMPUTED_SAME_ROW_A2_START), date(RECOMPUTED_SAME_ROW_A2_END));
+
+        assertPositionTimes(positionA2, RECOMPUTED_SAME_ROW_A2_START, RECOMPUTED_SAME_ROW_A2_END);
+        assertNotRecomputed(positionA1, A1_START, A1_END);
+        assertNotRecomputed(positionB1, B1_START, B1_END);
+        assertNotRecomputed(positionB2, B2_START, B2_END);
+        assertOtherSchedulePositionsNotRecomputed(calls);
+        assertDownstreamRowsUnchanged();
+
+        assertOnLine(movedPosition, LINE_A_ID);
+        assertPositionTimes(movedPosition, SLOT_FROM, SLOT_TO);
+
+        verify(positionDD).save(movedPosition);
+        verify(positionDD, times(2)).find();
+        verify(positionDD, never()).fastSave(any(Entity.class));
+        verify(plannedEventDD).find(ProductionMaintenanceGanttChartItemResolver.SHUTDOWN_EVENTS_QUERY);
+        verify(orderDD).find();
+        verify(technologyDD).find();
+        verify(shiftsService).getNearestWorkingDate(new DateTime(date(SLOT_FROM)), lineAByNumber);
+        verify(pluginManager, times(1)).isPluginEnabled(ORDERS_FOR_SUBPRODUCTS_GENERATION_PLUGIN);
+    }
+
+    @Test
+    public final void shouldAcceptMoveWithoutDownstreamPositions() {
+        // given: row A holds only a1 and m, row B only b1, besides the positions of schedule 8
+        positions.remove(positionA2);
+        positions.remove(positionB2);
+        usePsImplementations(recordingPsImplementation);
+
+        // when
+        listeners.moveItem(view, gantt, new String[0]);
+
+        // then: m is saved on row B and the move is accepted with no call to the PS implementation
+        verify(gantt).acceptMove();
+        verify(gantt, never()).rejectMove(anyString(), Matchers.<String> anyVararg());
+
+        List<RecordedCall> calls = recordingPsImplementation.getCalls();
+
+        assertTrue(calls.isEmpty());
+
+        assertOnLine(movedPosition, LINE_B_ID);
+        assertPositionTimes(movedPosition, SLOT_FROM, SLOT_TO);
+        assertNotRecomputed(positionA1, A1_START, A1_END);
+        assertNotRecomputed(positionB1, B1_START, B1_END);
+        assertOtherSchedulePositionsNotRecomputed(calls);
+
+        verify(positionDD).save(movedPosition);
+        verify(positionDD, times(3)).find();
+        verify(positionDD, never()).fastSave(any(Entity.class));
+        verify(orderDD, never()).find();
+        verify(pluginManager, never()).isPluginEnabled(ORDERS_FOR_SUBPRODUCTS_GENERATION_PLUGIN);
     }
 
 
     /**
-     * Verifies that the listener rejected the move with {@code RECOMPUTE_FAILED_KEY}, never accepted it, and that no position
-     * was fast-saved and no order was queried.
+     * Verifies that the listener rejected the move with {@code RECOMPUTE_FAILED_KEY}, never accepted it, that no position was
+     * fast-saved, and that the orders and the technologies of the recomputed positions were read with exactly one query each.
      */
     private void verifyRecomputeFailedRejection() {
         verify(gantt).rejectMove(eq(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY), Matchers.<String> anyVararg());
         verify(gantt, never()).acceptMove();
         verify(positionDD, never()).fastSave(any(Entity.class));
-        verify(orderDD, never()).find();
+        verify(orderDD).find();
+        verify(technologyDD).find();
     }
 
+    /**
+     * Asserts a {@code createProductionLinePositionNewData} call on the production line with the given line's id, with the
+     * finish date, the position, the technology and the previous order.
+     */
     private static void assertCreateCall(final RecordedCall call, final Entity productionLine, final Date finishDate,
             final Entity position, final Entity technology, final Entity previousOrder) {
         assertEquals(CREATE_METHOD, call.getMethodName());
-        assertSame(productionLine, call.getProductionLine());
+        assertNotNull(call.getProductionLine());
+        assertEquals(productionLine.getId(), call.getProductionLine().getId());
         assertEquals(finishDate, call.getDate());
         assertSame(position, call.getPosition());
         assertSame(technology, call.getTechnology());
@@ -663,6 +832,27 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         }
     }
 
+    /**
+     * Asserts that the position belongs to the production line with the given id.
+     */
+    private static void assertOnLine(final Entity position, final Long productionLineId) {
+        Entity productionLine = position.getBelongsToField(ProductionLineSchedulePositionFields.PRODUCTION_LINE);
+
+        assertNotNull(productionLine);
+        assertEquals(productionLineId, productionLine.getId());
+    }
+
+    /**
+     * Asserts that a2 still belongs to row A and b2 to row B, and that the production line of neither was ever set.
+     */
+    private void assertDownstreamRowsUnchanged() {
+        assertOnLine(positionA2, LINE_A_ID);
+        assertOnLine(positionB2, LINE_B_ID);
+
+        verify(positionA2, never()).setField(eq(ProductionLineSchedulePositionFields.PRODUCTION_LINE), any());
+        verify(positionB2, never()).setField(eq(ProductionLineSchedulePositionFields.PRODUCTION_LINE), any());
+    }
+
     private static void assertPositionTimes(final Entity position, final String startTime, final String endTime) {
         assertEquals(date(startTime), position.getDateField(ProductionLineSchedulePositionFields.START_TIME));
         assertEquals(date(endTime), position.getDateField(ProductionLineSchedulePositionFields.END_TIME));
@@ -674,6 +864,22 @@ public class ProductionMaintenanceGanttMoveFlowTest {
     private static void assertNotRecomputed(final Entity position, final String startTime, final String endTime) {
         assertPositionTimes(position, startTime, endTime);
         verify(position, never()).setField(anyString(), any());
+    }
+
+    /**
+     * Asserts that no recorded call names a position of schedule 8 and that every position of schedule 8 still holds its start
+     * and end time with no field of it ever set.
+     */
+    private void assertOtherSchedulePositionsNotRecomputed(final List<RecordedCall> calls) {
+        assertNotRecorded(calls, otherPositionA1);
+        assertNotRecorded(calls, otherPositionA2);
+        assertNotRecorded(calls, otherPositionB1);
+        assertNotRecorded(calls, otherPositionB2);
+
+        assertNotRecomputed(otherPositionA1, OTHER_A1_START, OTHER_A1_END);
+        assertNotRecomputed(otherPositionA2, OTHER_A2_START, OTHER_A2_END);
+        assertNotRecomputed(otherPositionB1, OTHER_B1_START, OTHER_B1_END);
+        assertNotRecomputed(otherPositionB2, OTHER_B2_START, OTHER_B2_END);
     }
 
     private void usePsImplementations(final ProductionLineScheduleServicePS... implementations) {
@@ -691,7 +897,7 @@ public class ProductionMaintenanceGanttMoveFlowTest {
 
         stubStringField(productionLine, ProductionLineFields.NUMBER, number);
         stubBooleanField(productionLine, ProductionLineFields.PRODUCTION, true);
-        stubBooleanField(productionLine, ProductionLineFields.ACTIVE, true);
+        given(productionLine.isActive()).willReturn(true);
 
         return productionLine;
     }
@@ -726,9 +932,17 @@ public class ProductionMaintenanceGanttMoveFlowTest {
      */
     private Entity position(final String name, final Long id, final Entity productionLine, final Entity order,
             final String startTime, final String endTime) {
+        return position(schedule, name, id, productionLine, order, startTime, endTime);
+    }
+
+    /**
+     * Returns a position of the given schedule whose getters read the fields its {@code setField} calls store.
+     */
+    private Entity position(final Entity positionSchedule, final String name, final Long id, final Entity productionLine,
+            final Entity order, final String startTime, final String endTime) {
         PositionFieldsAnswer answer = new PositionFieldsAnswer(id, positionDD);
 
-        answer.putField(ProductionLineSchedulePositionFields.PRODUCTION_LINE_SCHEDULE, schedule);
+        answer.putField(ProductionLineSchedulePositionFields.PRODUCTION_LINE_SCHEDULE, positionSchedule);
         answer.putField(ProductionLineSchedulePositionFields.PRODUCTION_LINE, productionLine);
         answer.putField(ProductionLineSchedulePositionFields.ORDER, order);
         answer.putField(ProductionLineSchedulePositionFields.START_TIME, date(startTime));
@@ -745,11 +959,11 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         Map<SearchCriterion, EntityCondition> conditions = new LinkedHashMap<SearchCriterion, EntityCondition>();
 
         conditions.put(SearchRestrictions.belongsTo(ProductionLineSchedulePositionFields.PRODUCTION_LINE_SCHEDULE, schedule),
-                new BelongsToCondition(ProductionLineSchedulePositionFields.PRODUCTION_LINE_SCHEDULE, schedule));
+                new BelongsToCondition(ProductionLineSchedulePositionFields.PRODUCTION_LINE_SCHEDULE, schedule.getId()));
         conditions.put(SearchRestrictions.belongsTo(ProductionLineSchedulePositionFields.PRODUCTION_LINE, lineA),
-                new BelongsToCondition(ProductionLineSchedulePositionFields.PRODUCTION_LINE, lineA));
+                new BelongsToCondition(ProductionLineSchedulePositionFields.PRODUCTION_LINE, lineA.getId()));
         conditions.put(SearchRestrictions.belongsTo(ProductionLineSchedulePositionFields.PRODUCTION_LINE, lineB),
-                new BelongsToCondition(ProductionLineSchedulePositionFields.PRODUCTION_LINE, lineB));
+                new BelongsToCondition(ProductionLineSchedulePositionFields.PRODUCTION_LINE, lineB.getId()));
 
         for (Entity position : positions) {
             conditions.put(SearchRestrictions.idNe(position.getId()), new IdNotEqualCondition(position.getId()));
@@ -798,31 +1012,30 @@ public class ProductionMaintenanceGanttMoveFlowTest {
     }
 
     /**
-     * Returns the criteria the planned event query may use: requires shutdown, start before the slot end and finish after the
-     * slot start.
+     * Returns the parameters the shutdown events query of the move must bind, each as the name of its
+     * {@link SearchQueryBuilder} setter followed by its value: the slot start and end as timestamps, requires shutdown true
+     * and the given id of the target row.
      */
-    private static Map<SearchCriterion, EntityCondition> plannedEventConditions() {
-        Map<SearchCriterion, EntityCondition> conditions = new LinkedHashMap<SearchCriterion, EntityCondition>();
+    private static Map<String, List<Object>> shutdownEventsQueryParameters(final Long targetLineId) {
+        Map<String, List<Object>> parameters = new LinkedHashMap<String, List<Object>>();
 
-        conditions.put(SearchRestrictions.eq(PlannedEventFields.REQUIRES_SHUTDOWN, true), new TrueFieldCondition(
-                PlannedEventFields.REQUIRES_SHUTDOWN));
-        conditions.put(SearchRestrictions.lt(PlannedEventFields.START_DATE, date(SLOT_TO)), new DateFieldCondition(
-                PlannedEventFields.START_DATE, date(SLOT_TO), DateComparison.BEFORE));
-        conditions.put(SearchRestrictions.gt(PlannedEventFields.FINISH_DATE, date(SLOT_FROM)), new DateFieldCondition(
-                PlannedEventFields.FINISH_DATE, date(SLOT_FROM), DateComparison.AFTER));
+        parameters.put("dateFrom", Arrays.<Object> asList("setTimestamp", date(SLOT_FROM)));
+        parameters.put("dateTo", Arrays.<Object> asList("setTimestamp", date(SLOT_TO)));
+        parameters.put("requiresShutdown", Arrays.<Object> asList("setBoolean", true));
+        parameters.put("productionLineId", Arrays.<Object> asList("setLong", targetLineId));
 
-        return conditions;
+        return parameters;
     }
 
     /**
-     * Returns the order the planned event query may use: start date ascending.
+     * Returns the only criterion an order or technology query may use: the id is one of the given ids, in the given order.
      */
-    private static Map<SearchOrder, Comparator<Entity>> plannedEventOrders() {
-        Map<SearchOrder, Comparator<Entity>> orders = new LinkedHashMap<SearchOrder, Comparator<Entity>>();
+    private static Map<SearchCriterion, EntityCondition> idInConditions(final List<Long> ids) {
+        Map<SearchCriterion, EntityCondition> conditions = new LinkedHashMap<SearchCriterion, EntityCondition>();
 
-        orders.put(SearchOrders.asc(PlannedEventFields.START_DATE), new DateFieldComparator(PlannedEventFields.START_DATE, true));
+        conditions.put(SearchRestrictions.in(L_ID, ids), new IdInCondition(ids));
 
-        return orders;
+        return conditions;
     }
 
     private static Date date(final String value) {
@@ -1219,32 +1432,101 @@ public class ProductionMaintenanceGanttMoveFlowTest {
     }
 
     /**
-     * Answers every builder method with the builder itself, {@code uniqueResult()} with the given entity and {@code list()}
-     * with a result holding only that entity.
+     * Answers {@code find(String)} of {@link ProductionMaintenanceGanttChartItemResolver#SHUTDOWN_EVENTS_QUERY} with a new
+     * {@link ShutdownEventsQueryBuilderAnswer} builder over the current rows and the expected parameters. Fails on every
+     * other query.
      */
-    private static final class AggregateCriteriaBuilderAnswer implements Answer<Object> {
+    private static final class ShutdownEventsFindAnswer implements Answer<SearchQueryBuilder> {
 
-        private final Entity result;
+        private final List<Entity> rows;
 
-        private AggregateCriteriaBuilderAnswer(final Entity result) {
-            this.result = result;
+        private final Map<String, List<Object>> expectedParameters;
+
+        private ShutdownEventsFindAnswer(final List<Entity> rows, final Map<String, List<Object>> expectedParameters) {
+            this.rows = rows;
+            this.expectedParameters = expectedParameters;
+        }
+
+        @Override
+        public SearchQueryBuilder answer(final InvocationOnMock invocation) {
+            String queryString = (String) invocation.getArguments()[0];
+
+            if (!ProductionMaintenanceGanttChartItemResolver.SHUTDOWN_EVENTS_QUERY.equals(queryString)) {
+                throw new AssertionError("Unexpected planned event query: " + queryString);
+            }
+
+            return mock(SearchQueryBuilder.class, new ShutdownEventsQueryBuilderAnswer(new ArrayList<Entity>(rows),
+                    expectedParameters));
+        }
+
+    }
+
+    /**
+     * Answers the setter of each expected parameter, bound once with its expected setter and value, with the builder itself,
+     * and {@code list()}, once every expected parameter is bound, with the given rows. Fails on an unexpected or repeated
+     * parameter, a missing parameter and every other builder method.
+     */
+    private static final class ShutdownEventsQueryBuilderAnswer implements Answer<Object> {
+
+        private final List<Entity> rows;
+
+        private final Map<String, List<Object>> expectedParameters;
+
+        private final Map<String, List<Object>> boundParameters = new LinkedHashMap<String, List<Object>>();
+
+        private ShutdownEventsQueryBuilderAnswer(final List<Entity> rows, final Map<String, List<Object>> expectedParameters) {
+            this.rows = rows;
+            this.expectedParameters = expectedParameters;
         }
 
         @Override
         public Object answer(final InvocationOnMock invocation) throws Throwable {
             String methodName = invocation.getMethod().getName();
+            Object[] arguments = invocation.getArguments();
 
-            if ("uniqueResult".equals(methodName)) {
-                return result;
+            if (Object.class.equals(invocation.getMethod().getDeclaringClass())) {
+                return Mockito.RETURNS_DEFAULTS.answer(invocation);
             }
-            if ("list".equals(methodName)) {
-                return new FixedSearchResult(Collections.singletonList(result));
-            }
-            if (SearchCriteriaBuilder.class.equals(invocation.getMethod().getReturnType())) {
+            if (methodName.startsWith("set") && arguments.length == 2 && arguments[0] instanceof String) {
+                String name = (String) arguments[0];
+                List<Object> parameter = Arrays.<Object> asList(methodName, arguments[1]);
+
+                if (!parameter.equals(expectedParameters.get(name)) || boundParameters.containsKey(name)) {
+                    throw new AssertionError("Unexpected shutdown events query parameter " + name + ": " + parameter);
+                }
+
+                boundParameters.put(name, parameter);
+
                 return invocation.getMock();
             }
+            if ("list".equals(methodName)) {
+                if (!expectedParameters.equals(boundParameters)) {
+                    throw new AssertionError("Missing shutdown events query parameters: bound " + boundParameters.keySet()
+                            + " of " + expectedParameters.keySet());
+                }
 
-            return Mockito.RETURNS_DEFAULTS.answer(invocation);
+                return new FixedSearchResult(rows);
+            }
+
+            throw new AssertionError("Unexpected shutdown events query builder method: " + methodName);
+        }
+
+    }
+
+    /**
+     * Fails the test on every call it answers, naming the unexpected call.
+     */
+    private static final class FailingAnswer implements Answer<Object> {
+
+        private final String call;
+
+        private FailingAnswer(final String call) {
+            this.call = call;
+        }
+
+        @Override
+        public Object answer(final InvocationOnMock invocation) {
+            throw new AssertionError("Unexpected " + call);
         }
 
     }
@@ -1282,22 +1564,69 @@ public class ProductionMaintenanceGanttMoveFlowTest {
     }
 
     /**
-     * Satisfied when the belongs-to field holds the given entity.
+     * Satisfied when the belongs-to field holds an entity with the given id.
      */
     private static final class BelongsToCondition implements EntityCondition {
 
         private final String fieldName;
 
-        private final Entity value;
+        private final Long id;
 
-        private BelongsToCondition(final String fieldName, final Entity value) {
+        private BelongsToCondition(final String fieldName, final Long id) {
             this.fieldName = fieldName;
-            this.value = value;
+            this.id = id;
         }
 
         @Override
         public boolean matches(final Entity entity) {
-            return entity.getBelongsToField(fieldName) == value;
+            Entity value = entity.getBelongsToField(fieldName);
+
+            return value != null && id.equals(value.getId());
+        }
+
+    }
+
+    /**
+     * Answers {@link DataAccessService#convertToDatabaseEntity} with a {@link DatabaseReference} to the id of the given
+     * entity.
+     */
+    private static final class DatabaseReferenceAnswer implements Answer<DatabaseReference> {
+
+        @Override
+        public DatabaseReference answer(final InvocationOnMock invocation) {
+            return new DatabaseReference(((Entity) invocation.getArguments()[0]).getId());
+        }
+
+    }
+
+    /**
+     * Database entity of a belongs-to criterion: equal to every reference with the same id, and written as {@code #<id>}.
+     */
+    private static final class DatabaseReference {
+
+        private final Long id;
+
+        private DatabaseReference(final Long id) {
+            if (id == null) {
+                throw new AssertionError("Entity without id converted to a database entity");
+            }
+
+            this.id = id;
+        }
+
+        @Override
+        public boolean equals(final Object other) {
+            return other instanceof DatabaseReference && id.equals(((DatabaseReference) other).id);
+        }
+
+        @Override
+        public int hashCode() {
+            return id.hashCode();
+        }
+
+        @Override
+        public String toString() {
+            return "#" + id;
         }
 
     }
@@ -1316,6 +1645,24 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         @Override
         public boolean matches(final Entity entity) {
             return !id.equals(entity.getId());
+        }
+
+    }
+
+    /**
+     * Satisfied when the entity's id is one of the given ids.
+     */
+    private static final class IdInCondition implements EntityCondition {
+
+        private final List<Long> ids;
+
+        private IdInCondition(final List<Long> ids) {
+            this.ids = new ArrayList<Long>(ids);
+        }
+
+        @Override
+        public boolean matches(final Entity entity) {
+            return ids.contains(entity.getId());
         }
 
     }
@@ -1444,4 +1791,3 @@ public class ProductionMaintenanceGanttMoveFlowTest {
     }
 
 }
-

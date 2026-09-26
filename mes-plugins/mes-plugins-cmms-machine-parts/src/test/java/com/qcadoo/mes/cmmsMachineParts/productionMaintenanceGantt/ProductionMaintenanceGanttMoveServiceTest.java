@@ -47,7 +47,6 @@ import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.verifyZeroInteractions;
 import static org.springframework.test.util.ReflectionTestUtils.setField;
 
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.sql.SQLException;
 import java.text.ParseException;
@@ -65,10 +64,8 @@ import java.util.Optional;
 import org.joda.time.DateTime;
 import org.json.JSONException;
 import org.json.JSONObject;
-import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
-import org.mockito.AdditionalAnswers;
 import org.mockito.InOrder;
 import org.mockito.Matchers;
 import org.mockito.Mock;
@@ -88,8 +85,6 @@ import com.qcadoo.mes.basic.ShiftsService;
 import com.qcadoo.mes.cmmsMachineParts.constants.CmmsMachinePartsConstants;
 import com.qcadoo.mes.cmmsMachineParts.constants.PlannedEventFields;
 import com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt.ProductionMaintenanceGanttMoveService.MoveRejectedException;
-import com.qcadoo.mes.orders.ProductionLineScheduleServicePPSExecutorService;
-import com.qcadoo.mes.orders.ProductionLineScheduleServicePSExecutorService;
 import com.qcadoo.mes.orders.constants.OrderFields;
 import com.qcadoo.mes.orders.constants.OrdersConstants;
 import com.qcadoo.mes.orders.constants.ParameterFieldsO;
@@ -97,32 +92,49 @@ import com.qcadoo.mes.orders.constants.ProductionLineScheduleFields;
 import com.qcadoo.mes.orders.constants.ProductionLineSchedulePositionFields;
 import com.qcadoo.mes.orders.states.constants.ScheduleStateStringValues;
 import com.qcadoo.mes.orders.validators.ProductionLineSchedulePositionValidators;
+import com.qcadoo.mes.productionLines.constants.DivisionFieldsPL;
 import com.qcadoo.mes.productionLines.constants.ProductionLineFields;
 import com.qcadoo.mes.productionLines.constants.ProductionLinesConstants;
+import com.qcadoo.mes.productionLines.constants.WorkstationFieldsPL;
 import com.qcadoo.model.api.DataDefinition;
 import com.qcadoo.model.api.DataDefinitionService;
 import com.qcadoo.model.api.Entity;
 import com.qcadoo.model.api.search.SearchCriteriaBuilder;
 import com.qcadoo.model.api.search.SearchCriterion;
 import com.qcadoo.model.api.search.SearchOrder;
-import com.qcadoo.model.api.search.SearchOrders;
+import com.qcadoo.model.api.search.SearchQueryBuilder;
 import com.qcadoo.model.api.search.SearchRestrictions;
 import com.qcadoo.model.api.search.SearchResult;
 import com.qcadoo.model.api.validators.ErrorMessage;
-import com.qcadoo.model.internal.api.DataAccessService;
 import com.qcadoo.view.api.components.ganttChart.GanttChartItem;
 import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
 
 /**
  * Unit tests of {@link ProductionMaintenanceGanttMoveService}.
  * <p>
- * The service runs against a spy of a real {@link ProductionMaintenanceGanttMoveValidator} whose collaborators are mocks
- * stubbed so that every check passes: the order's technology allows both production lines, no planned event requires a
- * shutdown, the nearest working date of the target line is the slot start itself, and the stored position equals the item as
- * rendered. Each rejection test changes only the collaborator of its own check. The production line and planned event data
- * definitions answer {@code find()} with a builder that records its criteria, orders and maximum result count, and selects the
- * fixture entities satisfying every recorded criterion. Unknown criteria, unknown orders and unknown builder methods fail the
- * test.
+ * The service runs against a spy of a real {@link ProductionMaintenanceGanttMoveValidator} whose collaborators are
+ * mocks stubbed so that every check passes: the order's technology allows both production lines, no planned event
+ * requires a shutdown, the nearest working date of the target line is the slot start itself, and the stored position
+ * equals the item as rendered. The production line data definition answers {@code find()} with a builder that records
+ * its criteria, orders and maximum result count, and selects the fixture entities satisfying every recorded criterion.
+ * Unknown criteria, unknown orders and unknown builder methods fail the test. The planned event data definition answers
+ * {@code find(String)} of {@link ProductionMaintenanceGanttChartItemResolver#SHUTDOWN_EVENTS_QUERY} with projection
+ * rows of the fixture planned events the query selects, and fails on {@code find()}, on any other query and on a
+ * missing or unexpected parameter.
+ * <p>
+ * Tests that depart from this passing setup change it in three ways:
+ * <ul>
+ * <li>routing, shutdown-window and working-hours tests change the answer of the collaborator of their own check: the
+ * candidate production lines of the order's technology, the planned events, or the nearest working date;</li>
+ * <li>stale-position, schedule-state, schedule-membership, context, unknown-position, target-row and item-id tests change a
+ * field of the stored position or schedule, the position returned for the item's id, or an input of the move request;</li>
+ * <li>invalid-save tests make the save of the position return null or an invalid entity, and recompute tests make the
+ * recompute service throw.</li>
+ * </ul>
+ * The recompute service is a mock, so the production line schedule executor services behind it are not reached. A move
+ * rejected before the save is asserted to leave the position unchanged and unsaved and the recompute service without any
+ * interaction; a move rejected by an invalid save is asserted to leave the position without a fast save and the recompute
+ * service without any interaction.
  * <p>
  * Fixture: draft schedule 7; production lines L1 (id 1, origin), L2 (id 2, target) and L3 (id 3); position 11 of order ORD-1 on
  * L1 from 08:00 to 10:00; move request onto row L2 from 10:00 to 12:00, rendered as row L1, name ORD-1, 08:00 to 10:00.
@@ -177,21 +189,10 @@ public class ProductionMaintenanceGanttMoveServiceTest {
     private ProductionMaintenanceGanttRecomputeService recomputeService;
 
     @Mock
-    private ProductionLineScheduleServicePSExecutorService psExecutor;
-
-    @Mock
-    private ProductionLineScheduleServicePPSExecutorService ppsExecutor;
-
-    @Mock
-    private DataAccessService dataAccessService;
-
-    @Mock
     private DataDefinition positionDD, productionLineDD, plannedEventDD;
 
     @Mock
     private GanttChartItem item;
-
-    private DataAccessService previousDataAccessService;
 
     private Entity schedule, parameter, order, position, savedPosition;
 
@@ -205,16 +206,11 @@ public class ProductionMaintenanceGanttMoveServiceTest {
 
     private final List<FixtureQuery> productionLineQueries = new ArrayList<FixtureQuery>();
 
-    private final List<FixtureQuery> plannedEventQueries = new ArrayList<FixtureQuery>();
+    private final List<String> plannedEventQueries = new ArrayList<String>();
 
     @Before
-    public void init() throws Exception {
+    public void init() {
         MockitoAnnotations.initMocks(this);
-
-        given(dataAccessService.convertToDatabaseEntity(Matchers.any(Entity.class))).willAnswer(
-                AdditionalAnswers.returnsFirstArg());
-
-        previousDataAccessService = swapSearchRestrictionsDataAccessService(dataAccessService);
 
         positionStart = date(POSITION_START);
         positionEnd = date(POSITION_END);
@@ -231,8 +227,9 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         given(productionLineDD.find()).willAnswer(
                 new FixtureFindAnswer(productionLines, productionLineConditions(), Collections
                         .<SearchOrder, Comparator<Entity>> emptyMap(), productionLineQueries));
-        given(plannedEventDD.find()).willAnswer(
-                new FixtureFindAnswer(plannedEvents, plannedEventConditions(), plannedEventOrders(), plannedEventQueries));
+        given(plannedEventDD.find()).willAnswer(new FailingAnswer("criteria find() of the planned event data definition"));
+        given(plannedEventDD.find(Matchers.anyString())).willAnswer(
+                new ShutdownEventsFindAnswer(plannedEvents, plannedEventQueries));
 
         lineL1 = productionLine(1L, ORIGIN_LINE_NUMBER);
         lineL2 = productionLine(2L, TARGET_LINE_NUMBER);
@@ -280,18 +277,17 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         setField(validatorSpy, "productionLineSchedulePositionValidators", productionLineSchedulePositionValidators);
         setField(validatorSpy, "parameterService", parameterService);
         setField(validatorSpy, "shiftsService", shiftsService);
-        setField(validatorSpy, "productionMaintenanceGanttChartItemResolver", new ProductionMaintenanceGanttChartItemResolver());
+
+        ProductionMaintenanceGanttChartItemResolver resolver = new ProductionMaintenanceGanttChartItemResolver();
+
+        setField(resolver, "dataDefinitionService", dataDefinitionService);
+        setField(validatorSpy, "productionMaintenanceGanttChartItemResolver", resolver);
 
         moveService = new ProductionMaintenanceGanttMoveService();
 
         setField(moveService, "dataDefinitionService", dataDefinitionService);
         setField(moveService, "productionMaintenanceGanttMoveValidator", validatorSpy);
         setField(moveService, "productionMaintenanceGanttRecomputeService", recomputeService);
-    }
-
-    @After
-    public void restoreSearchRestrictions() throws Exception {
-        swapSearchRestrictionsDataAccessService(previousDataAccessService);
     }
 
     @Test
@@ -315,7 +311,6 @@ public class ProductionMaintenanceGanttMoveServiceTest {
 
         verify(positionDD, never()).fastSave(Matchers.any(Entity.class));
         verifyNoMoreInteractions(recomputeService);
-        verifyZeroInteractions(psExecutor, ppsExecutor);
     }
 
     @Test
@@ -345,10 +340,31 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         moveService.move(request);
 
         // then
-        assertEquals(2, productionLineQueries.size());
+        assertEquals(1, productionLineQueries.size());
         assertEquals(Collections.singletonList(SearchRestrictions.eq(ProductionLineFields.NUMBER, TARGET_LINE_NUMBER)),
                 productionLineQueries.get(0).getCriteria());
-        assertEquals(Integer.valueOf(1), productionLineQueries.get(0).getMaxResults());
+        assertEquals(Integer.valueOf(2), productionLineQueries.get(0).getMaxResults());
+        verify(validatorSpy).validate(position, lineL2, request);
+    }
+
+    @Test
+    public final void shouldRejectTargetRowMatchingSeveralProductionLines() {
+        // given
+        productionLines.add(productionLine(4L, TARGET_LINE_NUMBER));
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY);
+        assertEquals(1, productionLineQueries.size());
+        assertEquals(Collections.singletonList(SearchRestrictions.eq(ProductionLineFields.NUMBER, TARGET_LINE_NUMBER)),
+                productionLineQueries.get(0).getCriteria());
+        assertEquals(Integer.valueOf(2), productionLineQueries.get(0).getMaxResults());
+        assertValidatorNeverCalled();
+        assertNothingPersisted();
     }
 
     @Test
@@ -415,7 +431,9 @@ public class ProductionMaintenanceGanttMoveServiceTest {
 
         // then
         assertRejection(rejection, ProductionMaintenanceGanttMoveValidator.SHUTDOWN_WINDOW_KEY, SHUTDOWN_EVENT_NUMBER);
-        assertEquals(1, plannedEventQueries.size());
+        assertEquals(Collections.singletonList(ProductionMaintenanceGanttChartItemResolver.SHUTDOWN_EVENTS_QUERY),
+                plannedEventQueries);
+        verify(plannedEventDD, never()).find();
         verify(validatorSpy).checkShutdownWindow(lineL2, slotFrom, slotTo);
         verify(validatorSpy, never()).checkWorkingHours(Matchers.any(Entity.class), Matchers.any(Date.class));
         assertNothingPersisted();
@@ -682,23 +700,32 @@ public class ProductionMaintenanceGanttMoveServiceTest {
 
     @Test
     public final void shouldFailOnNullRequest() {
+        // given
+        GanttChartMoveRequest request = null;
+
         // when
+        IllegalArgumentException failure = null;
+
         try {
-            moveService.move(null);
+            moveService.move(request);
             fail("Expected an IllegalArgumentException");
         } catch (IllegalArgumentException e) {
-            // then
-            assertEquals("move request is required", e.getMessage());
+            failure = e;
         }
 
-        verifyZeroInteractions(dataDefinitionService, positionDD, recomputeService, psExecutor, ppsExecutor);
+        // then
+        assertNotNull(failure);
+        assertEquals("move request is required", failure.getMessage());
+        verifyZeroInteractions(dataDefinitionService, positionDD, recomputeService);
         assertValidatorNeverCalled();
     }
 
     @Test
     public final void shouldRunInSerializableTransaction() throws NoSuchMethodException {
-        // when
+        // given
         Method move = ProductionMaintenanceGanttMoveService.class.getMethod("move", GanttChartMoveRequest.class);
+
+        // when
         Transactional transactional = move.getAnnotation(Transactional.class);
 
         // then
@@ -709,14 +736,22 @@ public class ProductionMaintenanceGanttMoveServiceTest {
 
     @Test
     public final void shouldUseMessageKeysOfRejectionReasons() {
+        // given
+        String expectedOptimisticLockKey = "qcadooView.validate.global.optimisticLock";
+        String expectedSaveFailedKey = "cmmsMachineParts.productionMaintenanceGantt.move.error.saveFailed";
+        String expectedRecomputeFailedKey = "cmmsMachineParts.productionMaintenanceGantt.move.error.recomputeFailed";
+
+        // when
+        String optimisticLockKey = ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY;
+        String validatorOptimisticLockKey = ProductionMaintenanceGanttMoveValidator.OPTIMISTIC_LOCK_KEY;
+        String saveFailedKey = ProductionMaintenanceGanttMoveService.SAVE_FAILED_KEY;
+        String recomputeFailedKey = ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY;
+
         // then
-        assertEquals("qcadooView.validate.global.optimisticLock", ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY);
-        assertEquals(ProductionMaintenanceGanttMoveValidator.OPTIMISTIC_LOCK_KEY,
-                ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY);
-        assertEquals("cmmsMachineParts.productionMaintenanceGantt.move.error.saveFailed",
-                ProductionMaintenanceGanttMoveService.SAVE_FAILED_KEY);
-        assertEquals("cmmsMachineParts.productionMaintenanceGantt.move.error.recomputeFailed",
-                ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY);
+        assertEquals(expectedOptimisticLockKey, optimisticLockKey);
+        assertEquals(validatorOptimisticLockKey, optimisticLockKey);
+        assertEquals(expectedSaveFailedKey, saveFailedKey);
+        assertEquals(expectedRecomputeFailedKey, recomputeFailedKey);
     }
 
 
@@ -761,6 +796,7 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         // given
         Map<String, ErrorMessage> fieldErrors = new LinkedHashMap<String, ErrorMessage>();
         fieldErrors.put(ProductionLineSchedulePositionFields.START_TIME, new ErrorMessage("some.field.error", "08:00"));
+        fieldErrors.put(ProductionLineSchedulePositionFields.END_TIME, new ErrorMessage("other.field.error", "10:00"));
 
         givenInvalidSave(Collections.<ErrorMessage> emptyList(), fieldErrors);
 
@@ -899,23 +935,43 @@ public class ProductionMaintenanceGanttMoveServiceTest {
 
     @Test
     public final void shouldRecogniseConcurrencyFailureExceptionsAsConflicts() {
+        // given
+        ConcurrencyFailureException concurrencyFailure = new ConcurrencyFailureException("x");
+        OptimisticLockingFailureException optimisticLockingFailure = new OptimisticLockingFailureException("x");
+        CannotSerializeTransactionException cannotSerializeTransaction = new CannotSerializeTransactionException("x");
+        RuntimeException wrappedOptimisticLockingFailure = new RuntimeException(new OptimisticLockingFailureException("x"));
+
+        // when
+        boolean concurrencyFailureIsConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(concurrencyFailure);
+        boolean optimisticLockingFailureIsConflict = ProductionMaintenanceGanttMoveService
+                .isConcurrencyConflict(optimisticLockingFailure);
+        boolean cannotSerializeTransactionIsConflict = ProductionMaintenanceGanttMoveService
+                .isConcurrencyConflict(cannotSerializeTransaction);
+        boolean wrappedOptimisticLockingFailureIsConflict = ProductionMaintenanceGanttMoveService
+                .isConcurrencyConflict(wrappedOptimisticLockingFailure);
+
         // then
-        assertTrue(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(new ConcurrencyFailureException("x")));
-        assertTrue(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(new OptimisticLockingFailureException("x")));
-        assertTrue(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(new CannotSerializeTransactionException("x")));
-        assertTrue(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(new RuntimeException(
-                new OptimisticLockingFailureException("x"))));
+        assertTrue(concurrencyFailureIsConflict);
+        assertTrue(optimisticLockingFailureIsConflict);
+        assertTrue(cannotSerializeTransactionIsConflict);
+        assertTrue(wrappedOptimisticLockingFailureIsConflict);
     }
 
     @Test
     public final void shouldRecogniseSerializationFailureSqlStateInCauseChain() {
         // given
         SQLException serializationFailure = new SQLException("x", "40001");
+        RuntimeException wrappedSerializationFailure = new RuntimeException(new IllegalStateException(serializationFailure));
+
+        // when
+        boolean serializationFailureIsConflict = ProductionMaintenanceGanttMoveService
+                .isConcurrencyConflict(serializationFailure);
+        boolean wrappedSerializationFailureIsConflict = ProductionMaintenanceGanttMoveService
+                .isConcurrencyConflict(wrappedSerializationFailure);
 
         // then
-        assertTrue(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(serializationFailure));
-        assertTrue(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(new RuntimeException(new IllegalStateException(
-                serializationFailure))));
+        assertTrue(serializationFailureIsConflict);
+        assertTrue(wrappedSerializationFailureIsConflict);
     }
 
     @Test
@@ -926,25 +982,48 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         batchFailure.setNextException(new SQLException("y", "23505"));
         batchFailure.setNextException(new SQLException("z", "40001"));
 
+        RuntimeException wrappedBatchFailure = new RuntimeException(batchFailure);
+
+        // when
+        boolean wrappedBatchFailureIsConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(wrappedBatchFailure);
+
         // then
-        assertTrue(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(new RuntimeException(batchFailure)));
+        assertTrue(wrappedBatchFailureIsConflict);
     }
 
     @Test
     public final void shouldNotRecogniseOtherExceptionsAsConflicts() {
         // given
+        SQLException uniqueViolation = new SQLException("x", "23505");
         SQLException uniqueViolationWithNext = new SQLException("x", "23505");
 
         uniqueViolationWithNext.setNextException(new SQLException("y", "23503"));
 
+        RuntimeException wrappedUniqueViolationWithNext = new RuntimeException(uniqueViolationWithNext);
+        SQLException sqlExceptionWithoutState = new SQLException("x");
+        RuntimeException otherRuntimeException = new RuntimeException("x");
+        MoveRejectedException moveRejection = new MoveRejectedException(
+                ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY);
+        Throwable noThrowable = null;
+
+        // when
+        boolean uniqueViolationIsConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(uniqueViolation);
+        boolean wrappedUniqueViolationWithNextIsConflict = ProductionMaintenanceGanttMoveService
+                .isConcurrencyConflict(wrappedUniqueViolationWithNext);
+        boolean sqlExceptionWithoutStateIsConflict = ProductionMaintenanceGanttMoveService
+                .isConcurrencyConflict(sqlExceptionWithoutState);
+        boolean otherRuntimeExceptionIsConflict = ProductionMaintenanceGanttMoveService
+                .isConcurrencyConflict(otherRuntimeException);
+        boolean moveRejectionIsConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(moveRejection);
+        boolean noThrowableIsConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(noThrowable);
+
         // then
-        assertFalse(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(new SQLException("x", "23505")));
-        assertFalse(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(new RuntimeException(uniqueViolationWithNext)));
-        assertFalse(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(new SQLException("x")));
-        assertFalse(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(new RuntimeException("x")));
-        assertFalse(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(new MoveRejectedException(
-                ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY)));
-        assertFalse(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(null));
+        assertFalse(uniqueViolationIsConflict);
+        assertFalse(wrappedUniqueViolationWithNextIsConflict);
+        assertFalse(sqlExceptionWithoutStateIsConflict);
+        assertFalse(otherRuntimeExceptionIsConflict);
+        assertFalse(moveRejectionIsConflict);
+        assertFalse(noThrowableIsConflict);
     }
 
     @Test
@@ -961,9 +1040,71 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         firstSqlException.setNextException(secondSqlException);
         secondSqlException.setNextException(firstSqlException);
 
+        // when
+        boolean cyclicCauseChainIsConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(first);
+        boolean cyclicNextExceptionChainIsConflict = ProductionMaintenanceGanttMoveService
+                .isConcurrencyConflict(firstSqlException);
+
         // then
-        assertFalse(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(first));
-        assertFalse(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(firstSqlException));
+        assertFalse(cyclicCauseChainIsConflict);
+        assertFalse(cyclicNextExceptionChainIsConflict);
+    }
+
+    @Test
+    public final void shouldRecogniseSerializationFailureAsCauseOfNextExceptionThatIsAlsoTheCause() {
+        // given
+        SQLException batchFailure = serializationFailureAsCauseOfNextException();
+
+        // when
+        boolean conflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(batchFailure);
+        boolean wrappedConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(new RuntimeException(
+                "flush failed", batchFailure));
+
+        // then
+        assertTrue(conflict);
+        assertTrue(wrappedConflict);
+    }
+
+    @Test
+    public final void shouldRecogniseConcurrencyFailureExceptionAsCauseOfNextException() {
+        // given
+        SQLException batchFailure = new SQLException("batch", "08000");
+        SQLException nextFailure = new SQLException("next", "08003");
+
+        batchFailure.setNextException(nextFailure);
+        nextFailure.initCause(new ConcurrencyFailureException("conflict"));
+
+        // when
+        boolean conflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(new RuntimeException(batchFailure));
+
+        // then
+        assertTrue(conflict);
+    }
+
+    @Test
+    public final void shouldRethrowSerializationFailureAsCauseOfNextExceptionFromRecompute() {
+        // given
+        RuntimeException serializationFailure = new RuntimeException("flush failed",
+                serializationFailureAsCauseOfNextException());
+
+        givenRecomputeThrows(serializationFailure);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        RuntimeException thrown = null;
+
+        // when
+        try {
+            moveService.move(request);
+            fail("Expected the serialization failure to propagate");
+        } catch (RuntimeException e) {
+            thrown = e;
+        }
+
+        // then
+        assertSame(serializationFailure, thrown);
+        verify(positionDD).save(position);
+        verify(recomputeService).recompute(schedule, savedPosition, lineL1, positionStart, lineL2, slotFrom);
     }
 
     @Test
@@ -986,6 +1127,66 @@ public class ProductionMaintenanceGanttMoveServiceTest {
                 new MoveRejectedException(ProductionMaintenanceGanttMoveService.SAVE_FAILED_KEY).getArgs());
         assertArrayEquals(new String[0], new MoveRejectedException(ProductionMaintenanceGanttMoveService.SAVE_FAILED_KEY,
                 (String[]) null).getArgs());
+    }
+
+    @Test
+    public final void shouldEscapeLineBreaksAndControlCharactersOfLogValue() {
+        // given
+        String forgedRowName = "L2\r\n2026-10-01 12:00:00 INFO forged entry\t\u0007";
+
+        // when
+        String logValue = ProductionMaintenanceGanttMoveService.toLogValue(forgedRowName);
+
+        // then
+        assertFalse(logValue.contains("\r"));
+        assertFalse(logValue.contains("\n"));
+        assertFalse(logValue.contains("\t"));
+        assertTrue(logValue.contains("\\r\\n"));
+        assertEquals("L2\\r\\n2026-10-01 12:00:00 INFO forged entry\\t\\u0007", logValue);
+    }
+
+    @Test
+    public final void shouldKeepIdentifiersAndNullReadableInLogValue() {
+        // given
+        Long positionId = POSITION_ID;
+
+        // when
+        String positionIdLogValue = ProductionMaintenanceGanttMoveService.toLogValue(positionId);
+        String rowNameLogValue = ProductionMaintenanceGanttMoveService.toLogValue(TARGET_LINE_NUMBER);
+        String nullLogValue = ProductionMaintenanceGanttMoveService.toLogValue(null);
+
+        // then
+        assertEquals("11", positionIdLogValue);
+        assertEquals(TARGET_LINE_NUMBER, rowNameLogValue);
+        assertEquals("null", nullLogValue);
+    }
+
+    @Test
+    public final void shouldFailFixtureBuilderOnUnmodelledMethods() {
+        // given
+        SearchCriteriaBuilder builder = productionLineDD.find();
+
+        AssertionError aliasFailure = null;
+        AssertionError firstResultFailure = null;
+
+        // when
+        try {
+            builder.existsAliasForAssociation(ProductionLineFields.NUMBER);
+        } catch (AssertionError e) {
+            aliasFailure = e;
+        }
+        try {
+            builder.setFirstResult(0);
+        } catch (AssertionError e) {
+            firstResultFailure = e;
+        }
+
+        // then
+        assertNotNull(aliasFailure);
+        assertEquals("Unexpected builder method: existsAliasForAssociation", aliasFailure.getMessage());
+        assertNotNull(firstResultFailure);
+        assertEquals("Unexpected builder method: setFirstResult", firstResultFailure.getMessage());
+        assertEquals("fixture SearchCriteriaBuilder", builder.toString());
     }
 
     private MoveRejectedException rejectionOf(final GanttChartMoveRequest request) {
@@ -1011,12 +1212,12 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         verify(positionDD, never()).save(Matchers.any(Entity.class));
         verify(positionDD, never()).fastSave(Matchers.any(Entity.class));
         verify(position, never()).setField(Matchers.anyString(), Matchers.any());
-        verifyZeroInteractions(recomputeService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(recomputeService);
     }
 
     private void assertNothingRecomputed() {
         verify(positionDD, never()).fastSave(Matchers.any(Entity.class));
-        verifyZeroInteractions(recomputeService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(recomputeService);
     }
 
     private void assertValidatorNeverCalled() {
@@ -1041,6 +1242,21 @@ public class ProductionMaintenanceGanttMoveServiceTest {
                 Matchers.any(Entity.class), Matchers.any(Date.class), Matchers.any(Entity.class), Matchers.any(Date.class));
     }
 
+    /**
+     * Returns an SQL exception with SQLSTATE 08000 whose next exception, SQLSTATE 08003, is also its cause, and whose next
+     * exception has a serialization failure (SQLSTATE 40001) as its own cause.
+     */
+    private static SQLException serializationFailureAsCauseOfNextException() {
+        SQLException batchFailure = new SQLException("batch", "08000");
+        SQLException nextFailure = new SQLException("next", "08003");
+
+        batchFailure.setNextException(nextFailure);
+        batchFailure.initCause(nextFailure);
+        nextFailure.initCause(new SQLException("could not serialize access due to concurrent update", "40001"));
+
+        return batchFailure;
+    }
+
     private GanttChartMoveRequest moveRequest() {
         return moveRequest(TARGET_LINE_NUMBER, scheduleContext());
     }
@@ -1062,19 +1278,6 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         }
     }
 
-    private static DataAccessService swapSearchRestrictionsDataAccessService(final DataAccessService dataAccessService)
-            throws NoSuchFieldException, IllegalAccessException {
-        Field field = SearchRestrictions.class.getDeclaredField("dataAccessService");
-
-        field.setAccessible(true);
-
-        DataAccessService previous = (DataAccessService) field.get(null);
-
-        field.set(null, dataAccessService);
-
-        return previous;
-    }
-
     private static Date date(final String value) {
         try {
             return new SimpleDateFormat(DateUtils.L_DATE_TIME_FORMAT).parse(value);
@@ -1088,7 +1291,7 @@ public class ProductionMaintenanceGanttMoveServiceTest {
 
         stubStringField(productionLine, ProductionLineFields.NUMBER, number);
         stubBooleanField(productionLine, ProductionLineFields.PRODUCTION, true);
-        stubBooleanField(productionLine, ProductionLineFields.ACTIVE, true);
+        given(productionLine.isActive()).willReturn(true);
 
         return productionLine;
     }
@@ -1106,6 +1309,7 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         Entity productionOrder = mockEntity(21L);
 
         stubStringField(productionOrder, OrderFields.NUMBER, number);
+        stubBelongsToField(productionOrder, OrderFields.TECHNOLOGY, mockEntity(31L));
 
         return productionOrder;
     }
@@ -1139,25 +1343,19 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         return conditions;
     }
 
-    private Map<SearchCriterion, EntityCondition> plannedEventConditions() {
-        Map<SearchCriterion, EntityCondition> conditions = new LinkedHashMap<SearchCriterion, EntityCondition>();
+    /**
+     * Returns the parameters of {@link ProductionMaintenanceGanttChartItemResolver#SHUTDOWN_EVENTS_QUERY}, each with the name
+     * of the {@link SearchQueryBuilder} setter that binds it.
+     */
+    private static Map<String, String> shutdownEventsQueryParameters() {
+        Map<String, String> parameters = new LinkedHashMap<String, String>();
 
-        conditions.put(SearchRestrictions.eq(PlannedEventFields.REQUIRES_SHUTDOWN, true), new TrueFieldCondition(
-                PlannedEventFields.REQUIRES_SHUTDOWN));
-        conditions.put(SearchRestrictions.lt(PlannedEventFields.START_DATE, slotTo), new DateFieldCondition(
-                PlannedEventFields.START_DATE, slotTo, false));
-        conditions.put(SearchRestrictions.gt(PlannedEventFields.FINISH_DATE, slotFrom), new DateFieldCondition(
-                PlannedEventFields.FINISH_DATE, slotFrom, true));
+        parameters.put("dateFrom", "setTimestamp");
+        parameters.put("dateTo", "setTimestamp");
+        parameters.put("requiresShutdown", "setBoolean");
+        parameters.put("productionLineId", "setLong");
 
-        return conditions;
-    }
-
-    private static Map<SearchOrder, Comparator<Entity>> plannedEventOrders() {
-        Map<SearchOrder, Comparator<Entity>> orders = new LinkedHashMap<SearchOrder, Comparator<Entity>>();
-
-        orders.put(SearchOrders.asc(PlannedEventFields.START_DATE), new DateFieldComparator(PlannedEventFields.START_DATE));
-
-        return orders;
+        return parameters;
     }
 
 
@@ -1316,11 +1514,16 @@ public class ProductionMaintenanceGanttMoveServiceTest {
 
     /**
      * Answers {@code add}, {@code addOrder} and {@code setMaxResults} with the builder itself after recording their argument,
-     * {@code list()} with the selected entities and {@code uniqueResult()} with the first selected entity or null. The
+     * {@code list()} with a search result of the selected entities, and {@code uniqueResult()} with null for no selected
+     * entity, the entity for one, and an {@link IllegalStateException} for several, as the framework's search criteria do. The
      * selected entities are those satisfying every recorded criterion, sorted by the recorded orders and limited to the
-     * recorded maximum result count. Fails on unknown criteria, unknown orders and every other builder method.
+     * recorded maximum result count. Answers {@code toString()} with a fixed description, and {@code equals(Object)} and
+     * {@code hashCode()} with identity semantics. Throws {@link AssertionError} on unknown criteria, unknown orders and every
+     * other method, whatever its return type.
      */
     private static final class FixtureCriteriaBuilderAnswer implements Answer<Object> {
+
+        private static final String BUILDER_DESCRIPTION = "fixture SearchCriteriaBuilder";
 
         private final List<Entity> entities;
 
@@ -1376,17 +1579,29 @@ public class ProductionMaintenanceGanttMoveServiceTest {
             if ("uniqueResult".equals(methodName)) {
                 List<Entity> selected = select();
 
+                if (selected.size() > 1) {
+                    throw new IllegalStateException("Too many results, expected one, found " + selected.size());
+                }
                 if (selected.isEmpty()) {
                     return null;
                 }
 
                 return selected.get(0);
             }
-            if (SearchCriteriaBuilder.class.equals(method.getReturnType())) {
-                throw new AssertionError("Unexpected builder method: " + methodName);
+
+            int parameterCount = method.getParameterTypes().length;
+
+            if ("toString".equals(methodName) && parameterCount == 0) {
+                return BUILDER_DESCRIPTION;
+            }
+            if ("equals".equals(methodName) && parameterCount == 1) {
+                return invocation.getMock() == invocation.getArguments()[0];
+            }
+            if ("hashCode".equals(methodName) && parameterCount == 0) {
+                return System.identityHashCode(invocation.getMock());
             }
 
-            return Mockito.RETURNS_DEFAULTS.answer(invocation);
+            throw new AssertionError("Unexpected builder method: " + methodName);
         }
 
         private List<Entity> select() {
@@ -1448,5 +1663,274 @@ public class ProductionMaintenanceGanttMoveServiceTest {
 
     }
 
-}
+    /**
+     * Orders entities ascending by their non-null id.
+     */
+    private static final class IdComparator implements Comparator<Entity> {
 
+        @Override
+        public int compare(final Entity first, final Entity second) {
+            return first.getId().compareTo(second.getId());
+        }
+
+    }
+
+    /**
+     * Answers {@code find(String)} of {@link ProductionMaintenanceGanttChartItemResolver#SHUTDOWN_EVENTS_QUERY} with a new
+     * {@link ShutdownEventsQueryBuilderAnswer} builder over the given planned events after recording the query text in the
+     * given query list. Fails on every other query.
+     */
+    private static final class ShutdownEventsFindAnswer implements Answer<SearchQueryBuilder> {
+
+        private final List<Entity> plannedEvents;
+
+        private final List<String> queries;
+
+        private ShutdownEventsFindAnswer(final List<Entity> plannedEvents, final List<String> queries) {
+            this.plannedEvents = plannedEvents;
+            this.queries = queries;
+        }
+
+        @Override
+        public SearchQueryBuilder answer(final InvocationOnMock invocation) {
+            String queryString = (String) invocation.getArguments()[0];
+
+            if (!ProductionMaintenanceGanttChartItemResolver.SHUTDOWN_EVENTS_QUERY.equals(queryString)) {
+                throw new AssertionError("Unexpected planned event query: " + queryString);
+            }
+
+            queries.add(queryString);
+
+            return mock(SearchQueryBuilder.class, new ShutdownEventsQueryBuilderAnswer(plannedEvents));
+        }
+
+    }
+
+    /**
+     * Records each parameter of {@link #shutdownEventsQueryParameters()} bound once with its own setter, and answers the
+     * setter with the builder itself. Answers {@code list()}, once every parameter is bound, with a projection row of each
+     * planned event that starts before {@code dateTo}, finishes after {@code dateFrom} and has the bound requires-shutdown
+     * flag, and whose own production line or workstation production line has the bound id or whose division holds a
+     * production line with that id, in ascending start date and id order. Fails on an unknown or repeated parameter, a
+     * parameter bound with another setter, a missing parameter and every other builder method.
+     */
+    private static final class ShutdownEventsQueryBuilderAnswer implements Answer<Object> {
+
+        private final List<Entity> plannedEvents;
+
+        private final Map<String, String> parameters = shutdownEventsQueryParameters();
+
+        private final Map<String, Object> values = new LinkedHashMap<String, Object>();
+
+        private ShutdownEventsQueryBuilderAnswer(final List<Entity> plannedEvents) {
+            this.plannedEvents = plannedEvents;
+        }
+
+        @Override
+        public Object answer(final InvocationOnMock invocation) throws Throwable {
+            Method method = invocation.getMethod();
+            String methodName = method.getName();
+            Object[] arguments = invocation.getArguments();
+
+            if (Object.class.equals(method.getDeclaringClass())) {
+                return Mockito.RETURNS_DEFAULTS.answer(invocation);
+            }
+            if (parameters.containsValue(methodName)) {
+                String name = (String) arguments[0];
+
+                if (!methodName.equals(parameters.get(name))) {
+                    throw new AssertionError("Unexpected shutdown events query parameter " + name + " bound with "
+                            + methodName);
+                }
+                if (values.containsKey(name)) {
+                    throw new AssertionError("Shutdown events query parameter bound twice: " + name);
+                }
+
+                values.put(name, arguments[1]);
+
+                return invocation.getMock();
+            }
+            if ("list".equals(methodName)) {
+                for (String name : parameters.keySet()) {
+                    if (!values.containsKey(name)) {
+                        throw new AssertionError("Missing shutdown events query parameter: " + name);
+                    }
+                }
+
+                return mock(SearchResult.class, new SearchResultAnswer(select()));
+            }
+
+            throw new AssertionError("Unexpected shutdown events query builder method: " + methodName);
+        }
+
+        private List<Entity> select() {
+            EntityCondition startsBeforeEnd = new DateFieldCondition(PlannedEventFields.START_DATE, (Date) values.get("dateTo"),
+                    false);
+            EntityCondition finishesAfterStart = new DateFieldCondition(PlannedEventFields.FINISH_DATE,
+                    (Date) values.get("dateFrom"), true);
+            boolean requiresShutdown = (Boolean) values.get("requiresShutdown");
+            Long productionLineId = (Long) values.get("productionLineId");
+
+            List<Entity> selected = new ArrayList<Entity>();
+
+            for (Entity plannedEvent : plannedEvents) {
+                if (startsBeforeEnd.matches(plannedEvent) && finishesAfterStart.matches(plannedEvent)
+                        && plannedEvent.getBooleanField(PlannedEventFields.REQUIRES_SHUTDOWN) == requiresShutdown
+                        && concernsLine(plannedEvent, productionLineId)) {
+                    selected.add(plannedEvent);
+                }
+            }
+
+            Collections.sort(selected, new IdComparator());
+            Collections.sort(selected, new DateFieldComparator(PlannedEventFields.START_DATE));
+
+            List<Entity> rows = new ArrayList<Entity>();
+
+            for (Entity plannedEvent : selected) {
+                rows.add(projectionRow(plannedEvent));
+            }
+
+            return rows;
+        }
+
+        private static boolean concernsLine(final Entity plannedEvent, final Long productionLineId) {
+            if (hasId(plannedEvent.getBelongsToField(PlannedEventFields.PRODUCTION_LINE), productionLineId)
+                    || hasId(workstationLine(plannedEvent), productionLineId)) {
+                return true;
+            }
+
+            Entity division = plannedEvent.getBelongsToField(PlannedEventFields.DIVISION);
+
+            if (division == null) {
+                return false;
+            }
+
+            for (Entity divisionLine : division.getManyToManyField(DivisionFieldsPL.PRODUCTION_LINES)) {
+                if (hasId(divisionLine, productionLineId)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static Entity projectionRow(final Entity plannedEvent) {
+            Entity eventLine = plannedEvent.getBelongsToField(PlannedEventFields.PRODUCTION_LINE);
+            Entity workstationLine = workstationLine(plannedEvent);
+            Entity division = plannedEvent.getBelongsToField(PlannedEventFields.DIVISION);
+            Map<String, Object> fields = new LinkedHashMap<String, Object>();
+
+            fields.put("eventNumber", plannedEvent.getStringField(PlannedEventFields.NUMBER));
+            fields.put("eventType", plannedEvent.getStringField(PlannedEventFields.TYPE));
+            fields.put("eventState", plannedEvent.getStringField(PlannedEventFields.STATE));
+            fields.put("requiresShutdown", plannedEvent.getBooleanField(PlannedEventFields.REQUIRES_SHUTDOWN));
+            fields.put("startDate", plannedEvent.getDateField(PlannedEventFields.START_DATE));
+            fields.put("finishDate", plannedEvent.getDateField(PlannedEventFields.FINISH_DATE));
+            fields.put("eventLineId", idOf(eventLine));
+            fields.put("eventLineNumber", numberOf(eventLine));
+            fields.put("workstationLineId", idOf(workstationLine));
+            fields.put("workstationLineNumber", numberOf(workstationLine));
+            fields.put("divisionId", idOf(division));
+
+            return mock(Entity.class, new ProjectionRowAnswer(fields));
+        }
+
+        private static Entity workstationLine(final Entity plannedEvent) {
+            Entity workstation = plannedEvent.getBelongsToField(PlannedEventFields.WORKSTATION);
+
+            if (workstation == null) {
+                return null;
+            }
+
+            return workstation.getBelongsToField(WorkstationFieldsPL.PRODUCTION_LINE);
+        }
+
+        private static boolean hasId(final Entity entity, final Long id) {
+            return entity != null && id.equals(entity.getId());
+        }
+
+        private static Long idOf(final Entity entity) {
+            if (entity == null) {
+                return null;
+            }
+
+            return entity.getId();
+        }
+
+        private static String numberOf(final Entity productionLine) {
+            if (productionLine == null) {
+                return null;
+            }
+
+            return productionLine.getStringField(ProductionLineFields.NUMBER);
+        }
+
+    }
+
+    /**
+     * Answers {@code getField}, {@code getStringField}, {@code getLongField}, {@code getBooleanField} and
+     * {@code getDateField} of a projection row with the value of the alias, false for a null flag and a copy for a date.
+     * Fails on an alias the row does not hold and on every other entity method.
+     */
+    private static final class ProjectionRowAnswer implements Answer<Object> {
+
+        private static final List<String> FIELD_GETTERS = Arrays.asList("getField", "getStringField", "getLongField",
+                "getBooleanField", "getDateField");
+
+        private final Map<String, Object> fields;
+
+        private ProjectionRowAnswer(final Map<String, Object> fields) {
+            this.fields = fields;
+        }
+
+        @Override
+        public Object answer(final InvocationOnMock invocation) throws Throwable {
+            Method method = invocation.getMethod();
+            String methodName = method.getName();
+
+            if (Object.class.equals(method.getDeclaringClass())) {
+                return Mockito.RETURNS_DEFAULTS.answer(invocation);
+            }
+            if (!FIELD_GETTERS.contains(methodName)) {
+                throw new AssertionError("Unexpected projection row method: " + methodName);
+            }
+
+            String alias = (String) invocation.getArguments()[0];
+
+            if (!fields.containsKey(alias)) {
+                throw new AssertionError("Unknown projection row alias: " + alias);
+            }
+
+            Object value = fields.get(alias);
+
+            if ("getBooleanField".equals(methodName)) {
+                return Boolean.TRUE.equals(value);
+            }
+            if (value instanceof Date) {
+                return new Date(((Date) value).getTime());
+            }
+
+            return value;
+        }
+
+    }
+
+    /**
+     * Fails the test on every call it answers, naming the unexpected call.
+     */
+    private static final class FailingAnswer implements Answer<Object> {
+
+        private final String call;
+
+        private FailingAnswer(final String call) {
+            this.call = call;
+        }
+
+        @Override
+        public Object answer(final InvocationOnMock invocation) {
+            throw new AssertionError("Unexpected " + call);
+        }
+
+    }
+
+}

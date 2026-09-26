@@ -29,8 +29,29 @@
  * Runs against a started application whose database holds mes_db_en.sql and fixture.sql:
  *
  *   node --test-reporter=tap acceptance.test.js --base-url http://localhost:<port> --user <login> --password <password>
- *        --db-uri postgresql://<user>:<password>@<host>:<port>/<db> --chrome <path to chrome-headless-shell>
+ *        --db-uri postgresql://<user>:<password>@localhost:<port>/<db> --chrome <path to chrome-headless-shell>
  *        --base-day YYYY-MM-DD
+ *
+ * Tested toolchain: Node.js v22.23.2, Chrome for Testing headless shell 154.0.8037.57, PostgreSQL 14 with its psql,
+ * on Linux. Before it parses the arguments, the runner throws unless it runs on Linux with /proc/net/tcp and on
+ * Node.js 22 or later with the global fetch, WebSocket and Headers.prototype.getSetCookie.
+ *
+ * Arguments, checked before any case is registered:
+ *   --base-url  a loopback http or https origin (localhost, 127.0.0.0/8 or [::1]) without user name, password, path,
+ *               query or fragment.
+ *   --db-uri    a postgresql:// or postgres:// URI in libpq 14 syntax: well-formed percent escapes other than %00,
+ *               key=value query parameters that libpq accepts other than service, hosts that are loopback hosts or
+ *               absolute socket directories, loopback hostaddr values, and a database name; it is passed to psql as
+ *               given, with application_name appended.
+ *   --chrome    an executable file, as a path or as a name found on PATH.
+ *   --user      a non-blank login.
+ *
+ * Before any case, the before hook reads, and only reads, the database and /proc: the database comment must equal
+ * qcadoo-acceptance:productionMaintenanceGantt; exactly one process must listen on the --base-url port; that process
+ * must hold at least one connection to the server of the database, every such connection must be a loopback
+ * connection to that database, and it must hold no loopback connection to another PostgreSQL server. Otherwise every
+ * case fails without an HTTP request, a browser or a database write. flushApplicationBackendStats terminates only the
+ * idle backends of that database that serve connections of that same process.
  *
  * http: cases post view events with Node's fetch. browser: cases drive the board in headless Chrome through the
  * DevTools Protocol with real mouse input. Database state is read, and concurrent transactions are run, with psql.
@@ -50,14 +71,209 @@ const path = require('node:path');
 // Arguments
 // ---------------------------------------------------------------------------------------------------------------
 
-const USAGE = 'usage: node acceptance.test.js --base-url <http://host:port> --user <login> --password <password> '
-    + '--db-uri <postgresql://user:password@host:port/db> --chrome <path> --base-day <YYYY-MM-DD>';
+const USAGE = 'usage: node acceptance.test.js --base-url <http://localhost:port> --user <login> --password <password> '
+    + '--db-uri <postgresql://user:password@localhost:port/db> --chrome <path> --base-day <YYYY-MM-DD>';
 
 const ARGUMENT_NAMES = ['base-url', 'user', 'password', 'db-uri', 'chrome', 'base-day'];
 
 /**
- * Parses `--name value` and `--name=value` arguments. Throws with the usage line when an argument is unknown, a value
- * is missing, or --base-day is not a calendar date in the YYYY-MM-DD form.
+ * Returns whether the host name is localhost, a 127.0.0.0/8 dotted quad or the IPv6 loopback address (::1 or [::1]).
+ * The comparison ignores case.
+ */
+function isLoopbackHost(name) {
+    const host = String(name).toLowerCase();
+
+    return host === 'localhost' || host === '[::1]' || isLoopbackAddress(host);
+}
+
+/** Returns whether the text is a 127.0.0.0/8 dotted quad or ::1. The comparison ignores case. */
+function isLoopbackAddress(text) {
+    const address = String(text).toLowerCase();
+
+    if (address === '::1') {
+        return true;
+    }
+
+    const quad = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(address);
+
+    return quad !== null && quad.slice(1).every((octet) => Number(octet) <= 255);
+}
+
+/** Returns whether the path names an existing regular file the process may execute. */
+function isExecutableFile(candidate) {
+    try {
+        if (!fs.statSync(candidate).isFile()) {
+            return false;
+        }
+
+        fs.accessSync(candidate, fs.constants.X_OK);
+
+        return true;
+    } catch (error) {
+        return false;
+    }
+}
+
+/**
+ * Validates --base-url and returns { baseUrl, httpPort }: baseUrl is the URL's origin and httpPort its port, 80 or 443
+ * when the URL names none. Throws with the usage line unless the value is an http or https URL on a loopback host
+ * without user name, password, query or fragment and with the path '/' or none. The message never holds the value.
+ */
+function parseBaseUrl(value) {
+    let url;
+
+    try {
+        url = new URL(value);
+    } catch (error) {
+        throw new Error(`--base-url must be an absolute http or https URL\n${USAGE}`);
+    }
+
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+        throw new Error(`--base-url must use the http or https scheme\n${USAGE}`);
+    }
+    if (url.username !== '' || url.password !== '') {
+        throw new Error(`--base-url must not hold a user name or a password\n${USAGE}`);
+    }
+    if (url.pathname !== '/' || url.search !== '' || url.hash !== '') {
+        throw new Error(`--base-url must be an origin without a path, a query or a fragment\n${USAGE}`);
+    }
+    if (!isLoopbackHost(url.hostname)) {
+        throw new Error(`--base-url must name a loopback host: localhost, 127.0.0.0/8 or [::1]\n${USAGE}`);
+    }
+
+    return {
+        baseUrl: url.origin,
+        httpPort: url.port ? Number(url.port) : (url.protocol === 'https:' ? 443 : 80)
+    };
+}
+
+// Query parameters of a libpq 14 connection URI accepted in --db-uri: the libpq connection keywords other than service.
+// The URI-only parameter ssl is accepted with the value true.
+const LIBPQ_URI_PARAMETERS = new Set(['user', 'password', 'passfile', 'channel_binding', 'connect_timeout', 'dbname',
+    'host', 'hostaddr', 'port', 'client_encoding', 'options', 'application_name', 'fallback_application_name',
+    'keepalives', 'keepalives_idle', 'keepalives_interval', 'keepalives_count', 'tcp_user_timeout', 'sslmode',
+    'requiressl', 'sslcompression', 'sslcert', 'sslkey', 'sslpassword', 'sslrootcert', 'sslcrl', 'sslcrldir', 'sslsni',
+    'requirepeer', 'ssl_min_protocol_version', 'ssl_max_protocol_version', 'gssencmode', 'krbsrvname', 'gsslib',
+    'replication', 'target_session_attrs']);
+
+/** Returns the percent-decoded text, or null when the decoded bytes are not UTF-8. */
+function percentDecode(text) {
+    try {
+        return decodeURIComponent(text);
+    } catch (error) {
+        return null;
+    }
+}
+
+/**
+ * Validates --db-uri. Throws with the usage line unless the value:
+ * - has no leading or trailing white space and no '#';
+ * - writes every '%' as a two-digit hex escape other than %00;
+ * - is a postgresql:// or postgres:// URI;
+ * - has a query, when it holds '?', of '&'-separated key=value parameters with no empty parameter and a single '=',
+ *   each key in LIBPQ_URI_PARAMETERS, or ssl=true;
+ * - names at least one host, and every host (of the authority and of the host query parameters) is a single loopback
+ *   host or an absolute socket directory;
+ * - has only single loopback addresses as hostaddr query parameters;
+ * - names a database (the last dbname query parameter, else the path) that is non-blank and holds no '/'.
+ * The message never holds the value.
+ */
+function validateDatabaseUri(value) {
+    if (value !== value.trim()) {
+        throw new Error(`--db-uri must not begin or end with white space\n${USAGE}`);
+    }
+    if (value.includes('#')) {
+        throw new Error(`--db-uri must write '#' as %23\n${USAGE}`);
+    }
+    if (/%(?![0-9A-Fa-f]{2})/.test(value) || /%00/.test(value)) {
+        throw new Error(`--db-uri must write every '%' as a two-digit hex escape other than %00\n${USAGE}`);
+    }
+
+    let url;
+
+    try {
+        url = new URL(value);
+    } catch (error) {
+        throw new Error(`--db-uri must be a postgresql:// connection URI\n${USAGE}`);
+    }
+
+    if (url.protocol !== 'postgresql:' && url.protocol !== 'postgres:') {
+        throw new Error(`--db-uri must use the postgresql or postgres scheme\n${USAGE}`);
+    }
+
+    const query = url.search.slice(1);
+    const parameters = [];
+
+    if (value.includes('?') && query === '') {
+        throw new Error(`--db-uri query parameters must have the form key=value\n${USAGE}`);
+    }
+
+    for (const token of query === '' ? [] : query.split('&')) {
+        const parts = token.split('=');
+        const key = parts.length === 2 ? percentDecode(parts[0]) : null;
+        const parameterValue = parts.length === 2 ? percentDecode(parts[1]) : null;
+
+        if (key === null || parameterValue === null) {
+            throw new Error(`--db-uri query parameters must have the form key=value\n${USAGE}`);
+        }
+        if (key === 'ssl' ? parameterValue !== 'true' : !LIBPQ_URI_PARAMETERS.has(key)) {
+            throw new Error(`--db-uri may use only the libpq 14 connection parameters other than service, and ssl only `
+                + `as ssl=true\n${USAGE}`);
+        }
+
+        parameters.push({ key, value: parameterValue });
+    }
+
+    const values = (key) => parameters.filter((parameter) => parameter.key === key).map((parameter) => parameter.value);
+    const hostname = percentDecode(url.hostname);
+    const hosts = (hostname === '' ? [] : [hostname]).concat(values('host'));
+    const isLocalHost = (host) => host !== null && !host.includes(',') && (isLoopbackHost(host) || host.startsWith('/'));
+
+    if (hosts.length === 0) {
+        throw new Error(`--db-uri must name a host\n${USAGE}`);
+    }
+    if (!hosts.every(isLocalHost)) {
+        throw new Error(`--db-uri must name only single loopback hosts (localhost, 127.0.0.0/8 or [::1]) or absolute `
+            + `socket directories\n${USAGE}`);
+    }
+    if (!values('hostaddr').every((address) => !address.includes(',') && isLoopbackAddress(address))) {
+        throw new Error(`--db-uri hostaddr must be a single loopback address: 127.0.0.0/8 or ::1\n${USAGE}`);
+    }
+
+    const databases = values('dbname');
+    const database = databases.length > 0 ? databases[databases.length - 1] : percentDecode(url.pathname.slice(1));
+
+    if (database === null || database.trim() === '' || database.includes('/')) {
+        throw new Error(`--db-uri must name a database without '/'\n${USAGE}`);
+    }
+}
+
+/**
+ * Returns the absolute path of the executable file --chrome names: the path itself when the value holds '/', else the
+ * first match on PATH. Throws with the usage line when the value is blank or names no executable file.
+ */
+function resolveChrome(value) {
+    if (value.trim() === '') {
+        throw new Error(`--chrome must not be blank\n${USAGE}`);
+    }
+
+    const candidates = value.includes('/')
+        ? [path.resolve(value)]
+        : (process.env.PATH || '').split(path.delimiter).map((directory) => path.resolve(directory, value));
+    const executable = candidates.find(isExecutableFile);
+
+    if (executable === undefined) {
+        throw new Error(`--chrome must name an executable file\n${USAGE}`);
+    }
+
+    return executable;
+}
+
+/**
+ * Parses `--name value` and `--name=value` arguments, then normalizes and validates the values with parseBaseUrl,
+ * validateDatabaseUri and resolveChrome. Throws with the usage line when an argument is unknown, a value is missing,
+ * --user is blank, --base-day is not a calendar date in the YYYY-MM-DD form, or a value fails its validation. Returns
+ * { baseUrl, httpPort, user, password, dbUri, chrome, baseDay, baseDayMillis }; dbUri is --db-uri unchanged.
  */
 function parseArguments(argv) {
     const values = {};
@@ -105,16 +321,61 @@ function parseArguments(argv) {
         throw new Error(`--base-day must be a calendar date in the YYYY-MM-DD form, got ${values['base-day']}\n${USAGE}`);
     }
 
+    if (values.user.trim() === '') {
+        throw new Error(`--user must not be blank\n${USAGE}`);
+    }
+
+    const { baseUrl, httpPort } = parseBaseUrl(values['base-url']);
+
+    validateDatabaseUri(values['db-uri']);
+
     return {
-        baseUrl: values['base-url'].replace(/\/+$/, ''),
+        baseUrl,
+        httpPort,
         user: values.user,
         password: values.password,
         dbUri: values['db-uri'],
-        chrome: values.chrome,
+        chrome: resolveChrome(values.chrome),
         baseDay: values['base-day'],
         baseDayMillis: dayMillis
     };
 }
+
+/**
+ * Throws unless the process runs on Linux with /proc/net/tcp, on Node.js 22 or later, and with the global fetch,
+ * WebSocket, Headers and Headers.prototype.getSetCookie.
+ */
+function checkRuntime() {
+    if (process.platform !== 'linux' || !fs.existsSync('/proc/net/tcp')) {
+        throw new Error(`acceptance.test.js requires Linux with /proc/net/tcp, not ${process.platform}`);
+    }
+
+    const major = Number(process.versions.node.split('.')[0]);
+
+    if (!(major >= 22)) {
+        throw new Error(`acceptance.test.js requires Node.js 22 or later (tested on v22.23.2), not ${process.version}`);
+    }
+
+    const missing = [];
+
+    if (typeof fetch !== 'function') {
+        missing.push('fetch');
+    }
+    if (typeof WebSocket !== 'function') {
+        missing.push('WebSocket');
+    }
+    if (typeof Headers !== 'function') {
+        missing.push('Headers');
+    } else if (typeof Headers.prototype.getSetCookie !== 'function') {
+        missing.push('Headers.prototype.getSetCookie');
+    }
+
+    if (missing.length > 0) {
+        throw new Error(`acceptance.test.js requires the global ${missing.join(', ')}, missing on Node.js ${process.version}`);
+    }
+}
+
+checkRuntime();
 
 const ARGS = parseArguments(process.argv.slice(2));
 
@@ -141,6 +402,33 @@ const BUNDLE_BY_PREFIX = {
 const BOARD_PATH = '/page/cmmsMachineParts/productionMaintenanceGantt.html';
 
 const CASE_TIMEOUT_MS = 600000;
+
+// Deadline of one HttpSession request, from sending it to reading the whole response body.
+const HTTP_REQUEST_TIMEOUT_MS = 180000;
+
+// Deadline for the DevTools socket to open once Chrome has printed its endpoint.
+const DEVTOOLS_CONNECT_TIMEOUT_MS = 30000;
+
+// Deadline for the reply to one DevTools command, and to Page.navigate.
+const DEVTOOLS_COMMAND_TIMEOUT_MS = 30000;
+const DEVTOOLS_NAVIGATE_TIMEOUT_MS = 60000;
+
+// Wait for Chrome to exit after SIGTERM, and again after SIGKILL.
+const CHROME_EXIT_WAIT_MS = 5000;
+
+// Exit status after SIGINT and SIGTERM, and the deadline of the cleanup that runs before it.
+const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 };
+const SIGNAL_CLEANUP_TIMEOUT_MS = 15000;
+
+// Hosts a DevTools endpoint may name.
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+// Longest excerpt of a browser response body quoted in an error message.
+const RESPONSE_EXCERPT_LENGTH = 300;
+
+// Deadline for the board to become idle after a drop, and the time without a board request event that counts as idle.
+const DRAG_IDLE_TIMEOUT_MS = 30000;
+const DRAG_IDLE_QUIET_MS = 1500;
 
 // ganttChart.js geometry: CELL_WIDTH px per hour at H1 and CELL_HEIGHT px per row.
 const CELL_WIDTH_PX = 25;
@@ -255,11 +543,35 @@ function minutesBetween(a, b) {
 // psql
 // ---------------------------------------------------------------------------------------------------------------
 
-// psql processes that have not exited yet.
+// psql processes that have not closed yet.
 const PSQL_CHILDREN = new Set();
 
 // Temporary directories removed by the after hook.
 const TEMP_DIRS = new Set();
+
+// Deadline of an ordinary psql query, in ms.
+const PSQL_QUERY_TIMEOUT_MS = 60000;
+
+// Deadline of a monitoring query run inside a waitFor poll, in ms.
+const PSQL_PROBE_TIMEOUT_MS = 10000;
+
+// Deadline of a psql session that holds a transaction open, in ms.
+const PSQL_HELD_TIMEOUT_MS = 180000;
+
+// Time from SIGTERM to SIGKILL of a psql process past its deadline, in ms.
+const PSQL_KILL_GRACE_MS = 5000;
+
+// Characters of psql standard output collected before the process is killed.
+const PSQL_STDOUT_LIMIT = 8 * 1024 * 1024;
+
+// Characters of one psql standard output line read line by line before the process is killed.
+const PSQL_LINE_LIMIT = 65536;
+
+// Characters of psql standard error kept as a rolling tail.
+const PSQL_STDERR_TAIL = 16384;
+
+// PGCONNECT_TIMEOUT, in seconds, of psql processes when the environment sets none.
+const PSQL_CONNECT_TIMEOUT_SECONDS = '10';
 
 function makeTempDir(prefix) {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), `pmg-acceptance-${prefix}-`));
@@ -276,47 +588,237 @@ function databaseUri(app) {
     return `${ARGS.dbUri}${separator}application_name=${encodeURIComponent(`pmg-acceptance-${app}`)}`;
 }
 
-/** Spawns psql -X -A -t -q -v ON_ERROR_STOP=1 against the acceptance database with application name pmg-acceptance-<app>. */
-function spawnPsql(app) {
-    const child = childProcess.spawn('psql', ['-X', '-A', '-t', '-q', '-v', 'ON_ERROR_STOP=1', '-d', databaseUri(app)],
-        { stdio: ['pipe', 'pipe', 'pipe'] });
+/** Returns a copy of process.env whose PGCONNECT_TIMEOUT is PSQL_CONNECT_TIMEOUT_SECONDS when process.env sets none. */
+function psqlEnvironment() {
+    const environment = Object.assign({}, process.env);
+
+    if (environment.PGCONNECT_TIMEOUT === undefined) {
+        environment.PGCONNECT_TIMEOUT = PSQL_CONNECT_TIMEOUT_SECONDS;
+    }
+
+    return environment;
+}
+
+/** Returns the first non-blank line of the SQL script, cut to 120 characters. */
+function sqlLabel(sql) {
+    const line = String(sql).split('\n').map((text) => text.trim()).find((text) => text !== '') || '(empty script)';
+
+    return line.length > 120 ? `${line.slice(0, 117)}...` : line;
+}
+
+/**
+ * Spawns psql -X -w -A -t -q -v ON_ERROR_STOP=1 against the acceptance database with application name
+ * pmg-acceptance-<app> and the environment of psqlEnvironment(). Returns {child, done, write, end, terminate, isClosed}.
+ *
+ * Options:
+ *   operation  label of the process in error messages
+ *   timeout    deadline in ms; past it the process gets SIGTERM, then SIGKILL after PSQL_KILL_GRACE_MS
+ *   onLine     function called with each standard output line; with it, standard output is not collected and done
+ *              resolves with ''; without it, done resolves with the standard output, limited to PSQL_STDOUT_LIMIT
+ *              characters
+ *
+ * done settles once the process has closed or has failed to start. It resolves when psql exited with 0 and no failure or
+ * stream error was recorded, and otherwise rejects with an error naming the app, the operation, the exit status or the
+ * recorded failure (start failure, missing standard stream, deadline, output limit, line handler error), the stream
+ * errors and the standard error tail (the last PSQL_STDERR_TAIL characters).
+ *
+ * write(text) and end(text) write to standard input and return false, writing nothing, once the process has closed or
+ * its standard input has ended. terminate(error) records error as the failure, sends SIGTERM and schedules SIGKILL.
+ * isClosed() tells whether done has settled.
+ */
+function spawnPsql(app, { operation = 'psql session', timeout = PSQL_QUERY_TIMEOUT_MS, onLine = null } = {}) {
+    const context = `psql (${app}, ${operation})`;
+    const handle = { child: null, done: null, write: null, end: null, terminate: null, isClosed: null };
+    let stdout = '';
+    let stderr = '';
+    let partialLine = '';
+    let failure = null;
+    const streamErrors = [];
+    let closed = false;
+    let deadlineTimer = null;
+    let killTimer = null;
+    let settleDone = null;
+
+    handle.done = new Promise((resolve, reject) => {
+        settleDone = { resolve, reject };
+    });
+
+    const stderrTail = () => stderr.trim() || '(no standard error)';
+
+    const kill = (signal) => {
+        if (!handle.child || closed) {
+            return;
+        }
+
+        try {
+            handle.child.kill(signal);
+        } catch (error) {
+            streamErrors.push(`kill ${signal}: ${error.message}`);
+        }
+    };
+
+    const terminate = (error) => {
+        if (closed) {
+            return;
+        }
+        if (!failure) {
+            failure = error;
+        }
+
+        kill('SIGTERM');
+
+        if (!killTimer) {
+            killTimer = setTimeout(() => kill('SIGKILL'), PSQL_KILL_GRACE_MS);
+        }
+    };
+
+    const finish = (code, signal) => {
+        if (closed) {
+            return;
+        }
+
+        closed = true;
+        clearTimeout(deadlineTimer);
+        clearTimeout(killTimer);
+        PSQL_CHILDREN.delete(handle.child);
+
+        const streams = streamErrors.length > 0 ? ` (stream errors: ${streamErrors.join('; ')})` : '';
+
+        if (failure) {
+            settleDone.reject(new Error(`${failure.message}${streams}; standard error: ${stderrTail()}`));
+        } else if (code === 0 && streamErrors.length === 0) {
+            settleDone.resolve(stdout);
+        } else {
+            settleDone.reject(new Error(`${context} exited with ${code === null ? signal : code}${streams}: ${stderrTail()}`));
+        }
+    };
+
+    const writable = () => !closed && handle.child !== null && handle.child.stdin !== null
+        && !handle.child.stdin.destroyed && !handle.child.stdin.writableEnded;
+
+    handle.write = (text) => {
+        if (!writable()) {
+            return false;
+        }
+
+        handle.child.stdin.write(text);
+
+        return true;
+    };
+    handle.end = (text) => {
+        if (!writable()) {
+            return false;
+        }
+
+        handle.child.stdin.end(text);
+
+        return true;
+    };
+    handle.terminate = terminate;
+    handle.isClosed = () => closed;
+
+    try {
+        handle.child = childProcess.spawn('psql',
+            ['-X', '-w', '-A', '-t', '-q', '-v', 'ON_ERROR_STOP=1', '-d', databaseUri(app)],
+            { stdio: ['pipe', 'pipe', 'pipe'], env: psqlEnvironment() });
+    } catch (error) {
+        failure = new Error(`${context} could not start: ${error.message}`);
+        finish(null, null);
+
+        return handle;
+    }
+
+    const child = handle.child;
 
     PSQL_CHILDREN.add(child);
-    child.on('exit', () => PSQL_CHILDREN.delete(child));
+    child.on('error', (error) => {
+        if (child.pid === undefined) {
+            if (!failure) {
+                failure = new Error(`${context} could not start: ${error.message}`);
+            }
 
-    const output = { stdout: '', stderr: '' };
+            finish(null, null);
+
+            return;
+        }
+
+        terminate(new Error(`${context} failed: ${error.message}`));
+    });
+    child.on('close', (code, signal) => finish(code, signal));
+
+    deadlineTimer = setTimeout(() => terminate(new Error(`${context} exceeded its ${timeout} ms deadline`)), timeout);
+
+    for (const [name, stream] of [['standard input', child.stdin], ['standard output', child.stdout],
+        ['standard error', child.stderr]]) {
+        if (stream) {
+            stream.on('error', (error) => streamErrors.push(`${name}: ${error.code || error.message}`));
+        }
+    }
+
+    if (!child.stdin || !child.stdout || !child.stderr) {
+        terminate(new Error(`${context} started without its standard input, output and error pipes`));
+
+        return handle;
+    }
 
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (chunk) => {
-        output.stdout += chunk;
-    });
     child.stderr.on('data', (chunk) => {
-        output.stderr += chunk;
+        stderr = (stderr + chunk).slice(-PSQL_STDERR_TAIL);
     });
+    child.stdout.on('data', (chunk) => {
+        if (closed || failure) {
+            return;
+        }
 
-    const done = new Promise((resolve, reject) => {
-        child.on('error', (error) => reject(new Error(`psql (${app}) could not start: ${error.message}`)));
-        child.on('close', (code, signal) => {
-            if (code === 0) {
-                resolve(output.stdout);
-            } else {
-                reject(new Error(`psql (${app}) exited with ${code === null ? signal : code}: ${output.stderr.trim()}`));
+        if (!onLine) {
+            if (stdout.length + chunk.length > PSQL_STDOUT_LIMIT) {
+                terminate(new Error(`${context} output exceeded ${PSQL_STDOUT_LIMIT} characters`));
+
+                return;
             }
-        });
+
+            stdout += chunk;
+
+            return;
+        }
+
+        const lines = (partialLine + chunk).split('\n');
+
+        partialLine = lines.pop();
+
+        if (partialLine.length > PSQL_LINE_LIMIT) {
+            terminate(new Error(`${context} printed a line longer than ${PSQL_LINE_LIMIT} characters`));
+
+            return;
+        }
+
+        for (const line of lines) {
+            try {
+                onLine(line);
+            } catch (error) {
+                terminate(new Error(`${context} output line handler failed on ${JSON.stringify(line.slice(0, 200))}: `
+                    + error.message));
+
+                return;
+            }
+        }
     });
 
-    return { child, done, output };
+    return handle;
 }
 
-/** Runs the SQL script with psql and returns its standard output. Rejects with psql's stderr on a non-zero exit. */
-async function psql(sql, { app = 'main' } = {}) {
-    const { child, done } = spawnPsql(app);
+/**
+ * Runs the SQL script with psql and returns its standard output. Rejects with the error of spawnPsql's done and the
+ * script. Options: app (default 'main'), timeout in ms (default PSQL_QUERY_TIMEOUT_MS).
+ */
+async function psql(sql, { app = 'main', timeout = PSQL_QUERY_TIMEOUT_MS } = {}) {
+    const session = spawnPsql(app, { operation: sqlLabel(sql), timeout });
 
-    child.stdin.end(sql);
+    session.end(sql);
 
     try {
-        return await done;
+        return await session.done;
     } catch (error) {
         throw new Error(`${error.message}\n--- SQL ---\n${sql}`);
     }
@@ -603,6 +1105,10 @@ class HttpSession {
         }
     }
 
+    /**
+     * Sends the request with the session cookies, takes the answer's cookies and returns {status, headers, text}.
+     * Throws, naming the method and the path, when the whole answer has not arrived within HTTP_REQUEST_TIMEOUT_MS.
+     */
     async request(pathAndQuery, { method = 'GET', headers = {}, body } = {}) {
         const requestHeaders = new Headers(headers);
 
@@ -612,11 +1118,25 @@ class HttpSession {
             requestHeaders.set('Cookie', Array.from(this.cookies, ([name, value]) => `${name}=${value}`).join('; '));
         }
 
-        const response = await fetch(this.baseUrl + pathAndQuery, { method, headers: requestHeaders, body, redirect: 'manual' });
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), HTTP_REQUEST_TIMEOUT_MS);
 
-        this.updateCookies(response);
+        try {
+            const response = await fetch(this.baseUrl + pathAndQuery,
+                { method, headers: requestHeaders, body, redirect: 'manual', signal: controller.signal });
 
-        return { status: response.status, headers: response.headers, text: await response.text() };
+            this.updateCookies(response);
+
+            return { status: response.status, headers: response.headers, text: await response.text() };
+        } catch (error) {
+            if (controller.signal.aborted) {
+                throw new Error(`${method} ${pathAndQuery} got no complete answer within ${HTTP_REQUEST_TIMEOUT_MS} ms`);
+            }
+
+            throw error;
+        } finally {
+            clearTimeout(timer);
+        }
     }
 
     csrfHeaders() {
@@ -1080,71 +1600,457 @@ function psPpsChecksums(all) {
 // Concurrent transactions
 // ---------------------------------------------------------------------------------------------------------------
 
+// Standard output line of a held transaction reporting its backend pid once its SQL has run.
+const HELD_READY_PATTERN = /^pmg-ready:(\d+)$/;
+
+// Standard output line of a held transaction reporting the end of its pg_sleep hold.
+const HELD_HOLD_LINE = 'pmg-held';
+
+// Time a held transaction has to report its SQL as run, and to close after COMMIT or ROLLBACK, in ms.
+const HELD_ANSWER_TIMEOUT_MS = 30000;
+
+// Seconds the background transaction sleeps inside its transaction once its marker exists.
+const BACKGROUND_HOLD_SECONDS = 3;
+
+// Time a settled request or transaction is awaited during the cleanup of a failed concurrent case, in ms.
+const CLEANUP_SETTLE_TIMEOUT_MS = 60000;
+
+// Time the answers of the posted moves are awaited once the concurrent transaction has ended, in ms.
+const MOVE_ANSWER_TIMEOUT_MS = 60000;
+
 /**
- * Starts a psql session (application pmg-acceptance-bg) that writes writeSql in a transaction, creates a marker file,
- * sleeps 3 s and commits. Returns {markerPath, done}; done resolves when psql exits 0.
+ * Returns {status: 'fulfilled', value}, {status: 'rejected', reason}, or {status: 'pending'} when the promise has not
+ * settled within timeout ms. Clears its timer on return.
  */
-function backgroundWrite(writeSql) {
-    const markerPath = path.join(makeTempDir('bg'), 'written');
-    const { child, done } = spawnPsql('bg');
-
-    child.stdin.end(`BEGIN;\n${writeSql};\n\\! touch '${markerPath}'\nSELECT pg_sleep(3);\nCOMMIT;\n`);
-    done.catch(() => undefined);
-
-    return { markerPath, done };
-}
-
-/** Waits until the marker file exists, failing early when the psql session ends first. */
-async function waitForMarker(markerPath, done, description) {
-    let finished = null;
-
-    done.then(() => {
-        finished = 'exited';
-    }, (error) => {
-        finished = error;
+async function settleWithin(promise, timeout) {
+    let timer = null;
+    const expiry = new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ status: 'pending' }), timeout);
     });
 
-    await waitFor(description, () => {
-        if (fs.existsSync(markerPath)) {
-            return true;
-        }
-        if (finished instanceof Error) {
-            throw new FatalError(finished.message);
-        }
-        if (finished) {
-            throw new FatalError('psql exited before creating the marker');
-        }
-
-        return false;
-    }, { timeout: 30000, interval: 25 });
+    try {
+        return await Promise.race([
+            Promise.resolve(promise).then((value) => ({ status: 'fulfilled', value }), (reason) => ({ status: 'rejected', reason })),
+            expiry
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
-/** Counts client backends of the application (any application name other than pmg-acceptance*) waiting on a lock. */
-async function appLockWaiters() {
-    return psqlInteger(`
-SELECT count(*)
-FROM pg_stat_activity
-WHERE datname = current_database()
-  AND backend_type = 'client backend'
-  AND wait_event_type = 'Lock'
-  AND coalesce(application_name, '') NOT LIKE 'pmg-acceptance%';
-`, { app: 'monitor' });
+/** Returns the value of the promise. Throws its rejection, or a timeout error naming description after timeout ms. */
+async function valueWithin(promise, timeout, description) {
+    const outcome = await settleWithin(promise, timeout);
+
+    if (outcome.status === 'fulfilled') {
+        return outcome.value;
+    }
+    if (outcome.status === 'rejected') {
+        throw outcome.reason;
+    }
+
+    throw new Error(`timed out after ${timeout} ms waiting for ${description}`);
 }
 
-/** Returns pid, application name, state, wait event and query text of every backend of the acceptance database. */
+/** Returns {promise, resolve, reject, settled}; resolve and reject act once, and a rejection nobody awaits is handled. */
+function deferred() {
+    const result = { promise: null, resolve: null, reject: null, settled: false };
+
+    result.promise = new Promise((resolve, reject) => {
+        result.resolve = (value) => {
+            if (!result.settled) {
+                result.settled = true;
+                resolve(value);
+            }
+        };
+        result.reject = (error) => {
+            if (!result.settled) {
+                result.settled = true;
+                reject(error);
+            }
+        };
+    });
+    result.promise.catch(() => undefined);
+
+    return result;
+}
+
+/**
+ * Returns {promise, settled, outcome, describe()} for a started request: settled turns true and outcome holds
+ * {status, value | reason} once the promise settles; describe() prints the outcome, or 'pending'.
+ */
+function trackSettlement(promise) {
+    const tracked = {
+        promise,
+        settled: false,
+        outcome: null,
+        describe() {
+            if (!tracked.outcome) {
+                return 'pending';
+            }
+
+            return tracked.outcome.status === 'fulfilled'
+                ? `answered ${JSON.stringify(tracked.outcome.value && tracked.outcome.value.moveResult)}`
+                : `failed: ${tracked.outcome.reason && tracked.outcome.reason.message}`;
+        }
+    };
+
+    promise.then((value) => {
+        tracked.settled = true;
+        tracked.outcome = { status: 'fulfilled', value };
+    }, (reason) => {
+        tracked.settled = true;
+        tracked.outcome = { status: 'rejected', reason };
+    });
+
+    return tracked;
+}
+
+/**
+ * Waits up to timeout ms until every tracked move has settled and returns their answers in order. Throws when a move
+ * failed or has not settled in time; the error names the outcome of every move, and its cause is the first failure.
+ */
+async function moveAnswers(moves, timeout) {
+    const settled = await settleWithin(Promise.allSettled(moves.map((move) => move.promise)), timeout);
+    const outcomes = () => moves.map((move, index) => `move M${index + 1}: ${move.describe()}`).join('\n');
+
+    if (settled.status === 'pending') {
+        throw new Error(`the moves did not all answer within ${timeout} ms\n${outcomes()}`);
+    }
+
+    const failure = settled.value.find((result) => result.status === 'rejected');
+
+    if (failure) {
+        throw new Error(`a move failed: ${failure.reason && failure.reason.message}\n${outcomes()}`,
+            { cause: failure.reason });
+    }
+
+    return settled.value.map((result) => result.value);
+}
+
+/**
+ * psql session (application pmg-acceptance-<app>, deadline PSQL_HELD_TIMEOUT_MS) that runs BEGIN, the SQL and
+ * SELECT 'pmg-ready:' || pg_backend_pid(), then keeps its transaction open with standard input open until commit() or
+ * rollback(). Its standard output is read line by line. Once the ready line arrives, the marker file
+ * <temporary directory pmg-acceptance-<app>-*>/<markerName> is created with the flag 'wx' and checked to be a file;
+ * when that fails, the transaction is rolled back and open() rejects.
+ *
+ *   const holder = await HeldTransaction.open('holder', 'SELECT id FROM t WHERE id = 1 FOR UPDATE', 'locked');
+ *   // holder.pid is the backend pid, holder.markerPath the created marker file
+ *   await holder.commit();
+ */
+class HeldTransaction {
+    /** Opens the transaction and resolves with it once the marker file exists. */
+    static async open(app, sql, markerName) {
+        const transaction = new HeldTransaction(app, sql, markerName);
+
+        await transaction.start();
+
+        return transaction;
+    }
+
+    constructor(app, sql, markerName) {
+        this.app = app;
+        this.sql = sql;
+        this.context = `held transaction psql (${app})`;
+        this.markerPath = path.join(makeTempDir(app), markerName);
+        this.pid = null;
+        this.ready = deferred();
+        this.held = deferred();
+        this.holdRequested = false;
+        this.ending = null;
+        this.session = spawnPsql(app, {
+            operation: `held transaction: ${sqlLabel(sql)}`,
+            timeout: PSQL_HELD_TIMEOUT_MS,
+            onLine: (line) => this.onLine(line)
+        });
+        this.closed = this.session.done.then(() => null, (error) => error);
+        this.closed.then((error) => {
+            const ended = new Error(`${this.context} ended${error ? `: ${error.message}` : ''}`);
+
+            this.ready.reject(ended);
+            this.held.reject(ended);
+        });
+    }
+
+    /** Tells whether the psql session has closed. */
+    get ended() {
+        return this.session.isClosed();
+    }
+
+    onLine(line) {
+        const ready = HELD_READY_PATTERN.exec(line);
+
+        if (ready) {
+            this.ready.resolve(Number(ready[1]));
+        } else if (line === HELD_HOLD_LINE) {
+            this.held.resolve();
+        }
+    }
+
+    /**
+     * Sends BEGIN, the SQL and the ready query, waits HELD_ANSWER_TIMEOUT_MS for the ready line, then creates the
+     * marker file. Rejects, after ending the session, when psql closes first, the ready line does not arrive, or the
+     * marker cannot be created.
+     */
+    async start() {
+        this.session.write(`BEGIN;\n${this.sql};\nSELECT 'pmg-ready:' || pg_backend_pid();\n`);
+
+        try {
+            this.pid = await valueWithin(this.ready.promise, HELD_ANSWER_TIMEOUT_MS, `${this.context} to run its SQL`);
+        } catch (error) {
+            await this.abandon(error);
+
+            throw new Error(`${this.context} did not report its SQL as run: ${error.message}\n--- SQL ---\n${this.sql}`);
+        }
+
+        try {
+            fs.writeFileSync(this.markerPath, `${this.pid}\n`, { flag: 'wx' });
+
+            if (!fs.statSync(this.markerPath).isFile()) {
+                throw new Error(`${this.markerPath} is not a regular file`);
+            }
+        } catch (error) {
+            const rollback = await settleWithin(this.rollback(), HELD_ANSWER_TIMEOUT_MS + 2 * PSQL_KILL_GRACE_MS);
+            const outcome = rollback.status === 'fulfilled'
+                ? 'the transaction was rolled back'
+                : `the rollback failed: ${rollback.status === 'rejected' ? rollback.reason.message : 'no answer'}`;
+
+            throw new Error(`${this.context} could not create its marker ${this.markerPath} (${error.message}); ${outcome}`);
+        }
+    }
+
+    /** Terminates a session that is still open and waits up to 2 * PSQL_KILL_GRACE_MS for it to close. */
+    async abandon(reason) {
+        if (!this.session.isClosed()) {
+            this.session.terminate(new Error(`${this.context} abandoned: ${reason.message}`));
+            await settleWithin(this.session.done, 2 * PSQL_KILL_GRACE_MS);
+        }
+    }
+
+    /**
+     * Sends SELECT 'pmg-held' FROM pg_sleep(seconds) once and returns the promise that resolves on its 'pmg-held' line
+     * and rejects when the session ends first.
+     */
+    hold(seconds) {
+        if (!this.holdRequested) {
+            this.holdRequested = true;
+
+            if (!this.session.write(`SELECT '${HELD_HOLD_LINE}' FROM pg_sleep(${Number(seconds)});\n`)) {
+                this.held.reject(new Error(`${this.context} ended before its hold`));
+            }
+        }
+
+        return this.held.promise;
+    }
+
+    /** Sends COMMIT, ends standard input and resolves once psql exited 0. Repeated calls return the same promise. */
+    commit() {
+        return this.finish('COMMIT');
+    }
+
+    /**
+     * Sends ROLLBACK, ends standard input and resolves once psql exited 0, or at once when the session has already
+     * closed without COMMIT. Repeated calls return the same promise.
+     */
+    rollback() {
+        return this.finish('ROLLBACK');
+    }
+
+    finish(statement) {
+        if (this.ending) {
+            return this.ending.statement === statement
+                ? this.ending.promise
+                : Promise.reject(new Error(`${this.context} already ended with ${this.ending.statement}`));
+        }
+
+        this.ending = { statement, promise: this.end(statement) };
+        this.ending.promise.catch(() => undefined);
+
+        return this.ending.promise;
+    }
+
+    /**
+     * Ends the session with the statement. Waits HELD_ANSWER_TIMEOUT_MS for psql to close; past that, terminates it,
+     * waits up to 2 * PSQL_KILL_GRACE_MS and rejects. When the statement cannot be sent, terminates a session that is
+     * still open; ROLLBACK then resolves and COMMIT rejects.
+     */
+    async end(statement) {
+        if (!this.session.end(`${statement};\n`)) {
+            await this.abandon(new Error(`${statement} could not be sent`));
+
+            const closed = await settleWithin(this.closed, 2 * PSQL_KILL_GRACE_MS);
+
+            if (statement === 'ROLLBACK') {
+                return;
+            }
+
+            const cause = closed.status === 'fulfilled' && closed.value ? `: ${closed.value.message}` : '';
+
+            throw new Error(`${this.context} closed before ${statement}${cause}`);
+        }
+
+        const outcome = await settleWithin(this.session.done, HELD_ANSWER_TIMEOUT_MS);
+
+        if (outcome.status === 'fulfilled') {
+            return;
+        }
+        if (outcome.status === 'rejected') {
+            throw new Error(`${this.context} failed at ${statement}: ${outcome.reason.message}`);
+        }
+
+        const timeout = new Error(`${this.context} did not close within ${HELD_ANSWER_TIMEOUT_MS} ms of ${statement}`);
+
+        this.session.terminate(timeout);
+
+        const killed = await settleWithin(this.session.done, 2 * PSQL_KILL_GRACE_MS);
+
+        throw new Error(killed.status === 'rejected' ? killed.reason.message
+            : `${timeout.message}; it did not close after SIGTERM and SIGKILL`);
+    }
+}
+
+/**
+ * Opens a HeldTransaction (application pmg-acceptance-bg, marker file 'written') that writes writeSql, and starts its
+ * BACKGROUND_HOLD_SECONDS s sleep inside the transaction once the marker exists. Resolves with {transaction, held};
+ * held resolves when the sleep has ended. The transaction stays open until commit() or rollback().
+ */
+async function backgroundWrite(writeSql) {
+    const transaction = await HeldTransaction.open('bg', writeSql, 'written');
+
+    return { transaction, held: transaction.hold(BACKGROUND_HOLD_SECONDS) };
+}
+
+/**
+ * Returns the lock-wait tree rooted at the backend rootPid: the client backends of the acceptance database whose
+ * pg_blocking_pids holds rootPid, then, repeatedly, those whose pg_blocking_pids holds a backend already in the tree.
+ * Backends named pmg-acceptance* and rootPid itself are left out. Each backend appears once, ordered by pid, as
+ * {pid, application, waitEventType, waitEvent, blockedBy}.
+ */
+async function lockWaitTree(rootPid) {
+    const root = Number(rootPid);
+
+    if (!Number.isInteger(root) || root <= 0) {
+        throw new Error(`not a backend pid: ${rootPid}`);
+    }
+
+    return psqlJson(`
+WITH RECURSIVE backends AS (
+    SELECT pid, application_name, wait_event_type, wait_event, pg_blocking_pids(pid) AS blocked_by
+    FROM pg_stat_activity
+    WHERE datname = current_database()
+      AND backend_type = 'client backend'
+      AND pid <> ${root}
+      AND coalesce(application_name, '') NOT LIKE 'pmg-acceptance%'
+), tree AS (
+    SELECT pid FROM backends WHERE ${root} = ANY (blocked_by)
+    UNION
+    SELECT b.pid FROM backends b JOIN tree ON tree.pid = ANY (b.blocked_by)
+)
+SELECT coalesce(json_agg(json_build_object(
+           'pid', b.pid, 'application', b.application_name, 'waitEventType', b.wait_event_type,
+           'waitEvent', b.wait_event, 'blockedBy', to_json(b.blocked_by)) ORDER BY b.pid), '[]')
+FROM backends b
+WHERE b.pid IN (SELECT pid FROM tree);
+`, { app: 'monitor', timeout: PSQL_PROBE_TIMEOUT_MS });
+}
+
+/**
+ * Returns pid, application name, state, wait event, blocking pids and query text of every backend of the acceptance
+ * database.
+ */
 async function activityDump() {
     return psqlJson(`
 SELECT coalesce(json_agg(json_build_object(
            'pid', pid, 'application', application_name, 'state', state, 'waitEventType', wait_event_type,
-           'waitEvent', wait_event, 'query', left(query, 300)) ORDER BY pid), '[]')
+           'waitEvent', wait_event, 'blockedBy', to_json(pg_blocking_pids(pid)), 'query', left(query, 300)) ORDER BY pid),
+       '[]')
 FROM pg_stat_activity
 WHERE datname = current_database();
-`, { app: 'monitor' });
+`, { app: 'monitor', timeout: PSQL_PROBE_TIMEOUT_MS });
+}
+
+/**
+ * Cleans up after a failed concurrent case and returns the error to throw. Reads pg_stat_activity, rolls back every
+ * transaction that has not been ended, and waits up to CLEANUP_SETTLE_TIMEOUT_MS for the tracked requests. The returned
+ * error holds the message of error, each cleanup failure, the outcome of each request and the pg_stat_activity rows, or
+ * the error of reading them; its cause is error.
+ */
+async function concurrentFailure(error, transactions, requests) {
+    const notes = [];
+    let activity;
+
+    try {
+        activity = JSON.stringify(await activityDump(), null, 2);
+    } catch (dumpError) {
+        activity = `unavailable (${dumpError.message})`;
+    }
+
+    for (const transaction of transactions) {
+        if (transaction.ending) {
+            continue;
+        }
+
+        const rollback = await settleWithin(transaction.rollback(), CLEANUP_SETTLE_TIMEOUT_MS);
+
+        if (rollback.status !== 'fulfilled') {
+            notes.push(`rollback of the ${transaction.context}: `
+                + (rollback.status === 'rejected' ? rollback.reason.message : `no answer within ${CLEANUP_SETTLE_TIMEOUT_MS} ms`));
+        }
+    }
+
+    const settled = await settleWithin(Promise.allSettled(requests.map((request) => request.promise)),
+        CLEANUP_SETTLE_TIMEOUT_MS);
+
+    if (settled.status === 'pending') {
+        notes.push(`requests still pending after ${CLEANUP_SETTLE_TIMEOUT_MS} ms`);
+    }
+
+    requests.forEach((request, index) => notes.push(`move M${index + 1}: ${request.describe()}`));
+
+    return new Error(`${error.message}\n${notes.join('\n')}\npg_stat_activity at the failure: ${activity}`, { cause: error });
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // DevTools Protocol client
 // ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * Returns the normalised DevTools endpoint printed by Chrome when it is a ws: URL of a loopback host (127.0.0.1,
+ * localhost or [::1]) with an explicit port 1-65535, no user name or password, and a path under /devtools/browser/.
+ * Throws, naming the endpoint and the unmet condition, otherwise.
+ *
+ * Example: devToolsEndpoint('ws://127.0.0.1:41235/devtools/browser/0f3a') returns that URL;
+ * devToolsEndpoint('ws://10.1.2.3:9222/devtools/browser/x') throws "... host 10.1.2.3 is not a loopback host".
+ */
+function devToolsEndpoint(text) {
+    const refusal = (reason) => new Error(`refusing to connect to the DevTools endpoint ${text.slice(0, 200)}: ${reason}`);
+    let url;
+
+    try {
+        url = new URL(text);
+    } catch (error) {
+        throw refusal(`it is not a URL (${error.message})`);
+    }
+
+    if (url.protocol !== 'ws:') {
+        throw refusal(`protocol ${url.protocol} is not ws:`);
+    }
+    if (!LOOPBACK_HOSTS.has(url.hostname)) {
+        throw refusal(`host ${url.hostname} is not a loopback host`);
+    }
+    if (!/^\d+$/.test(url.port) || Number(url.port) < 1 || Number(url.port) > 65535) {
+        throw refusal(`port ${url.port === '' ? '(none)' : url.port} is not a port 1-65535`);
+    }
+    if (url.username !== '' || url.password !== '') {
+        throw refusal('it carries a user name or password');
+    }
+    if (!url.pathname.startsWith('/devtools/browser/')) {
+        throw refusal(`path ${url.pathname} is not under /devtools/browser/`);
+    }
+
+    return url.href;
+}
 
 /** Headless Chrome with one page target, driven over the DevTools Protocol with flattened sessions. */
 class DevTools {
@@ -1157,6 +2063,7 @@ class DevTools {
         this.listeners = new Map();
         this.stderrTail = '';
         this.exited = false;
+        this.processError = null;
     }
 
     /** Starts Chrome, connects to its DevTools endpoint and attaches to a new page with Page, Runtime and Network enabled. */
@@ -1171,60 +2078,97 @@ class DevTools {
 
         chromeArgs.push('about:blank');
 
-        this.process = childProcess.spawn(chromePath, chromeArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
-        this.process.on('exit', () => {
+        try {
+            this.process = childProcess.spawn(chromePath, chromeArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+        } catch (error) {
             this.exited = true;
-        });
-        this.process.stderr.setEncoding('utf8');
+            throw new Error(`Chrome ${chromePath} could not start: ${error.message}`);
+        }
+
+        const chrome = this.process;
 
         const endpoint = await new Promise((resolve, reject) => {
-            let stderr = '';
-            let listening = false;
-            const timer = setTimeout(() => reject(new Error(`Chrome printed no DevTools endpoint within 30 s: ${stderr}`)),
-                30000);
+            // Chrome's standard error up to the DevTools endpoint line, as a rolling tail of 8000 characters.
+            let startupStderr = '';
+            let settled = false;
+            let timer = null;
 
-            this.process.stderr.on('data', (chunk) => {
-                this.stderrTail = (this.stderrTail + chunk).slice(-4000);
-
-                if (listening) {
+            const settle = (error, value) => {
+                if (settled) {
                     return;
                 }
 
-                stderr += chunk;
+                settled = true;
+                clearTimeout(timer);
 
-                const match = /DevTools listening on (ws:\/\/\S+)/.exec(stderr);
-
-                if (match) {
-                    listening = true;
-                    clearTimeout(timer);
-                    resolve(match[1]);
+                if (error) {
+                    reject(error);
+                } else {
+                    resolve(value);
                 }
-            });
-            this.process.on('error', (error) => {
-                clearTimeout(timer);
-                reject(new Error(`Chrome ${chromePath} could not start: ${error.message}`));
-            });
-            this.process.on('exit', (code, signal) => {
-                clearTimeout(timer);
-                reject(new Error(`Chrome exited with ${code === null ? signal : code} before listening: ${stderr}`));
-            });
-        });
+            };
 
-        this.socket = new WebSocket(endpoint);
+            chrome.on('error', (error) => {
+                const started = chrome.pid !== undefined;
 
-        await new Promise((resolve, reject) => {
-            this.socket.addEventListener('open', () => resolve(), { once: true });
-            this.socket.addEventListener('error', () => reject(new Error(`cannot connect to ${endpoint}`)), { once: true });
-        });
+                if (!started) {
+                    this.exited = true;
+                }
 
-        this.socket.addEventListener('message', (event) => this.onMessage(JSON.parse(String(event.data))));
-        this.socket.addEventListener('close', () => {
-            for (const pending of this.pending.values()) {
-                pending.reject(new Error(`DevTools socket closed during ${pending.method}`));
+                this.stderrTail = `${this.stderrTail}\nprocess error: ${error.message}`.slice(-4000);
+                settle(new Error(`Chrome ${chromePath} ${started ? 'failed' : 'could not start'}: ${error.message}`), null);
+            });
+            chrome.on('exit', (code, signal) => {
+                this.exited = true;
+                settle(new Error(`Chrome exited with ${code === null ? signal : code} before listening: ${startupStderr}`), null);
+            });
+
+            if (!chrome.stderr) {
+                settle(new Error(`Chrome ${chromePath} started without a standard error pipe`), null);
+
+                return;
             }
 
-            this.pending.clear();
+            chrome.stderr.on('error', (error) => {
+                this.stderrTail = `${this.stderrTail}\nstandard error failed: ${error.message}`.slice(-4000);
+                settle(new Error(`Chrome standard error failed before listening: ${error.message}`), null);
+            });
+
+            timer = setTimeout(() => settle(new Error(`Chrome printed no DevTools endpoint within 30 s: ${startupStderr}`),
+                null), 30000);
+
+            chrome.stderr.setEncoding('utf8');
+            chrome.stderr.on('data', (chunk) => {
+                this.stderrTail = (this.stderrTail + chunk).slice(-4000);
+
+                if (settled) {
+                    return;
+                }
+
+                startupStderr = (startupStderr + chunk).slice(-8000);
+
+                const match = /DevTools listening on (ws:\/\/\S+)/.exec(startupStderr);
+
+                if (match) {
+                    settle(null, match[1]);
+                }
+            });
         });
+
+        this.process.on('error', (error) => {
+            this.processError = error;
+        });
+        this.process.on('close', () => {
+            this.exited = true;
+        });
+
+        const loopbackEndpoint = devToolsEndpoint(endpoint);
+
+        await this.connect(loopbackEndpoint);
+
+        this.socket.addEventListener('message', (event) => this.onMessage(JSON.parse(String(event.data))));
+        this.socket.addEventListener('close', (event) => this.rejectPending((pending) => `DevTools socket closed `
+            + `(code ${event.code}) during ${pending.method} (${pending.target})`));
 
         const { targetId } = await this.send('Target.createTarget', { url: 'about:blank' }, null);
         const { sessionId } = await this.send('Target.attachToTarget', { targetId, flatten: true }, null);
@@ -1237,7 +2181,105 @@ class DevTools {
         await this.command('Emulation.setDeviceMetricsOverride', { width: 1600, height: 1000, deviceScaleFactor: 1, mobile: false });
     }
 
-    send(method, params, sessionId) {
+    /**
+     * Opens the DevTools socket to the endpoint and settles once: resolves on open; rejects on a socket error, on a
+     * close before open (with its code and reason), when Chrome has exited or exits, or when the socket has not opened
+     * within DEVTOOLS_CONNECT_TIMEOUT_MS. On rejection the socket is closed and every listener and timer is removed.
+     */
+    connect(endpoint) {
+        const socket = new WebSocket(endpoint);
+        const chrome = this.process;
+
+        this.socket = socket;
+
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            let timer = null;
+            let onOpen = null;
+            let onError = null;
+            let onClose = null;
+            let onExit = null;
+
+            const settle = (error) => {
+                if (settled) {
+                    return;
+                }
+
+                settled = true;
+                clearTimeout(timer);
+                socket.removeEventListener('open', onOpen);
+                socket.removeEventListener('error', onError);
+                socket.removeEventListener('close', onClose);
+
+                if (chrome) {
+                    chrome.removeListener('exit', onExit);
+                }
+                if (error === null) {
+                    resolve();
+                    return;
+                }
+
+                try {
+                    socket.close();
+                } catch (closeError) {
+                    error.message += `; closing the socket failed: ${closeError.message}`;
+                }
+
+                reject(error);
+            };
+
+            onOpen = () => settle(null);
+            onError = (event) => {
+                const cause = (event && (event.message || (event.error && event.error.message))) || 'socket error';
+
+                settle(new Error(`cannot connect to ${endpoint}: ${cause}`));
+            };
+            onClose = (event) => settle(new Error(`the DevTools socket ${endpoint} closed before it opened (code `
+                + `${event.code}${event.reason ? `, reason ${event.reason}` : ''})`));
+            onExit = (code, signal) => settle(new Error(`Chrome exited with ${code === null ? signal : code} before the `
+                + `DevTools socket ${endpoint} opened: ${this.stderrTail.trim()}`));
+
+            socket.addEventListener('open', onOpen);
+            socket.addEventListener('error', onError);
+            socket.addEventListener('close', onClose);
+
+            if (chrome) {
+                chrome.on('exit', onExit);
+            }
+
+            timer = setTimeout(() => settle(new Error(`the DevTools socket ${endpoint} did not open within `
+                + `${DEVTOOLS_CONNECT_TIMEOUT_MS} ms`)), DEVTOOLS_CONNECT_TIMEOUT_MS);
+
+            if (this.hasExited()) {
+                settle(new Error(`Chrome exited before the DevTools socket ${endpoint} opened: ${this.stderrTail.trim()}`));
+            }
+        });
+    }
+
+    /**
+     * Returns true when Chrome is not running: it was never spawned, its spawn failed (no pid), or it has exited or
+     * closed, as recorded by its exit and close events or by its exit code or signal.
+     */
+    hasExited() {
+        const chrome = this.process;
+
+        return this.exited || !chrome || chrome.pid === undefined || chrome.exitCode !== null || chrome.signalCode !== null;
+    }
+
+    /**
+     * Sends a command to the page session sessionId, or to the browser when sessionId is null, and resolves with its
+     * result. Rejects at once when the socket is not open. Rejects, and forgets the command, when no reply arrives
+     * within `timeout` ms.
+     *
+     * Example: devtools.send('Target.createTarget', { url: 'about:blank' }, null, { timeout: 10000 }).
+     */
+    send(method, params, sessionId, { timeout = DEVTOOLS_COMMAND_TIMEOUT_MS } = {}) {
+        const target = `session ${sessionId || 'browser'}`;
+
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+            return Promise.reject(new Error(`${method} (${target}) was not sent: the DevTools socket is not open`));
+        }
+
         const id = this.nextId++;
         const payload = { id, method, params: params || {} };
 
@@ -1246,14 +2288,39 @@ class DevTools {
         }
 
         return new Promise((resolve, reject) => {
-            this.pending.set(id, { resolve, reject, method });
-            this.socket.send(JSON.stringify(payload));
+            const timer = setTimeout(() => {
+                if (this.pending.delete(id)) {
+                    reject(new Error(`${method} (${target}) got no reply within ${timeout} ms`));
+                }
+            }, timeout);
+
+            this.pending.set(id, { resolve, reject, method, target, timer });
+
+            try {
+                this.socket.send(JSON.stringify(payload));
+            } catch (error) {
+                clearTimeout(timer);
+                this.pending.delete(id);
+                reject(new Error(`${method} (${target}) could not be sent: ${error.message}`));
+            }
         });
     }
 
-    /** Sends a command to the attached page. */
-    command(method, params) {
-        return this.send(method, params, this.sessionId);
+    /** Sends a command to the attached page; options.timeout replaces DEVTOOLS_COMMAND_TIMEOUT_MS. */
+    command(method, params, options) {
+        return this.send(method, params, this.sessionId, options);
+    }
+
+    /** Clears the timer of every command awaiting its reply and rejects it with the message describe(pending) returns. */
+    rejectPending(describe) {
+        const pendingCommands = Array.from(this.pending.values());
+
+        this.pending.clear();
+
+        for (const pending of pendingCommands) {
+            clearTimeout(pending.timer);
+            pending.reject(new Error(describe(pending)));
+        }
     }
 
     onMessage(payload) {
@@ -1265,6 +2332,7 @@ class DevTools {
             }
 
             this.pending.delete(payload.id);
+            clearTimeout(pending.timer);
 
             if (payload.error) {
                 pending.reject(new Error(`${pending.method} failed: ${payload.error.message}`
@@ -1313,72 +2381,198 @@ class DevTools {
         return result.result ? result.result.value : undefined;
     }
 
-    /** Closes the socket, sends SIGTERM and, when Chrome is still running after 5 s, SIGKILL. */
+    /** Resolves true once Chrome is not running, or false when it still runs after `timeout` ms. */
+    waitForExit(timeout) {
+        if (this.hasExited()) {
+            return Promise.resolve(true);
+        }
+
+        const chrome = this.process;
+
+        return new Promise((resolve) => {
+            let timer = null;
+
+            const onExit = () => {
+                clearTimeout(timer);
+                resolve(true);
+            };
+
+            timer = setTimeout(() => {
+                chrome.removeListener('exit', onExit);
+                resolve(this.hasExited());
+            }, timeout);
+            chrome.once('exit', onExit);
+        });
+    }
+
+    /**
+     * Rejects every command awaiting its reply, closes the socket and stops Chrome: SIGTERM, then SIGKILL when Chrome
+     * still runs after CHROME_EXIT_WAIT_MS, then a last wait of CHROME_EXIT_WAIT_MS. Every step runs whatever the
+     * earlier ones did. Throws, after the last step, one error naming every failed step.
+     */
     async close() {
+        const failures = [];
+
+        this.rejectPending((pending) => `${pending.method} (${pending.target}) was abandoned: the DevTools client closed`);
+
         if (this.socket) {
             try {
                 this.socket.close();
             } catch (error) {
-                this.stderrTail += `\nsocket close failed: ${error.message}`;
+                failures.push(`closing the DevTools socket failed: ${error.message}`);
             }
         }
-        if (this.process && !this.exited) {
-            this.process.kill('SIGTERM');
 
-            try {
-                await waitFor('Chrome to exit after SIGTERM', () => this.exited, { timeout: 5000, interval: 100 });
-            } catch (error) {
-                this.process.kill('SIGKILL');
-                await waitFor('Chrome to exit after SIGKILL', () => this.exited, { timeout: 5000, interval: 100 });
+        if (!this.hasExited()) {
+            const chrome = this.process;
+            let running = true;
+
+            for (const signal of ['SIGTERM', 'SIGKILL']) {
+                try {
+                    chrome.kill(signal);
+                } catch (error) {
+                    failures.push(`sending ${signal} to Chrome (pid ${chrome.pid}) failed: ${error.message}`);
+                }
+
+                if (await this.waitForExit(CHROME_EXIT_WAIT_MS)) {
+                    running = false;
+                    break;
+                }
             }
+
+            if (running) {
+                failures.push(`Chrome (pid ${chrome.pid}) still runs ${CHROME_EXIT_WAIT_MS} ms after SIGKILL`
+                    + (this.processError ? ` (last process error: ${this.processError.message})` : ''));
+            }
+        }
+
+        if (failures.length > 0) {
+            throw new Error(failures.join('; '));
         }
     }
 }
 
 let DEVTOOLS = null;
 
-/** Records the POST requests to the board, with their post data and completion, from the page's Network events. */
+/** Returns the path of a URL without scheme, host, query and fragment. */
+function urlPath(url) {
+    return url.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]+/i, '').split(/[?#]/)[0];
+}
+
+/** Returns the value of a header of a DevTools Protocol headers object, matched without case, or null. */
+function headerValue(headers, name) {
+    const wanted = name.toLowerCase();
+
+    for (const key of Object.keys(headers || {})) {
+        if (key.toLowerCase() === wanted) {
+            return String(headers[key]);
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Returns an excerpt of a response body for an error message: the content of every _csrf meta tag and every _csrf
+ * query parameter replaced by [redacted], whitespace runs collapsed to one space, cut to RESPONSE_EXCERPT_LENGTH
+ * characters; '(empty body)' for a blank body.
+ */
+function responseExcerpt(text) {
+    const excerpt = String(text === undefined || text === null ? '' : text)
+        .replace(/<meta\b[^>]*>/gi, (tag) => (tagAttribute(tag, 'name') === '_csrf'
+            ? '<meta name="_csrf" content="[redacted]">' : tag))
+        .replace(/([?&]_csrf=)[^&"'\s>]*/gi, '$1[redacted]')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, RESPONSE_EXCERPT_LENGTH);
+
+    return excerpt === '' ? '(empty body)' : excerpt;
+}
+
+/**
+ * Records the POST requests to the board from the page's Network events. Each entry holds the request id, the post
+ * data, the HTTP status, MIME type and Location header of the answer, the redirects the request followed ({status,
+ * location, url}), whether loading finished and, when it failed, the cause. lastActivityAt is the time of the last
+ * Network event of a recorded request.
+ */
 class BoardRequestRecorder {
     constructor(devtools) {
         this.devtools = devtools;
         this.entries = [];
+        this.lastActivityAt = Date.now();
 
         const byId = new Map();
+        const touch = () => {
+            this.lastActivityAt = Date.now();
+        };
 
         this.unsubscribers = [
             devtools.on('Network.requestWillBeSent', (params) => {
                 const request = params.request;
-                const requestPath = request.url.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]+/i, '').split(/[?#]/)[0];
+                const known = byId.get(params.requestId);
 
-                if (request.method !== 'POST' || requestPath !== BOARD_PATH) {
+                if (known && params.redirectResponse) {
+                    known.redirects.push({
+                        status: params.redirectResponse.status,
+                        location: headerValue(params.redirectResponse.headers, 'location'),
+                        url: request.url
+                    });
+                    touch();
+                    return;
+                }
+
+                if (request.method !== 'POST' || urlPath(request.url) !== BOARD_PATH) {
                     return;
                 }
 
                 const entry = {
                     requestId: params.requestId,
                     postData: request.postData === undefined ? null : request.postData,
-                    postDataPromise: null,
+                    postDataPending: false,
+                    status: null,
+                    mimeType: null,
+                    location: null,
+                    url: request.url,
+                    redirects: [],
                     finished: false,
                     failed: null
                 };
 
                 if (entry.postData === null && request.hasPostData) {
-                    entry.postDataPromise = devtools.command('Network.getRequestPostData', { requestId: params.requestId })
+                    entry.postDataPending = true;
+                    devtools.command('Network.getRequestPostData', { requestId: params.requestId })
                         .then((result) => {
                             entry.postData = result.postData;
                         }, (error) => {
                             entry.failed = `post data unavailable: ${error.message}`;
+                        })
+                        .finally(() => {
+                            entry.postDataPending = false;
+                            touch();
                         });
                 }
 
                 this.entries.push(entry);
                 byId.set(params.requestId, entry);
+                touch();
+            }),
+            devtools.on('Network.responseReceived', (params) => {
+                const entry = byId.get(params.requestId);
+
+                if (entry && params.response) {
+                    entry.status = params.response.status;
+                    entry.mimeType = params.response.mimeType || null;
+                    entry.location = headerValue(params.response.headers, 'location');
+                    entry.url = params.response.url || entry.url;
+                    touch();
+                }
             }),
             devtools.on('Network.loadingFinished', (params) => {
                 const entry = byId.get(params.requestId);
 
                 if (entry) {
                     entry.finished = true;
+                    touch();
                 }
             }),
             devtools.on('Network.loadingFailed', (params) => {
@@ -1386,6 +2580,7 @@ class BoardRequestRecorder {
 
                 if (entry) {
                     entry.failed = params.errorText || 'loading failed';
+                    touch();
                 }
             })
         ];
@@ -1399,9 +2594,14 @@ class BoardRequestRecorder {
         this.unsubscribers = [];
     }
 
-    /** Waits for the post data requested with Network.getRequestPostData. */
-    async settle() {
-        await Promise.all(this.entries.map((entry) => entry.postDataPromise));
+    /** Returns true while the post data of a recorded request is still being read with Network.getRequestPostData. */
+    hasPendingPostData() {
+        return this.entries.some((entry) => entry.postDataPending);
+    }
+
+    /** Returns the first recorded request that failed, or undefined. */
+    firstFailed() {
+        return this.entries.find((entry) => entry.failed);
     }
 
     static eventOf(entry) {
@@ -1432,55 +2632,168 @@ class BoardRequestRecorder {
         });
     }
 
-    /** Returns the parsed JSON response body of a finished request. */
-    async responseJson(entry) {
-        const result = await this.devtools.command('Network.getResponseBody', { requestId: entry.requestId });
-        const text = result.base64Encoded ? Buffer.from(result.body, 'base64').toString('utf8') : result.body;
+    /** Returns 'board request <requestId> (event <name>)', with 'unknown' when the post data holds no event. */
+    static describe(entry) {
+        const event = BoardRequestRecorder.eventOf(entry);
 
-        return JSON.parse(text.trim());
+        return `board request ${entry.requestId} (event ${event && event.name ? event.name : 'unknown'})`;
+    }
+
+    /** Returns {requestId, event, status, redirects, finished, failed} of every entry. */
+    summary() {
+        return this.entries.map((entry) => {
+            const event = BoardRequestRecorder.eventOf(entry);
+
+            return {
+                requestId: entry.requestId,
+                event: event ? event.name : null,
+                status: entry.status,
+                redirects: entry.redirects.map((redirect) => redirect.status),
+                finished: entry.finished,
+                failed: entry.failed
+            };
+        });
+    }
+
+    /**
+     * Returns the parsed JSON response body of a finished request. Throws an error naming the request id, the event,
+     * the HTTP status and an excerpt of the body (see responseExcerpt) when the request failed or was redirected (to the
+     * login page or elsewhere), or its answer is not HTTP 200, is sessionExpired, is an error page or an HTML page, or
+     * is not JSON.
+     */
+    async responseJson(entry) {
+        const request = BoardRequestRecorder.describe(entry);
+
+        if (entry.failed) {
+            throw new Error(`${request} failed: ${entry.failed}`);
+        }
+        if (entry.redirects.length > 0) {
+            const redirect = entry.redirects[0];
+            const target = redirect.location || redirect.url;
+
+            throw new Error(`${request} was redirected (HTTP ${redirect.status}) to `
+                + `${/login/i.test(`${target} ${redirect.url}`) ? 'the login page ' : ''}${target}`);
+        }
+
+        let text;
+
+        try {
+            const result = await this.devtools.command('Network.getResponseBody', { requestId: entry.requestId });
+
+            text = (result.base64Encoded ? Buffer.from(result.body, 'base64').toString('utf8') : result.body).trim();
+        } catch (error) {
+            throw new Error(`${request} answered HTTP ${entry.status === null ? '(status unknown)' : entry.status}, `
+                + `and its body is unavailable: ${error.message}`);
+        }
+
+        const answered = `${request} answered HTTP ${entry.status === null ? '(status unknown)' : entry.status}`;
+
+        if (entry.status !== 200) {
+            throw new Error(`${answered}${entry.location ? ` with Location ${entry.location}` : ''}: `
+                + responseExcerpt(text));
+        }
+        if (text === 'sessionExpired') {
+            throw new Error(`${answered} with sessionExpired`);
+        }
+        if (text.startsWith('<![CDATA[ERROR PAGE:')) {
+            throw new Error(`${answered} with an error page: ${responseExcerpt(text)}`);
+        }
+        if (/^(?:<!DOCTYPE|<html)/i.test(text)) {
+            throw new Error(`${answered} with an HTML page (${entry.mimeType || 'no MIME type'}`
+                + `${/login/i.test(entry.url || '') ? ', the login page' : ''}): ${responseExcerpt(text)}`);
+        }
+
+        try {
+            return JSON.parse(text);
+        } catch (error) {
+            throw new Error(`${answered} with no JSON (${error.message}): ${responseExcerpt(text)}`);
+        }
     }
 }
 
-/** Waits until exactly one finished request of the recorder carries the event, failing on a failed or second request. */
+/**
+ * Waits until exactly one finished request of the recorder carries the event and no post data is still being read.
+ * Fails at the first poll that sees a failed board request, whatever its event and whatever other request is still
+ * pending, naming its request id, its event and the cause, and when a second request carries the event.
+ */
 async function waitForSingleEvent(recorder, name, timeout) {
-    return waitFor(`the ${name} request`, async () => {
-        await recorder.settle();
-
-        const entries = recorder.withEvent(name);
-        const failed = entries.find((entry) => entry.failed);
+    return waitFor(`the ${name} request`, () => {
+        const failed = recorder.firstFailed();
 
         if (failed) {
-            throw new FatalError(`${name} request failed: ${failed.failed}`);
+            throw new FatalError(`${BoardRequestRecorder.describe(failed)} failed while waiting for the ${name} request: `
+                + failed.failed);
         }
+        if (recorder.hasPendingPostData()) {
+            return false;
+        }
+
+        const entries = recorder.withEvent(name);
+
         if (entries.length > 1) {
-            throw new FatalError(`${entries.length} ${name} requests were sent`);
+            throw new FatalError(`${entries.length} ${name} requests were sent: `
+                + entries.map((entry) => entry.requestId).join(', '));
         }
 
         return entries.length === 1 && entries[0].finished ? entries[0] : false;
-    }, { timeout, interval: 50, detail: () => JSON.stringify(recorder.eventNames()) });
+    }, { timeout, interval: 50, detail: () => JSON.stringify(recorder.summary()) });
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // Browser
 // ---------------------------------------------------------------------------------------------------------------
 
-const FRAME_PREAMBLE = 'const F = document.getElementById(\'mainPageIframe\'); const W = F.contentWindow; '
-    + 'const D = W.document;';
+// Binds F to the main page iframe, W to its window and D to its document; each is null when the one before is missing.
+const FRAME_PREAMBLE = 'const F = document.getElementById(\'mainPageIframe\'); const W = F ? F.contentWindow : null; '
+    + 'const D = W ? W.document : null;';
 
-/** Wraps statements that read the board's iframe (F, W, D) into an expression. */
-function frameExpression(statements) {
-    return `(() => { ${FRAME_PREAMBLE} ${statements} })()`;
+// Statements that throw when the main page iframe, its window or its document is missing.
+const FRAME_GUARD = 'if (!F) { throw new Error(\'the main page iframe #mainPageIframe is missing\'); } '
+    + 'if (!W || !D) { throw new Error(\'the main page iframe #mainPageIframe has no document\'); }';
+
+/**
+ * Wraps statements that read the board's iframe (F, W, D) into an expression. With requireFrame (the default) the
+ * expression throws a missing-iframe or no-document error before the statements run; without it the statements handle
+ * a null F, W or D themselves.
+ */
+function frameExpression(statements, { requireFrame = true } = {}) {
+    return `(() => { ${FRAME_PREAMBLE} ${requireFrame ? FRAME_GUARD : ''} ${statements} })()`;
 }
 
 function barElementId(itemId) {
     return `${GANTT_PATH}_item_${itemId}`;
 }
 
-/** Logs in through the login form with fresh cookies and waits for main.html. */
+// Page state read after the login click: path and query, whether main.html is ready, whether login-min.js marked the
+// inputs is-invalid, and the text of the #messagePanel when it is shown as alert-danger (null otherwise).
+const LOGIN_STATE_EXPRESSION = `(() => {
+    const panel = document.getElementById('messagePanel');
+    const username = document.getElementById('usernameInput');
+    const password = document.getElementById('passwordInput');
+    const panelText = (id) => ((document.getElementById(id) || {}).textContent || '').trim();
+    const alertShown = !!panel && panel.classList.contains('alert-danger') && getComputedStyle(panel).display !== 'none';
+    return {
+        pathname: location.pathname,
+        search: location.search,
+        ready: location.pathname === '/main.html' && typeof window.goToPage === 'function'
+            && typeof window.encodeParams === 'function',
+        invalid: (!!username && username.classList.contains('is-invalid'))
+            || (!!password && password.classList.contains('is-invalid')),
+        alert: alertShown ? (panelText('messageHeader') + ' ' + panelText('messageContent')).replace(/\\s+/g, ' ').trim() : null
+    };
+})()`;
+
+/**
+ * Logs in through the login form with fresh cookies and waits up to 120 s for main.html. Fails at once, naming the
+ * user and never the password, when the POST to /j_spring_security_check fails or answers a status other than 200,
+ * when the form marks the inputs is-invalid (wrong login or password), shows an alert-danger message (blocked user or
+ * another refusal), or the page moves to ?loginError=true (request error) or ?timeout=true (sessionExpired).
+ */
 async function browserLogin() {
     await DEVTOOLS.command('Network.clearBrowserCookies');
 
-    const navigation = await DEVTOOLS.command('Page.navigate', { url: `${ARGS.baseUrl}/login.html?lang=en` });
+    const navigation = await DEVTOOLS.command('Page.navigate', { url: `${ARGS.baseUrl}/login.html?lang=en` },
+        { timeout: DEVTOOLS_NAVIGATE_TIMEOUT_MS });
 
     if (navigation.errorText) {
         throw new Error(`cannot open the login page: ${navigation.errorText}`);
@@ -1491,16 +2804,75 @@ async function browserLogin() {
         + '&& !!document.getElementById(\'passwordInput\') && !!document.getElementById(\'loginButton\')'),
     { timeout: 60000, interval: 100 });
 
-    await DEVTOOLS.evaluate(`(() => {
-        document.getElementById('usernameInput').value = ${JSON.stringify(ARGS.user)};
-        document.getElementById('passwordInput').value = ${JSON.stringify(ARGS.password)};
-        document.getElementById('loginButton').click();
-        return true;
-    })()`);
+    const login = { requestId: null, status: null, failed: null };
+    const unsubscribers = [
+        DEVTOOLS.on('Network.requestWillBeSent', (params) => {
+            if (params.request.method === 'POST' && urlPath(params.request.url) === '/j_spring_security_check') {
+                login.requestId = params.requestId;
+                login.status = null;
+                login.failed = null;
+            }
+        }),
+        DEVTOOLS.on('Network.responseReceived', (params) => {
+            if (params.requestId === login.requestId && params.response) {
+                login.status = params.response.status;
+            }
+        }),
+        DEVTOOLS.on('Network.loadingFailed', (params) => {
+            if (params.requestId === login.requestId) {
+                login.failed = params.errorText || 'loading failed';
+            }
+        })
+    ];
 
-    await waitFor('main.html after login', () => DEVTOOLS.evaluate('location.pathname === \'/main.html\' '
-        + '&& typeof window.goToPage === \'function\' && typeof window.encodeParams === \'function\''),
-    { timeout: 120000, interval: 250 });
+    try {
+        await DEVTOOLS.evaluate(`(() => {
+            document.getElementById('usernameInput').value = ${JSON.stringify(ARGS.user)};
+            document.getElementById('passwordInput').value = ${JSON.stringify(ARGS.password)};
+            document.getElementById('loginButton').click();
+            return true;
+        })()`);
+
+        let last = null;
+
+        await waitFor('main.html after login', async () => {
+            if (login.failed) {
+                throw new FatalError(`the login request of user ${ARGS.user} failed: ${login.failed}`);
+            }
+            if (login.status !== null && login.status !== 200) {
+                throw new FatalError(`the login request of user ${ARGS.user} answered HTTP ${login.status}`);
+            }
+
+            last = await DEVTOOLS.evaluate(LOGIN_STATE_EXPRESSION);
+
+            if (!last) {
+                return false;
+            }
+            if (last.ready) {
+                return true;
+            }
+            if (last.invalid) {
+                throw new FatalError(`wrong login or password for user ${ARGS.user}`);
+            }
+            if (last.alert !== null) {
+                throw new FatalError(`the login of user ${ARGS.user} was refused: ${last.alert}`);
+            }
+            if (/[?&]loginError=true\b/.test(last.search)) {
+                throw new FatalError(`the login request of user ${ARGS.user} ended with an error: the page moved to `
+                    + `${last.pathname}${last.search}`);
+            }
+            if (/[?&]timeout=true\b/.test(last.search)) {
+                throw new FatalError(`the login of user ${ARGS.user} answered sessionExpired: the page moved to `
+                    + `${last.pathname}${last.search}`);
+            }
+
+            return false;
+        }, { timeout: 120000, interval: 250, detail: () => JSON.stringify({ loginStatus: login.status, page: last }) });
+    } finally {
+        for (const unsubscribe of unsubscribers) {
+            unsubscribe();
+        }
+    }
 }
 
 /**
@@ -1519,15 +2891,26 @@ async function browserOpenBoard(scheduleId, barItemId) {
             return true;
         })()`);
 
-        const barCheck = barItemId === null
-            ? 'return D.querySelectorAll(\'.ganttItem\').length > 0;'
-            : `return !!D.getElementById(${JSON.stringify(barElementId(barItemId))});`;
+        const barPresent = barItemId === null
+            ? 'D.querySelectorAll(\'.ganttItem\').length > 0'
+            : `!!D.getElementById(${JSON.stringify(barElementId(barItemId))})`;
+        let frameState = null;
 
-        await waitFor(`the board of schedule ${scheduleId} in the main page iframe`, () => DEVTOOLS.evaluate(
-            frameExpression(`
-                if (!F || !W || !W.mainController || !D) { return false; }
-                if (D.querySelectorAll('.ganttRowNameElement').length < 3) { return false; }
-                ${barCheck}`)), { timeout: 120000, interval: 250 });
+        await waitFor(`the board of schedule ${scheduleId} in the main page iframe`, async () => {
+            frameState = await DEVTOOLS.evaluate(frameExpression(`
+                const state = {
+                    iframe: !!F,
+                    window: !!W,
+                    document: !!D,
+                    mainController: !!(W && W.mainController),
+                    rows: D ? D.querySelectorAll('.ganttRowNameElement').length : 0,
+                    bar: !!D && ${barPresent}
+                };
+                state.ready = state.mainController && state.rows >= 3 && state.bar;
+                return state;`, { requireFrame: false }));
+
+            return frameState !== null && frameState !== undefined && frameState.ready;
+        }, { timeout: 120000, interval: 250, detail: () => JSON.stringify(frameState) });
 
         const initializeEntry = await waitForSingleEvent(recorder, 'initialize', 60000);
 
@@ -1605,10 +2988,21 @@ function dispatchMouse(type, point, extra) {
     return DEVTOOLS.command('Input.dispatchMouseEvent', Object.assign({ type, x: point.x, y: point.y }, extra));
 }
 
+/** Sends a left-button mouseReleased at the point. A failure is written to stderr and not thrown. */
+async function releaseLeftButton(point) {
+    try {
+        await dispatchMouse('mouseReleased', point, { button: 'left', buttons: 0, clickCount: 1 });
+    } catch (error) {
+        process.stderr.write(`acceptance.test.js: releasing the left mouse button at ${JSON.stringify(point)} after a `
+            + `failed drag failed: ${error.message}\n`);
+    }
+}
+
 /**
  * Drags the bar of the rendered item from its centre to the point of targetRow and targetDate with real mouse input,
  * waits for the single moveItem request and checks its payload. Returns {payload, event, moveResult, content,
- * recorder}; the recorder keeps recording until the caller stops it.
+ * recorder}; the recorder keeps recording until finishDrag stops it. On a failure the drag releases the left button
+ * at the last point sent when the button is down, stops the recorder and throws the first error.
  */
 async function browserDrag({ item, targetRow, targetDate }) {
     const initial = await requireBar(item.id);
@@ -1652,17 +3046,28 @@ async function browserDrag({ item, targetRow, targetDate }) {
 
     const recorder = new BoardRequestRecorder(DEVTOOLS);
 
+    // Whether the left button is down, and the last point sent while it is.
+    let buttonDown = false;
+    let lastPoint = press;
+
+    const moveTo = (point) => {
+        lastPoint = point;
+
+        return dispatchMouse('mouseMoved', point, { button: 'left', buttons: 1 });
+    };
+
     try {
+        buttonDown = true;
         await dispatchMouse('mousePressed', press, { button: 'left', buttons: 1, clickCount: 1 });
-        await dispatchMouse('mouseMoved', { x: press.x + (deltaX / length) * 6, y: press.y + (deltaY / length) * 6 },
-            { button: 'left', buttons: 1 });
+        await moveTo({ x: press.x + (deltaX / length) * 6, y: press.y + (deltaY / length) * 6 });
 
         for (let step = 1; step <= 10; step++) {
-            await dispatchMouse('mouseMoved', { x: press.x + (deltaX * step) / 10, y: press.y + (deltaY * step) / 10 },
-                { button: 'left', buttons: 1 });
+            await moveTo({ x: press.x + (deltaX * step) / 10, y: press.y + (deltaY * step) / 10 });
         }
 
+        lastPoint = target;
         await dispatchMouse('mouseReleased', target, { button: 'left', buttons: 0, clickCount: 1 });
+        buttonDown = false;
 
         const moveEntry = await waitForSingleEvent(recorder, 'moveItem', 120000);
         const event = BoardRequestRecorder.eventOf(moveEntry);
@@ -1682,19 +3087,57 @@ async function browserDrag({ item, targetRow, targetDate }) {
 
         return { payload, event, moveResult: found.content.moveResult, content: found.content, recorder };
     } catch (error) {
+        if (buttonDown) {
+            await releaseLeftButton(lastPoint);
+        }
+
         recorder.stop();
         throw error;
     }
 }
 
-/** Asserts that the drag sent no refresh event, and stops its recorder. */
+/**
+ * Keeps the drag's recorder recording until the board is idle: every recorded request has finished or failed, its
+ * post data has been read, the gantt root holds no .blockUI element, and no Network event of a board request has
+ * arrived for DRAG_IDLE_QUIET_MS. Fails at once when a recorded request failed, and after DRAG_IDLE_TIMEOUT_MS
+ * without an idle board. Then asserts that no request failed and that the drag sent exactly one board request, a
+ * moveItem, and no refresh. Stops the recorder in every case.
+ */
 async function finishDrag(drag) {
+    const recorder = drag.recorder;
+    let last = null;
+
     try {
-        await drag.recorder.settle();
-        assert.deepStrictEqual(drag.recorder.withEvent('refresh').length, 0,
-            `no refresh after the drop (events: ${drag.recorder.eventNames().join(', ')})`);
+        await waitFor('the board idle after the drop', async () => {
+            const failed = recorder.firstFailed();
+
+            if (failed) {
+                throw new FatalError(`${BoardRequestRecorder.describe(failed)} failed after the drop: ${failed.failed}`);
+            }
+
+            const blocked = await DEVTOOLS.evaluate(frameExpression(`
+                const root = D.getElementById(${JSON.stringify(GANTT_PATH)});
+                return root ? root.querySelector('.blockUI') !== null : null;`));
+            const quietFor = Date.now() - recorder.lastActivityAt;
+            const postDataPending = recorder.hasPendingPostData();
+
+            last = { ganttBlocked: blocked, quietFor, postDataPending, requests: recorder.summary() };
+
+            return blocked === false && quietFor >= DRAG_IDLE_QUIET_MS && !postDataPending
+                && recorder.entries.every((entry) => entry.finished || entry.failed);
+        }, { timeout: DRAG_IDLE_TIMEOUT_MS, interval: 100, detail: () => JSON.stringify(last) });
+
+        const events = recorder.eventNames();
+
+        assert.deepStrictEqual(recorder.summary().filter((request) => request.failed !== null), [],
+            'no board request failed after the drop');
+        assert.equal(recorder.withEvent('moveItem').length, 1,
+            `exactly one moveItem for the drop (events: ${events.join(', ')})`);
+        assert.deepStrictEqual(recorder.withEvent('refresh').length, 0,
+            `no refresh after the drop (events: ${events.join(', ')})`);
+        assert.deepStrictEqual(events, ['moveItem'], `no board request other than the moveItem (events: ${events.join(', ')})`);
     } finally {
-        drag.recorder.stop();
+        recorder.stop();
     }
 }
 
@@ -1706,6 +3149,8 @@ async function finishDrag(drag) {
 let EXPECTED = null;
 
 before(async () => {
+    await verifyAcceptanceTarget();
+
     EXPECTED = {
         routing: message('orders.error.inappropriateProductionLineForPositionOrder'),
         shutdownWindow: message('cmmsMachineParts.productionMaintenanceGantt.move.error.shutdownWindow', 'PMG-EV-SHUTDOWN'),
@@ -1736,19 +3181,99 @@ before(async () => {
     assert.ok(Array.isArray(found.content.rows) && Array.isArray(found.content.items));
 }, { timeout: CASE_TIMEOUT_MS });
 
+// Promise of the single run of releaseResources, or null before it starts.
+let RELEASE = null;
+
+/**
+ * Stops Chrome, sends SIGKILL to every psql child still running and removes every temporary directory once Chrome is
+ * stopped. Each step, and each child and directory within a step, runs on its own, whatever the earlier ones did.
+ * Runs once: later calls return the promise of the first call. Resolves with the errors of the failed steps, empty
+ * when every step succeeded; never rejects.
+ */
+function releaseResources() {
+    if (RELEASE === null) {
+        RELEASE = (async () => {
+            const errors = [];
+
+            if (DEVTOOLS) {
+                try {
+                    await DEVTOOLS.close();
+                } catch (error) {
+                    errors.push(new Error(`stopping Chrome failed: ${error.message}`));
+                }
+            }
+
+            for (const child of PSQL_CHILDREN) {
+                try {
+                    child.kill('SIGKILL');
+                } catch (error) {
+                    errors.push(new Error(`sending SIGKILL to psql (pid ${child.pid}) failed: ${error.message}`));
+                }
+            }
+
+            for (const directory of TEMP_DIRS) {
+                try {
+                    fs.rmSync(directory, { recursive: true, force: true });
+                } catch (error) {
+                    errors.push(new Error(`removing ${directory} failed: ${error.message}`));
+                }
+            }
+
+            return errors;
+        })();
+    }
+
+    return RELEASE;
+}
+
 after(async () => {
-    if (DEVTOOLS) {
-        await DEVTOOLS.close();
-    }
+    const errors = await releaseResources();
 
-    for (const child of PSQL_CHILDREN) {
-        child.kill('SIGKILL');
-    }
-
-    for (const directory of TEMP_DIRS) {
-        fs.rmSync(directory, { recursive: true, force: true });
+    if (errors.length > 0) {
+        throw new AggregateError(errors, `cleanup failed: ${errors.map((error) => error.message).join('; ')}`);
     }
 });
+
+// Name of the first termination signal received, or null.
+let TERMINATION_SIGNAL = null;
+
+/**
+ * Handles SIGINT and SIGTERM: writes the signal to stderr, runs releaseResources, writes each cleanup error to stderr
+ * and exits with SIGNAL_EXIT_CODES[signal]. Exits with that status after SIGNAL_CLEANUP_TIMEOUT_MS when the cleanup
+ * has not finished. A later signal is written to stderr while the cleanup of the first one runs.
+ */
+function onTerminationSignal(signal) {
+    if (TERMINATION_SIGNAL !== null) {
+        process.stderr.write(`acceptance.test.js: ${signal} received while cleaning up after ${TERMINATION_SIGNAL}\n`);
+        return;
+    }
+
+    TERMINATION_SIGNAL = signal;
+
+    const exitCode = SIGNAL_EXIT_CODES[signal];
+
+    process.stderr.write(`acceptance.test.js: ${signal} received; stopping Chrome and psql and removing temporary `
+        + `directories, then exiting with ${exitCode}\n`);
+
+    const deadline = setTimeout(() => {
+        process.stderr.write(`acceptance.test.js: cleanup did not finish within ${SIGNAL_CLEANUP_TIMEOUT_MS} ms\n`);
+        process.exit(exitCode);
+    }, SIGNAL_CLEANUP_TIMEOUT_MS);
+
+    releaseResources().then((errors) => {
+        for (const error of errors) {
+            process.stderr.write(`acceptance.test.js: cleanup failed: ${error.message}\n`);
+        }
+    }, (error) => {
+        process.stderr.write(`acceptance.test.js: cleanup failed: ${error.message}\n`);
+    }).finally(() => {
+        clearTimeout(deadline);
+        process.exit(exitCode);
+    });
+}
+
+process.on('SIGINT', onTerminationSignal);
+process.on('SIGTERM', onTerminationSignal);
 
 // ---------------------------------------------------------------------------------------------------------------
 // Shared case flows
@@ -1810,48 +3335,58 @@ async function browserRejection({ caseName, role, targetRow, targetDate, expecte
 }
 
 /**
- * Runs one simultaneous-write move of A2 to PMG-B at D1 10:00: a background transaction writes writeSql, creates its
- * marker, sleeps 3 s and commits while the move request runs. Asserts the optimistic-lock rejection and that every
- * checksum equals the state after writeSql alone.
+ * Runs one simultaneous-write move of A2 to PMG-B at D1 10:00 against the background transaction of
+ * backgroundWrite(writeSql). The move is posted once the background marker exists. The case then waits up to 60 s until
+ * a backend in the lock-wait tree of the background backend lists that backend in its blocking pids, and fails at once
+ * when the background session ends or the move answers first. It then waits for the end of the background sleep and
+ * commits the background transaction. On a failure before the commit, the background transaction is rolled back and
+ * the error carries concurrentFailure's report. After the commit, the move answer is awaited with moveAnswers for up to
+ * MOVE_ANSWER_TIMEOUT_MS.
+ *
+ * Asserts the optimistic-lock rejection, that every checksum equals the state after writeSql alone, and that a backend
+ * blocked by the background backend was seen.
  */
 async function concurrentWriteRun(t, caseName, session, writeSql) {
     const fixture = fx(caseName);
     const board = await initialize(session, fixture.scheduleId);
     const item = itemById(board.content, fixture.roles.A2.positionId);
     const expected = await precomputeChecksums(fixture.scheduleId, writeSql);
-    const background = backgroundWrite(writeSql);
+    const { transaction: writer, held } = await backgroundWrite(writeSql);
+    const moves = [];
+    let blocked = null;
 
-    await waitForMarker(background.markerPath, background.done, 'the background write to hold its row locks');
+    try {
+        moves.push(trackSettlement(postMove(session, fixture.scheduleId, board.headerParameters, item, 'PMG-B',
+            at(1, '10:00'))));
 
-    const move = postMove(session, fixture.scheduleId, board.headerParameters, item, 'PMG-B', at(1, '10:00'));
+        blocked = await waitFor(`the move to wait on a lock of the background transaction (pid ${writer.pid})`, async () => {
+            if (writer.ended) {
+                throw new FatalError('the background transaction ended before the move waited on it');
+            }
+            if (moves[0].settled) {
+                throw new FatalError(`the move finished before it waited on the background transaction: ${moves[0].describe()}`);
+            }
 
-    move.catch(() => undefined);
+            const waiters = (await lockWaitTree(writer.pid)).filter((backend) => backend.blockedBy.includes(writer.pid));
 
-    let backgroundOpen = true;
+            return waiters.length > 0 ? waiters : null;
+        }, { timeout: 60000, interval: 100 });
 
-    background.done.then(() => {
-        backgroundOpen = false;
-    }, () => {
-        backgroundOpen = false;
-    });
+        t.diagnostic(`backends blocked by the background transaction (pid ${writer.pid}): ${JSON.stringify(blocked)}`);
 
-    await waitFor('the background transaction to commit', async () => {
-        if (!backgroundOpen) {
-            return true;
-        }
+        await valueWithin(held, HELD_ANSWER_TIMEOUT_MS, 'the end of the background sleep');
+        await writer.commit();
+    } catch (error) {
+        throw await concurrentFailure(error, [writer], moves);
+    }
 
-        t.diagnostic(`application backends waiting on a lock: ${await appLockWaiters()}`);
-
-        return !backgroundOpen;
-    }, { timeout: 60000, interval: 500 });
-
-    await background.done;
-
-    const content = await move;
+    const [content] = await moveAnswers(moves, MOVE_ANSWER_TIMEOUT_MS);
 
     assert.equal(content.moveResult.accepted, false, `the move is rejected (message: ${content.moveResult.message})`);
     assert.equal(norm(content.moveResult.message), norm(EXPECTED.optimisticLock), 'the rejection is the optimistic lock');
     assert.deepStrictEqual(await checksums(fixture.scheduleId), expected, 'only the background write persisted');
+    assert.ok(blocked.some((backend) => backend.blockedBy.includes(writer.pid)),
+        `a backend blocked by the background transaction (pid ${writer.pid}) was seen: ${JSON.stringify(blocked)}`);
 }
 
 /** Returns the rows of productionscheduling_planordertimecalculation of the schedule. */
@@ -1868,21 +3403,443 @@ WHERE c.productionlineschedule_id = ${Number(scheduleId)};
 `);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Acceptance target
+// ---------------------------------------------------------------------------------------------------------------
+
+// Comment of the acceptance database, set by run-acceptance.sh with COMMENT ON DATABASE.
+const ACCEPTANCE_DATABASE_MARKER = 'qcadoo-acceptance:productionMaintenanceGantt';
+
+// { database, serverPort, pid } of the verified acceptance database, its server port and the pid of the process
+// listening on the --base-url port, set by verifyAcceptanceTarget.
+let ACCEPTANCE_TARGET = null;
+
+// Socket states of /proc/net/tcp and /proc/net/tcp6.
+const TCP_ESTABLISHED = '01';
+const TCP_LISTEN = '0A';
+
+// Errors of reading /proc/<pid>/fd and its links when the process or descriptor is gone or belongs to another user.
+const PROC_ENTRY_UNAVAILABLE = new Set(['ENOENT', 'ESRCH', 'EACCES', 'EPERM']);
+
 /**
- * Terminates the idle client backends of the application (any application name other than pmg-acceptance*) on the
- * acceptance database and waits until they have exited; each backend reports its pending table statistics as it
- * exits. The application's connection pool opens new connections on demand.
+ * Decodes a /proc/net/tcp endpoint 'HEX:PORT' into { bytes, port }. The address hex is a sequence of 32-bit words,
+ * each printed in host byte order; the port is plain hex.
+ */
+function decodeProcEndpoint(text) {
+    const match = /^((?:[0-9A-F]{8}){1,4}):([0-9A-F]{4})$/i.exec(text);
+
+    if (!match || (match[1].length !== 8 && match[1].length !== 32)) {
+        throw new Error(`not a /proc/net/tcp endpoint: ${text}`);
+    }
+
+    const bytes = [];
+
+    for (let offset = 0; offset < match[1].length; offset += 8) {
+        const word = [];
+
+        for (let digit = 0; digit < 8; digit += 2) {
+            word.push(parseInt(match[1].slice(offset + digit, offset + digit + 2), 16));
+        }
+        if (os.endianness() === 'LE') {
+            word.reverse();
+        }
+
+        bytes.push(...word);
+    }
+
+    return { bytes, port: parseInt(match[2], 16) };
+}
+
+/**
+ * Returns the TCP sockets of /proc/net/tcp and /proc/net/tcp6 (skipped when absent) as
+ * { localBytes, localPort, remoteBytes, remotePort, state, inode }; state is the two-digit hex state, inode a string.
+ */
+function readTcpSockets() {
+    const sockets = [];
+
+    for (const file of ['/proc/net/tcp', '/proc/net/tcp6']) {
+        let text;
+
+        try {
+            text = fs.readFileSync(file, 'utf8');
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                continue;
+            }
+
+            throw error;
+        }
+
+        for (const line of text.split('\n').slice(1)) {
+            const fields = line.trim().split(/\s+/);
+
+            if (fields.length < 10) {
+                continue;
+            }
+
+            const local = decodeProcEndpoint(fields[1]);
+            const remote = decodeProcEndpoint(fields[2]);
+
+            sockets.push({
+                localBytes: local.bytes,
+                localPort: local.port,
+                remoteBytes: remote.bytes,
+                remotePort: remote.port,
+                state: fields[3].toUpperCase(),
+                inode: fields[9]
+            });
+        }
+    }
+
+    return sockets;
+}
+
+/**
+ * Returns the text of an address: the dotted quad of 4 bytes or of an IPv4-mapped IPv6 address, '::1' for the IPv6
+ * loopback address, and null for any other address.
+ */
+function addressText(bytes) {
+    if (bytes.length === 4) {
+        return bytes.join('.');
+    }
+    if (bytes.length === 16) {
+        if (bytes.slice(0, 10).every((byte) => byte === 0) && bytes[10] === 0xff && bytes[11] === 0xff) {
+            return bytes.slice(12).join('.');
+        }
+        if (bytes.slice(0, 15).every((byte) => byte === 0) && bytes[15] === 1) {
+            return '::1';
+        }
+    }
+
+    return null;
+}
+
+/** Returns whether the address is in 127.0.0.0/8, is ::1, or is an IPv4-mapped IPv6 address in 127.0.0.0/8. */
+function isLoopbackBytes(bytes) {
+    if (bytes.length === 4) {
+        return bytes[0] === 127;
+    }
+    if (bytes.length === 16 && bytes.slice(0, 10).every((byte) => byte === 0)) {
+        return (bytes.slice(10, 15).every((byte) => byte === 0) && bytes[15] === 1)
+            || (bytes[10] === 0xff && bytes[11] === 0xff && bytes[12] === 127);
+    }
+
+    return false;
+}
+
+/**
+ * Returns the socket inodes of the descriptors of process pid, or null when its descriptor directory is gone or not
+ * readable. Descriptors that close while they are read are left out.
+ */
+function processSocketInodes(pid) {
+    const directory = `/proc/${pid}/fd`;
+    let descriptors;
+
+    try {
+        descriptors = fs.readdirSync(directory);
+    } catch (error) {
+        if (PROC_ENTRY_UNAVAILABLE.has(error.code)) {
+            return null;
+        }
+
+        throw error;
+    }
+
+    const inodes = [];
+
+    for (const descriptor of descriptors) {
+        let target;
+
+        try {
+            target = fs.readlinkSync(path.join(directory, descriptor));
+        } catch (error) {
+            if (PROC_ENTRY_UNAVAILABLE.has(error.code)) {
+                continue;
+            }
+
+            throw error;
+        }
+
+        const match = /^socket:\[(\d+)\]$/.exec(target);
+
+        if (match) {
+            inodes.push(match[1]);
+        }
+    }
+
+    return inodes;
+}
+
+/**
+ * Reads the TCP sockets and the socket inodes of every process. Returns { sockets, inodesByPid }: sockets as
+ * readTcpSockets gives them, and inodesByPid mapping the pid of each process with a readable descriptor directory to
+ * the Set of its socket inodes.
+ */
+function readSocketOwnership() {
+    const sockets = readTcpSockets();
+    const inodesByPid = new Map();
+
+    for (const entry of fs.readdirSync('/proc')) {
+        if (!/^\d+$/.test(entry)) {
+            continue;
+        }
+
+        const inodes = processSocketInodes(entry);
+
+        if (inodes !== null) {
+            inodesByPid.set(Number(entry), new Set(inodes));
+        }
+    }
+
+    return { sockets, inodesByPid };
+}
+
+/** Returns the pids of the processes of the ownership snapshot that hold the socket inode. */
+function socketHolders(ownership, inode) {
+    const holders = [];
+
+    for (const [pid, inodes] of ownership.inodesByPid) {
+        if (inodes.has(inode)) {
+            holders.push(pid);
+        }
+    }
+
+    return holders;
+}
+
+/**
+ * Returns { pid, inodes } of the one process that holds every socket listening on the port, on any address. Throws a
+ * FatalError when no socket listens on the port, when a listening socket has no readable holder, or when more than
+ * one process holds the listening sockets.
+ */
+function listeningProcess(ownership, port) {
+    const listening = ownership.sockets.filter((socket) => socket.state === TCP_LISTEN && socket.localPort === port);
+
+    if (listening.length === 0) {
+        throw new FatalError(`no process listens on port ${port}`);
+    }
+
+    const owners = new Set();
+
+    for (const socket of listening) {
+        const holders = socketHolders(ownership, socket.inode);
+
+        if (holders.length === 0) {
+            throw new FatalError(`the process of a socket listening on port ${port} cannot be identified`);
+        }
+
+        holders.forEach((pid) => owners.add(pid));
+    }
+
+    if (owners.size > 1) {
+        throw new FatalError(`refusing to run: ${owners.size} processes listen on port ${port} `
+            + `(${[...owners].sort((left, right) => left - right).join(', ')})`);
+    }
+
+    const pid = [...owners][0];
+
+    return { pid, inodes: ownership.inodesByPid.get(pid) };
+}
+
+/** Returns whether a process named postgres or postmaster holds a socket listening on the port. */
+function isPostgresqlPort(ownership, port) {
+    return ownership.sockets
+        .filter((socket) => socket.state === TCP_LISTEN && socket.localPort === port)
+        .some((socket) => socketHolders(ownership, socket.inode).some((pid) => {
+            let name;
+
+            try {
+                name = fs.readFileSync(`/proc/${pid}/comm`, 'utf8').trim();
+            } catch (error) {
+                return false;
+            }
+
+            return name === 'postgres' || name === 'postmaster';
+        }));
+}
+
+/**
+ * Returns the established TCP connections of the process ({ pid, inodes } as listeningProcess gives it) as
+ * { sockets, unverifiable, foreignServerPorts }:
+ * - sockets: { address, port } of each connection to serverPort whose remote end is a loopback address, where address
+ *   is the local address as addressText gives it;
+ * - unverifiable: the number of connections to serverPort whose remote end is not a loopback address or whose local
+ *   address has no text;
+ * - foreignServerPorts: the other ports of loopback connections that a PostgreSQL server listens on.
+ */
+function processConnections(ownership, application, serverPort) {
+    const sockets = [];
+    const foreignServerPorts = new Set();
+    let unverifiable = 0;
+
+    for (const socket of ownership.sockets) {
+        if (socket.state !== TCP_ESTABLISHED || !application.inodes.has(socket.inode)) {
+            continue;
+        }
+
+        const loopback = isLoopbackBytes(socket.remoteBytes);
+
+        if (socket.remotePort === serverPort) {
+            const address = addressText(socket.localBytes);
+
+            if (loopback && address !== null) {
+                sockets.push({ address, port: socket.localPort });
+            } else {
+                unverifiable++;
+            }
+        } else if (loopback && isPostgresqlPort(ownership, socket.remotePort)) {
+            foreignServerPorts.add(socket.remotePort);
+        }
+    }
+
+    return { sockets, unverifiable, foreignServerPorts: [...foreignServerPorts].sort((left, right) => left - right) };
+}
+
+/**
+ * Returns the SQL VALUES rows `('address', port), ...` of the sockets. Throws when an address holds a character other
+ * than [0-9a-f.:] or a port is not an integer from 1 to 65535.
+ */
+function socketValues(sockets) {
+    return sockets.map(({ address, port }) => {
+        if (!/^[0-9a-f.:]+$/.test(address) || !Number.isInteger(port) || port < 1 || port > 65535) {
+            throw new Error(`not a socket address: ${address} port ${port}`);
+        }
+
+        return `('${address}', ${port})`;
+    }).join(', ');
+}
+
+/**
+ * Verifies the acceptance target and sets ACCEPTANCE_TARGET. Only reads. Throws, before any request or write:
+ * - when the database of --db-uri does not carry the comment ACCEPTANCE_DATABASE_MARKER;
+ * - at once, when no process, or more than one process, listens on the --base-url port, when that process holds a
+ *   connection to the server port that is not a loopback connection, when it holds a loopback connection to another
+ *   PostgreSQL server, or when one of its connections to the server belongs to another database;
+ * - when, within 30 s, that process does not hold at least one connection to the server with every connection to the
+ *   server belonging to that database.
+ */
+async function verifyAcceptanceTarget() {
+    const target = await psqlJson(`
+SELECT json_build_object('database', current_database(),
+                         'marker', shobj_description(d.oid, 'pg_database'),
+                         'port', current_setting('port')::integer)
+FROM pg_database d
+WHERE d.datname = current_database();
+`, { app: 'target' });
+
+    if (target.marker !== ACCEPTANCE_DATABASE_MARKER) {
+        throw new Error(`refusing to run: database ${JSON.stringify(target.database)} does not carry the comment `
+            + ACCEPTANCE_DATABASE_MARKER);
+    }
+
+    let lastSockets = null;
+    let lastRows = null;
+    let verifiedPid = null;
+
+    await waitFor(`the application at ${ARGS.baseUrl} to hold connections only to database ${target.database}`,
+        async () => {
+            const ownership = readSocketOwnership();
+            const application = listeningProcess(ownership, ARGS.httpPort);
+            const connections = processConnections(ownership, application, target.port);
+            const sockets = connections.sockets;
+
+            lastSockets = sockets.length;
+            lastRows = null;
+
+            if (connections.foreignServerPorts.length > 0) {
+                throw new FatalError(`refusing to run: the application at ${ARGS.baseUrl} is also connected to the `
+                    + `PostgreSQL server on port(s) ${connections.foreignServerPorts.join(', ')}`);
+            }
+            if (connections.unverifiable > 0) {
+                throw new FatalError(`refusing to run: the application at ${ARGS.baseUrl} holds `
+                    + `${connections.unverifiable} connection(s) to port ${target.port} `
+                    + 'that are not loopback connections');
+            }
+            if (sockets.length === 0) {
+                return false;
+            }
+
+            const rows = await psqlJson(`
+WITH application_sockets (address, port) AS (VALUES ${socketValues(sockets)})
+SELECT coalesce(json_agg(json_build_object('address', a.address, 'port', a.port, 'database', s.datname)), '[]')
+FROM application_sockets a
+LEFT JOIN pg_stat_activity s ON s.backend_type = 'client backend'
+                            AND s.client_port = a.port
+                            AND regexp_replace(host(s.client_addr), '^::ffff:', '') = a.address;
+`, { app: 'target' });
+
+            lastRows = rows;
+
+            const foreign = [...new Set(rows
+                .map((row) => row.database)
+                .filter((database) => database !== null && database !== target.database))];
+
+            if (foreign.length > 0) {
+                throw new FatalError(`refusing to run: the application at ${ARGS.baseUrl} is connected to database(s) `
+                    + `${foreign.map((database) => JSON.stringify(database)).join(', ')} instead of `
+                    + JSON.stringify(target.database));
+            }
+
+            if (rows.length === 0 || !rows.every((row) => row.database === target.database)) {
+                return false;
+            }
+
+            verifiedPid = application.pid;
+
+            return true;
+        }, {
+            timeout: 30000,
+            interval: 250,
+            detail: () => `${lastSockets} application socket(s) to port ${target.port}`
+                + (lastRows === null ? ''
+                    : `, ${lastRows.filter((row) => row.database === target.database).length} with a backend of `
+                    + `${JSON.stringify(target.database)}, ${lastRows.filter((row) => row.database === null).length} `
+                    + 'without a client backend')
+        });
+
+    ACCEPTANCE_TARGET = { database: target.database, serverPort: target.port, pid: verifiedPid };
+}
+
+/**
+ * Terminates the idle client backends of the acceptance database whose client address and port belong to a loopback
+ * connection of the verified process, and waits until they have exited; each backend reports its pending table
+ * statistics as it exits. The backends to terminate are selected into a materialized set first, and only the members
+ * of that set are passed to pg_terminate_backend. Throws when verifyAcceptanceTarget has not succeeded, or when the
+ * one process listening on the --base-url port is not the verified process.
  */
 async function flushApplicationBackendStats() {
+    if (ACCEPTANCE_TARGET === null) {
+        throw new Error('flushApplicationBackendStats requires a verified acceptance target');
+    }
+
+    const ownership = readSocketOwnership();
+    const application = listeningProcess(ownership, ARGS.httpPort);
+
+    if (application.pid !== ACCEPTANCE_TARGET.pid) {
+        throw new Error(`the process listening on port ${ARGS.httpPort} is ${application.pid}, `
+            + `not the verified process ${ACCEPTANCE_TARGET.pid}`);
+    }
+
+    const sockets = processConnections(ownership, application, ACCEPTANCE_TARGET.serverPort).sockets;
+
+    if (sockets.length === 0) {
+        return;
+    }
+
     const terminated = await psqlJson(`
-SELECT coalesce(json_agg(pid), '[]')
-FROM pg_stat_activity
-WHERE datname = current_database()
-  AND backend_type = 'client backend'
-  AND state = 'idle'
-  AND pid <> pg_backend_pid()
-  AND coalesce(application_name, '') NOT LIKE 'pmg-acceptance%'
-  AND pg_terminate_backend(pid);
+WITH application_sockets (address, port) AS (VALUES ${socketValues(sockets)}),
+targets AS MATERIALIZED (
+    SELECT s.pid
+    FROM pg_stat_activity s
+    JOIN application_sockets a ON a.address = regexp_replace(host(s.client_addr), '^::ffff:', '')
+                              AND a.port = s.client_port
+    WHERE s.datid = (SELECT d.oid FROM pg_database d WHERE d.datname = current_database())
+      AND s.backend_type = 'client backend'
+      AND s.state = 'idle'
+      AND s.pid <> pg_backend_pid()
+)
+SELECT coalesce(json_agg(t.pid) FILTER (WHERE pg_terminate_backend(t.pid)), '[]')
+FROM targets t;
 `, { app: 'stats' });
 
     if (terminated.length === 0) {
@@ -1891,16 +3848,19 @@ WHERE datname = current_database()
 
     await waitFor('the terminated application backends to exit', async () => (await psqlInteger(`
 SELECT count(*) FROM pg_stat_activity WHERE pid IN (${terminated.map(Number).join(', ')});
-`, { app: 'stats' })) === 0, { timeout: 30000, interval: 100 });
+`, { app: 'stats', timeout: PSQL_PROBE_TIMEOUT_MS })) === 0, { timeout: 30000, interval: 100 });
 }
 
-/** Reads n_tup_ins of productionscheduling_planordertimecalculation in a fresh psql session. */
+/**
+ * Reads n_tup_ins of productionscheduling_planordertimecalculation in a fresh psql session with the deadline
+ * PSQL_PROBE_TIMEOUT_MS.
+ */
 async function planOrderTimeCalculationInserts() {
     return psqlInteger(`
 SELECT coalesce((SELECT n_tup_ins
                  FROM pg_stat_user_tables
                  WHERE schemaname = 'public' AND relname = 'productionscheduling_planordertimecalculation'), -1);
-`, { app: 'stats' });
+`, { app: 'stats', timeout: PSQL_PROBE_TIMEOUT_MS });
 }
 
 // Stored positions after the accepted A2 -> PMG-B D1 10:00 move (acceptedCrossRowMove, concurrentMoves M1).
@@ -2197,50 +4157,45 @@ test('http:concurrentMoves', { timeout: CASE_TIMEOUT_MS }, async (t) => {
     const beforeMoves = await positionState('concurrentMoves');
 
     // The holder session locks B5 FOR UPDATE and keeps its transaction open.
-    const markerPath = path.join(makeTempDir('holder'), 'locked');
-    const holder = spawnPsql('holder');
-
-    holder.done.catch(() => undefined);
-    holder.child.stdin.write(`BEGIN;\nSELECT id FROM public.orders_productionlinescheduleposition WHERE id = `
-        + `${Number(fixture.roles.B5.positionId)} FOR UPDATE;\n\\! touch '${markerPath}'\n`);
-
-    await waitForMarker(markerPath, holder.done, 'the holder session to lock B5');
-
-    // M1: A2 -> PMG-B at D1 10:00; M2: A2 -> PMG-B at D1 09:30; both sent at once.
-    const moves = [
-        postMove(session, fixture.scheduleId, board.headerParameters, item, 'PMG-B', at(1, '10:00')),
-        postMove(session, fixture.scheduleId, board.headerParameters, item, 'PMG-B', at(1, '09:30'))
-    ];
-
-    for (const move of moves) {
-        move.catch(() => undefined);
-    }
-
-    let waitersError = null;
+    const holder = await HeldTransaction.open('holder', 'SELECT id FROM public.orders_productionlinescheduleposition '
+        + `WHERE id = ${Number(fixture.roles.B5.positionId)} FOR UPDATE`, 'locked');
+    const moves = [];
 
     try {
-        await waitFor('two application backends waiting on a lock', async () => {
-            const waiters = await appLockWaiters();
+        // M1: A2 -> PMG-B at D1 10:00; M2: A2 -> PMG-B at D1 09:30; both sent at once.
+        moves.push(trackSettlement(postMove(session, fixture.scheduleId, board.headerParameters, item, 'PMG-B',
+            at(1, '10:00'))));
+        moves.push(trackSettlement(postMove(session, fixture.scheduleId, board.headerParameters, item, 'PMG-B',
+            at(1, '09:30'))));
 
-            t.diagnostic(`application backends waiting on a lock: ${waiters}`);
+        // Two distinct backends in the lock-wait tree rooted at the holder, before either move answers.
+        const waiters = await waitFor(`two backends in the lock-wait tree of the holder session (pid ${holder.pid})`,
+            async () => {
+                if (holder.ended) {
+                    throw new FatalError('the holder session ended before both moves waited on it');
+                }
 
-            return waiters >= 2;
-        }, { timeout: 60000, interval: 250 });
+                const finished = moves.findIndex((move) => move.settled);
+
+                if (finished >= 0) {
+                    throw new FatalError(`move M${finished + 1} finished before both moves waited on the holder session: `
+                        + moves[finished].describe());
+                }
+
+                const tree = await lockWaitTree(holder.pid);
+
+                return tree.length >= 2 ? tree : null;
+            }, { timeout: 60000, interval: 250 });
+
+        t.diagnostic(`backends in the lock-wait tree of the holder session (pid ${holder.pid}): ${JSON.stringify(waiters)}`);
+
+        // The holder commits without a change.
+        await holder.commit();
     } catch (error) {
-        waitersError = error;
+        throw await concurrentFailure(error, [holder], moves);
     }
 
-    const activity = waitersError ? await activityDump() : null;
-
-    holder.child.stdin.end('COMMIT;\n');
-    await holder.done;
-
-    if (waitersError) {
-        await Promise.allSettled(moves);
-        throw new Error(`${waitersError.message}\npg_stat_activity: ${JSON.stringify(activity, null, 2)}`);
-    }
-
-    const results = await Promise.all(moves);
+    const results = await moveAnswers(moves, MOVE_ANSWER_TIMEOUT_MS);
     const acceptedIndexes = results.map((content, index) => (content.moveResult.accepted === true ? index : -1))
         .filter((index) => index >= 0);
 

@@ -4,7 +4,11 @@
 --   psql -X -v ON_ERROR_STOP=1 -v base_day=YYYY-MM-DD -d <uri> -f fixture.sql
 --
 -- DD means base_day and D1 means base_day + 1 day. Every timestamp is a wall-clock value computed as
--- base_day + interval. run-acceptance.sh passes a base_day whose UTC offset is constant from DD to DD + 7 days.
+-- base_day + interval.
+--
+-- Prerequisite: the caller must pass a base_day on which the application's time zone keeps one UTC offset from
+-- DD to DD + 7 days. The base_day checks below accept any calendar date in YYYY-MM-DD form; they do not check
+-- time zones.
 --
 -- Creates, in one transaction:
 --   * factory PMG-F, division PMG-D, production lines PMG-A and PMG-B with their shifts;
@@ -165,12 +169,13 @@ FROM (VALUES (1, 'PMG-T-BOTH', 'PMG-A'),
              (5, 'PMG-T-ZERO', 'PMG-B')) AS tl (ord, technology_number, line_number)
 ORDER BY tl.ord;
 
--- Line changeover norms for specific technologies on a specific line, 1800 s each.
+-- Line changeover norms of changeover type 01forTechnology between specific technologies on a specific line,
+-- no technology groups, 1800 s each.
 INSERT INTO public.linechangeovernorms_linechangeovernorms (id, number, name, changeovertype, fromtechnology_id,
                                                             totechnology_id, fromtechnologygroup_id,
                                                             totechnologygroup_id, productionline_id, duration)
 SELECT nextval('public.linechangeovernorms_linechangeovernorms_id_seq'), n.number, n.number,
-       '01fromTechForSpecificLine',
+       '01forTechnology',
        (SELECT id FROM public.technologies_technology WHERE number = n.from_technology_number),
        (SELECT id FROM public.technologies_technology WHERE number = n.to_technology_number),
        NULL, NULL,
@@ -218,8 +223,9 @@ CREATE TEMP TABLE pmg_fixture_param ON COMMIT DROP AS SELECT :'base_day'::date A
 
 -- Schedule PMG-<case> of every case: starttime D1 06:00, state 01draft, duration basis 01timeConsumingTechnology,
 -- production line change allowed. Order PMG-<case>-<role>: state 01pending, division PMG-D, planned quantity 1,
--- datefrom = startdate = position start, dateto = finishdate = position end. Positions: no changeover norm,
--- additionaltime 0.
+-- datefrom = startdate = the role's start and dateto = finishdate = the role's end in the layout below. For every
+-- role except SPARE these equal the position's starttime and endtime; SPARE has no position.
+-- Positions: no changeover norm, additionaltime 0.
 --
 -- Layout of every schedule (times on D1):
 --   role   line   technology     start-end      used by
@@ -351,8 +357,9 @@ END
 $$;
 
 -- Fails unless the master data, the events and every schedule are complete: 2 lines, 5 technology production lines,
--- 1 root operation component per technology, 6 norms, 2 events with factory and division, 12 schedules with
--- 11 orders, 11 operation runs and 10 positions each.
+-- 1 root operation component per technology, 6 norms of changeover type 01forTechnology with from and to
+-- technology and line, 2 events with factory and division, 12 schedules with 11 orders, 11 operation runs and
+-- 10 positions each.
 DO $$
 DECLARE
     v_schedule record;
@@ -382,7 +389,8 @@ BEGIN
     END IF;
 
     IF (SELECT count(*) FROM public.linechangeovernorms_linechangeovernorms
-        WHERE number LIKE 'PMG-N-%' AND fromtechnology_id IS NOT NULL AND totechnology_id IS NOT NULL
+        WHERE number LIKE 'PMG-N-%' AND changeovertype = '01forTechnology'
+          AND fromtechnology_id IS NOT NULL AND totechnology_id IS NOT NULL
           AND productionline_id IS NOT NULL) <> 6 THEN
         RAISE EXCEPTION 'fixture.sql: changeover norms PMG-N-* are incomplete';
     END IF;

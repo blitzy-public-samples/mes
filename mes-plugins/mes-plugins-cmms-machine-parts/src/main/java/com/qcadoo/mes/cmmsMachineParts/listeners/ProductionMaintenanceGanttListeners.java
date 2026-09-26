@@ -26,9 +26,11 @@ package com.qcadoo.mes.cmmsMachineParts.listeners;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import com.qcadoo.localization.api.TranslationService;
 import com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt.ProductionMaintenanceGanttMoveService;
 import com.qcadoo.view.api.ComponentState;
 import com.qcadoo.view.api.ViewDefinitionState;
+import com.qcadoo.view.api.components.FieldComponent;
 import com.qcadoo.view.internal.components.ganttChart.GanttChartComponentState;
 import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
 
@@ -37,12 +39,24 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * <p>
  * {@link #moveItem(ViewDefinitionState, ComponentState, String[])} is bound to the {@code moveItem} event of the board's
  * {@code gantt} component and runs after the component's built-in {@code moveItem} handler.
+ * {@link #fillTitle(ViewDefinitionState)} is the view's {@code beforeRender} hook that writes the translated title into the
+ * {@code title} field when the view is initialized.
  */
 @Service
 public class ProductionMaintenanceGanttListeners {
 
+    /**
+     * Translation key of the board title written into the {@code title} field.
+     */
+    public static final String TITLE_TRANSLATION_KEY = "cmmsMachineParts.productionMaintenanceGantt.window.mainTab.title.label";
+
+    private static final String L_TITLE = "title";
+
     @Autowired
     private ProductionMaintenanceGanttMoveService productionMaintenanceGanttMoveService;
+
+    @Autowired
+    private TranslationService translationService;
 
     /**
      * Runs the move of the dropped item through {@link ProductionMaintenanceGanttMoveService#move(GanttChartMoveRequest)} and
@@ -50,7 +64,9 @@ public class ProductionMaintenanceGanttListeners {
      * <ul>
      * <li>no move request on the component (the built-in handler already rejected the move): returns without calling the move
      * service and without accepting or rejecting;</li>
-     * <li>{@code move} returns: calls {@link GanttChartComponentState#acceptMove()}, which renders the refreshed board;</li>
+     * <li>{@code move} returns: calls {@link GanttChartComponentState#acceptMove()}, which renders the refreshed board, or,
+     * when the board cannot be refreshed or rendered, an accepted move result with {@code reloadRequired} and a message asking
+     * to reload the board; the move service is not called again;</li>
      * <li>{@code move} throws {@link ProductionMaintenanceGanttMoveService.MoveRejectedException}: calls
      * {@link GanttChartComponentState#rejectMove(String, String...)} with the exception's message key and arguments;</li>
      * <li>{@code move} throws a runtime exception that
@@ -94,6 +110,30 @@ public class ProductionMaintenanceGanttListeners {
         }
 
         gantt.acceptMove();
+    }
+
+    /**
+     * Writes the board title into the view's {@code title} field:
+     * <ul>
+     * <li>view rendered for an {@code initialize*} or {@code reset} event ({@link ViewDefinitionState#isViewAfterReload()}
+     * returns {@code false}): sets the field value to {@link #TITLE_TRANSLATION_KEY} translated for the view's locale and
+     * requests the field's state update;</li>
+     * <li>view rendered after any other event: returns without reading or changing the field, which keeps the value the client
+     * sent.</li>
+     * </ul>
+     *
+     * @param view
+     *            view definition state of the board
+     */
+    public void fillTitle(final ViewDefinitionState view) {
+        if (view.isViewAfterReload()) {
+            return;
+        }
+
+        FieldComponent title = (FieldComponent) view.getComponentByReference(L_TITLE);
+
+        title.setFieldValue(translationService.translate(TITLE_TRANSLATION_KEY, view.getLocale()));
+        title.requestComponentUpdateState();
     }
 
 }

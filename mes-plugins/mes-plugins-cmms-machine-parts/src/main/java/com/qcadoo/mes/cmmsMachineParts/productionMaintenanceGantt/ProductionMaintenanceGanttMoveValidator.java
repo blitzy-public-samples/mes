@@ -23,7 +23,7 @@
  */
 package com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt;
 
-import java.util.Arrays;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Objects;
@@ -38,19 +38,17 @@ import org.springframework.stereotype.Service;
 import com.qcadoo.localization.api.utils.DateUtils;
 import com.qcadoo.mes.basic.ParameterService;
 import com.qcadoo.mes.basic.ShiftsService;
-import com.qcadoo.mes.cmmsMachineParts.constants.CmmsMachinePartsConstants;
-import com.qcadoo.mes.cmmsMachineParts.constants.PlannedEventFields;
+import com.qcadoo.mes.basic.constants.BasicConstants;
+import com.qcadoo.mes.orders.constants.OrderFields;
 import com.qcadoo.mes.orders.constants.ParameterFieldsO;
 import com.qcadoo.mes.orders.constants.ProductionLineScheduleFields;
 import com.qcadoo.mes.orders.constants.ProductionLineSchedulePositionFields;
+import com.qcadoo.mes.orders.states.constants.OrderStateStringValues;
 import com.qcadoo.mes.orders.validators.ProductionLineSchedulePositionValidators;
 import com.qcadoo.mes.productionLines.constants.ProductionLineFields;
-import com.qcadoo.mes.productionLines.constants.ProductionLinesConstants;
 import com.qcadoo.model.api.DataDefinition;
 import com.qcadoo.model.api.DataDefinitionService;
 import com.qcadoo.model.api.Entity;
-import com.qcadoo.model.api.search.SearchOrders;
-import com.qcadoo.model.api.search.SearchRestrictions;
 import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
 
 /**
@@ -65,8 +63,9 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * <li>{@link #checkConcurrentEdit(Entity, GanttChartMoveRequest)} - the stored position still matches the item as rendered on
  * the board.</li>
  * </ol>
- * The target slot is the half-open interval {@code [dateFrom, dateTo)} of the move request. Every check only reads data and
- * expects the position as currently stored, before any change of the move is applied to it.
+ * The target slot is the half-open interval {@code [dateFrom, dateTo)} of the move request. Every check only reads data; the
+ * basic parameter is read without being created. Every check expects the position as currently stored, before any change of
+ * the move is applied to it.
  */
 @Service
 public class ProductionMaintenanceGanttMoveValidator {
@@ -137,7 +136,7 @@ public class ProductionMaintenanceGanttMoveValidator {
 
         if (rejection.isPresent() && LOG.isDebugEnabled()) {
             LOG.debug("Gantt move of position " + position.getId() + " to production line " + targetLine.getId()
-                    + " rejected with " + rejection.get().getMessageKey() + " " + Arrays.toString(rejection.get().getArgs()));
+                    + " rejected with " + rejection.get().getMessageKey());
         }
 
         return rejection;
@@ -146,11 +145,21 @@ public class ProductionMaintenanceGanttMoveValidator {
     /**
      * Checks that the target production line can run the position's order.
      * <p>
-     * The eligible production lines are those with {@code production = true} and {@code active = true}. The candidate
-     * production lines are returned by
+     * The target production line is eligible when its own {@code production} field is true and it is active; no
+     * production line is queried. An ineligible target production line rejects, and so does a position without an order.
+     * <p>
+     * The candidate production lines are returned by
      * {@link ProductionLineSchedulePositionValidators#getProductionLinesFromTechnology(Entity, List, boolean, boolean)} for the
-     * eligible lines, the schedule's {@code allowProductionLineChange} flag and the {@code canChangeProdLineForAcceptedOrders}
-     * parameter. The check passes only when the target production line is both a candidate and eligible.
+     * target production line as the only eligible line, the schedule's {@code allowProductionLineChange} flag and the
+     * {@code canChangeProdLineForAcceptedOrders} parameter. That parameter is read without creating the basic parameter, and is
+     * false when no basic parameter exists. The check passes only when the target production line is a candidate.
+     * <p>
+     * The order's own production line is kept as the only candidate, and neither the order's state nor its technology is
+     * needed, when the order has a production line and production line change is not allowed. It is also kept, and the
+     * technology is not needed, when the order has a production line and is accepted while
+     * {@code canChangeProdLineForAcceptedOrders} is false. The check rejects without looking up candidates when the order has
+     * a production line, production line change is allowed and the order has no state, or when the order's production line
+     * is not kept and the order has no technology.
      *
      * @param position
      *            the moved production line schedule position
@@ -159,21 +168,31 @@ public class ProductionMaintenanceGanttMoveValidator {
      * @return a {@link #ROUTING_MISMATCH_KEY} rejection, or an empty optional when the check passes
      */
     public Optional<MoveRejection> checkRouting(final Entity position, final Entity targetLine) {
-        List<Entity> eligibleLines = getProductionLineDD().find()
-                .add(SearchRestrictions.eq(ProductionLineFields.PRODUCTION, true))
-                .add(SearchRestrictions.eq(ProductionLineFields.ACTIVE, true)).list().getEntities();
+        boolean targetLineEligible = targetLine.getBooleanField(ProductionLineFields.PRODUCTION)
+                && targetLine.isActive();
+
+        if (!targetLineEligible) {
+            return Optional.of(new MoveRejection(ROUTING_MISMATCH_KEY));
+        }
+
+        Entity order = position.getBelongsToField(ProductionLineSchedulePositionFields.ORDER);
+
+        if (order == null) {
+            return Optional.of(new MoveRejection(ROUTING_MISMATCH_KEY));
+        }
 
         Entity schedule = position.getBelongsToField(ProductionLineSchedulePositionFields.PRODUCTION_LINE_SCHEDULE);
         boolean allowProductionLineChange = schedule.getBooleanField(ProductionLineScheduleFields.ALLOW_PRODUCTION_LINE_CHANGE);
-        boolean canChangeProdLineForAcceptedOrders = parameterService.getParameter().getBooleanField(
-                ParameterFieldsO.CAN_CHANGE_PROD_LINE_FOR_ACCEPTED_ORDERS);
+        boolean canChangeProdLineForAcceptedOrders = canChangeProdLineForAcceptedOrders();
+
+        if (!hasRoutingInputs(order, allowProductionLineChange, canChangeProdLineForAcceptedOrders)) {
+            return Optional.of(new MoveRejection(ROUTING_MISMATCH_KEY));
+        }
 
         List<Entity> candidateLines = productionLineSchedulePositionValidators.getProductionLinesFromTechnology(position,
-                eligibleLines, allowProductionLineChange, canChangeProdLineForAcceptedOrders);
+                Collections.singletonList(targetLine), allowProductionLineChange, canChangeProdLineForAcceptedOrders);
 
-        Long targetLineId = targetLine.getId();
-
-        if (containsId(candidateLines, targetLineId) && containsId(eligibleLines, targetLineId)) {
+        if (containsId(candidateLines, targetLine.getId())) {
             return Optional.empty();
         }
 
@@ -184,9 +203,10 @@ public class ProductionMaintenanceGanttMoveValidator {
      * Checks that no planned event requiring a shutdown of the target production line overlaps the slot.
      * <p>
      * An event overlaps the slot when its start date is before {@code dateTo} and its finish date is after {@code dateFrom}.
-     * Events of every state are considered. An event concerns the target production line when the line is one of the lines
-     * returned by {@link ProductionMaintenanceGanttChartItemResolver#resolveEventLines(Entity)}. Events are examined in
-     * ascending start date order.
+     * Events of every state are considered. An event concerns the target production line when the rule of
+     * {@link ProductionMaintenanceGanttChartItemResolver#resolveEventLines(Entity)} places it on that line. The events are
+     * read by {@link ProductionMaintenanceGanttChartItemResolver#findShutdownEventNumbers(Entity, Date, Date)}, in ascending
+     * start date order.
      *
      * @param targetLine
      *            the production line of the target row
@@ -201,25 +221,14 @@ public class ProductionMaintenanceGanttMoveValidator {
         Objects.requireNonNull(dateFrom, "dateFrom");
         Objects.requireNonNull(dateTo, "dateTo");
 
-        List<Entity> plannedEvents = getPlannedEventDD().find()
-                .add(SearchRestrictions.eq(PlannedEventFields.REQUIRES_SHUTDOWN, true))
-                .add(SearchRestrictions.lt(PlannedEventFields.START_DATE, dateTo))
-                .add(SearchRestrictions.gt(PlannedEventFields.FINISH_DATE, dateFrom))
-                .addOrder(SearchOrders.asc(PlannedEventFields.START_DATE)).list().getEntities();
+        List<String> eventNumbers = productionMaintenanceGanttChartItemResolver.findShutdownEventNumbers(targetLine, dateFrom,
+                dateTo);
 
-        Long targetLineId = targetLine.getId();
-
-        for (Entity plannedEvent : plannedEvents) {
-            List<Entity> eventLines = productionMaintenanceGanttChartItemResolver.resolveEventLines(plannedEvent);
-
-            if (containsId(eventLines, targetLineId)) {
-                String eventNumber = plannedEvent.getStringField(PlannedEventFields.NUMBER);
-
-                return Optional.of(new MoveRejection(SHUTDOWN_WINDOW_KEY, eventNumber));
-            }
+        if (eventNumbers.isEmpty()) {
+            return Optional.empty();
         }
 
-        return Optional.empty();
+        return Optional.of(new MoveRejection(SHUTDOWN_WINDOW_KEY, eventNumbers.get(0)));
     }
 
     /**
@@ -309,12 +318,50 @@ public class ProductionMaintenanceGanttMoveValidator {
         return false;
     }
 
-    private DataDefinition getProductionLineDD() {
-        return dataDefinitionService.get(ProductionLinesConstants.PLUGIN_IDENTIFIER, ProductionLinesConstants.MODEL_PRODUCTION_LINE);
+    /**
+     * Returns the {@code canChangeProdLineForAcceptedOrders} flag of the basic parameter. Returns false, without calling
+     * {@link ParameterService#getParameter()}, when the basic parameter data definition is missing or holds no parameter; no
+     * basic parameter is created.
+     */
+    private boolean canChangeProdLineForAcceptedOrders() {
+        DataDefinition parameterDD = dataDefinitionService.get(BasicConstants.PLUGIN_IDENTIFIER, BasicConstants.MODEL_PARAMETER);
+
+        if (parameterDD == null || parameterDD.count() == 0L) {
+            return false;
+        }
+
+        return parameterService.getParameter().getBooleanField(ParameterFieldsO.CAN_CHANGE_PROD_LINE_FOR_ACCEPTED_ORDERS);
     }
 
-    private DataDefinition getPlannedEventDD() {
-        return dataDefinitionService.get(CmmsMachinePartsConstants.PLUGIN_IDENTIFIER, CmmsMachinePartsConstants.MODEL_PLANNED_EVENT);
+    /**
+     * Returns true when the order holds every field
+     * {@link ProductionLineSchedulePositionValidators#getProductionLinesFromTechnology(Entity, List, boolean, boolean)} reads
+     * for the given flags.
+     * <p>
+     * An order with a production line needs nothing more when production line change is not allowed. When production line
+     * change is allowed, it needs a state, and needs nothing more when that state is accepted and
+     * {@code canChangeProdLineForAcceptedOrders} is false. In every other case the order needs a technology.
+     */
+    private boolean hasRoutingInputs(final Entity order, final boolean allowProductionLineChange,
+            final boolean canChangeProdLineForAcceptedOrders) {
+        Entity orderProductionLine = order.getBelongsToField(OrderFields.PRODUCTION_LINE);
+
+        if (orderProductionLine != null) {
+            if (!allowProductionLineChange) {
+                return true;
+            }
+
+            String orderState = order.getStringField(OrderFields.STATE);
+
+            if (orderState == null) {
+                return false;
+            }
+            if (OrderStateStringValues.ACCEPTED.equals(orderState) && !canChangeProdLineForAcceptedOrders) {
+                return true;
+            }
+        }
+
+        return order.getBelongsToField(OrderFields.TECHNOLOGY) != null;
     }
 
     /**
