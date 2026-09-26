@@ -147,6 +147,7 @@
         <view:view resource="view/toolDetails.xml"/>
         <view:view resource="view/operationToolDetails.xml"/>
         <view:view resource="view/technologyOperationToolDetails.xml"/>
+        <view:view resource="view/productionMaintenanceGantt.xml"/>
 
         <view:view-tab resource="view/tabExtensions/generalParameters.xml"/>
 
@@ -157,6 +158,7 @@
         <view:view-tab resource="view/tabExtensions/technologyOperationComponentDetails.xml"/>
 
         <view:view-ribbon-group resource="view/ribbonExtensions/ordersPlanningList.xml"/>
+        <view:view-ribbon-group resource="view/ribbonExtensions/productionLineScheduleDetails.xml"/>
 
         <view:view-hook plugin="technologies"
                         view="technologyOperationComponentDetails" type="beforeRender"
@@ -489,6 +491,11 @@
                             component="grid" event="createOrdersToolRequirement"
                             class="com.qcadoo.mes.cmmsMachineParts.listeners.OrdersPlanningListListenersCMP"
                             method="createOrdersToolRequirement"/>
+
+        <view:view-listener plugin="orders" view="productionLineScheduleDetails"
+                            component="form" event="showProductionMaintenanceGantt"
+                            class="com.qcadoo.mes.cmmsMachineParts.listeners.ProductionLineScheduleDetailsListenersCMP"
+                            method="showProductionMaintenanceGantt"/>
 
         <view:resource uri="public/**/*"/>
 
