@@ -63,9 +63,9 @@
  *               the first '/' and '?' (%40 elsewhere), key=value query parameters that libpq accepts other than
  *               service, hosts that are loopback hosts or absolute socket directories, loopback hostaddr values, and a
  *               database name. psql gets it with any password moved into a mode-600 password file of a private
- *               temporary directory and with application_name appended, and runs without the environment variables
- *               whose names start with PG other than PGCONNECT_TIMEOUT. A server that psql reaches over TCP on an
- *               address other than a loopback address is refused before any case.
+ *               temporary directory and with application_name appended, and runs with an environment that holds only
+ *               PATH and PGCONNECT_TIMEOUT. A server that psql reaches over TCP on an address other than a loopback
+ *               address is refused before any case.
  *   --chrome    an executable file, as a path or as a name found on PATH.
  *   --user      a non-blank login without control characters (U+0000-U+001F, U+007F-U+009F, U+2028 and U+2029).
  *
@@ -1394,19 +1394,17 @@ function databaseUri(app) {
 }
 
 /**
- * Returns a copy of process.env without the variables whose names start with PG, and with PGCONNECT_TIMEOUT set to
- * PSQL_CONNECT_TIMEOUT_SECONDS.
+ * Returns the whole environment of every psql process: PATH, taken from process.env when it is set there, and
+ * PGCONNECT_TIMEOUT set to PSQL_CONNECT_TIMEOUT_SECONDS. No other variable is read or passed.
+ * Example: with PATH=/usr/bin and HOME=/root in process.env, the result is
+ * { PATH: '/usr/bin', PGCONNECT_TIMEOUT: '10' }; without PATH, it is { PGCONNECT_TIMEOUT: '10' }.
  */
 function psqlEnvironment() {
-    const environment = {};
+    const environment = { PGCONNECT_TIMEOUT: PSQL_CONNECT_TIMEOUT_SECONDS };
 
-    for (const [name, value] of Object.entries(process.env)) {
-        if (!name.startsWith('PG')) {
-            environment[name] = value;
-        }
+    if (process.env.PATH !== undefined) {
+        environment.PATH = process.env.PATH;
     }
-
-    environment.PGCONNECT_TIMEOUT = PSQL_CONNECT_TIMEOUT_SECONDS;
 
     return environment;
 }
