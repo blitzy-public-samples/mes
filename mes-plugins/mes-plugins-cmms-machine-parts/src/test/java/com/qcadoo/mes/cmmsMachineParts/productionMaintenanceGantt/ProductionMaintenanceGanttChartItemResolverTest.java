@@ -42,6 +42,8 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.BDDMockito.given;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -94,6 +96,8 @@ import com.qcadoo.mes.basic.constants.BasicConstants;
 import com.qcadoo.mes.basic.constants.ProductFields;
 import com.qcadoo.mes.cmmsMachineParts.constants.CmmsMachinePartsConstants;
 import com.qcadoo.mes.cmmsMachineParts.constants.PlannedEventFields;
+import com.qcadoo.mes.cmmsMachineParts.constants.PlannedEventType;
+import com.qcadoo.mes.cmmsMachineParts.states.constants.PlannedEventState;
 import com.qcadoo.mes.cmmsMachineParts.states.constants.PlannedEventStateStringValues;
 import com.qcadoo.mes.orders.constants.OrderFields;
 import com.qcadoo.mes.orders.constants.OrdersConstants;
@@ -137,7 +141,7 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
 
     private static final String SCALE_TO = "2026-10-05 00:00:00";
 
-    private static final String EVENT_TYPE = "01review";
+    private static final String EVENT_TYPE = PlannedEventType.REVIEW.getStringValue();
 
     private static final String EVENT_TYPE_PREFIX = "cmmsMachineParts.plannedEvent.type.value.";
 
@@ -859,7 +863,7 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
         Entity shutdownEvent = plannedEvent("EV-T1", PlannedEventStateStringValues.CANCELED, true, "2026-09-29 06:00:00",
                 "2026-09-29 10:00:00", lineL1, null, null);
 
-        stubStringField(shutdownEvent, PlannedEventFields.TYPE, "02repairs&co");
+        stubStringField(shutdownEvent, PlannedEventFields.TYPE, PlannedEventType.REPAIRS.getStringValue());
 
         plannedEvents.add(shutdownEvent);
         plannedEvents.add(plannedEvent("EV-T2", PlannedEventStateStringValues.NEW, false, "2026-09-30 06:00:00",
@@ -873,8 +877,9 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
 
         assertEquals("EV-T1", shutdownTooltip.getHeader().get());
         assertEquals(Arrays.asList(
-                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY, EVENT_TYPE_PREFIX
-                        + "02repairs&amp;co", EVENT_STATE_PREFIX + PlannedEventStateStringValues.CANCELED),
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY,
+                        EVENT_TYPE_PREFIX + PlannedEventType.REPAIRS.getStringValue(),
+                        EVENT_STATE_PREFIX + PlannedEventStateStringValues.CANCELED),
                 translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, TRUE_KEY)),
                 shutdownTooltip.getContent());
 
@@ -886,6 +891,185 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
                         EVENT_STATE_PREFIX + PlannedEventStateStringValues.NEW),
                 translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, FALSE_KEY)),
                 maintenanceTooltip.getContent());
+    }
+
+    @Test
+    public final void shouldEscapeTranslatedTypeAndStateLabelsInTooltip() {
+        // given
+        Map<String, String> translations = new HashMap<String, String>();
+
+        translations.put(EVENT_TYPE_PREFIX + PlannedEventType.REPAIRS.getStringValue(), "<b>Repairs</b>");
+        translations.put(EVENT_STATE_PREFIX + PlannedEventStateStringValues.PLANNED, "<i>Planned</i> & \"due\"");
+        translations.put(ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNSPECIFIED_KEY, "<u>Unspecified</u>");
+        translations.put(ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNKNOWN_KEY, "<s>Unknown</s>");
+
+        doAnswer(new FixedTranslationAnswer(translations)).when(translationService).translate(Matchers.anyString(),
+                Matchers.any(Locale.class), Matchers.<String> anyVararg());
+
+        Entity declaredStateEvent = plannedEvent("EV-DECLARED", PlannedEventStateStringValues.PLANNED, true,
+                "2026-09-29 06:00:00", "2026-09-29 10:00:00", lineL1, null, null);
+
+        stubStringField(declaredStateEvent, PlannedEventFields.TYPE, PlannedEventType.REPAIRS.getStringValue());
+
+        plannedEvents.add(declaredStateEvent);
+        plannedEvents.add(plannedEvent("EV-NO-STATE", null, false, "2026-09-29 06:00:00", "2026-09-29 10:00:00", lineL2,
+                null, null));
+        plannedEvents.add(plannedEvent("EV-OTHER-STATE", "09archived", false, "2026-09-29 06:00:00",
+                "2026-09-29 10:00:00", lineL3, null, null));
+
+        // when
+        resolver.resolve(scale, context, locale);
+
+        // then
+        assertEquals(Arrays.asList(
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY, "&lt;b&gt;Repairs&lt;/b&gt;",
+                        "&lt;i&gt;Planned&lt;/i&gt; &amp; &quot;due&quot;"),
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, TRUE_KEY)),
+                recordedItemLabelled("EV-DECLARED").tooltip.getContent());
+        assertEquals(Arrays.asList(
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY, EVENT_TYPE_PREFIX + EVENT_TYPE,
+                        "&lt;u&gt;Unspecified&lt;/u&gt;"),
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, FALSE_KEY)),
+                recordedItemLabelled("EV-NO-STATE").tooltip.getContent());
+        assertEquals(Arrays.asList(
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY, EVENT_TYPE_PREFIX + EVENT_TYPE,
+                        "&lt;s&gt;Unknown&lt;/s&gt;"),
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, FALSE_KEY)),
+                recordedItemLabelled("EV-OTHER-STATE").tooltip.getContent());
+    }
+
+    @Test
+    public final void shouldLabelEveryDeclaredPlannedEventStateWithItsStateTranslation() {
+        // given
+        for (PlannedEventState state : PlannedEventState.values()) {
+            plannedEvents.add(plannedEvent("EV-" + state.getStringValue(), state.getStringValue(), false,
+                    "2026-09-29 06:00:00", "2026-09-29 10:00:00", lineL1, null, null));
+        }
+
+        // when
+        resolver.resolve(scale, context, locale);
+
+        // then
+        List<String> declaredStates = new ArrayList<String>();
+
+        for (PlannedEventState state : PlannedEventState.values()) {
+            declaredStates.add(state.getStringValue());
+        }
+
+        assertEquals(Arrays.asList(PlannedEventStateStringValues.NEW, PlannedEventStateStringValues.IN_PLAN,
+                PlannedEventStateStringValues.PLANNED, PlannedEventStateStringValues.IN_REALIZATION,
+                PlannedEventStateStringValues.IN_EDITING, PlannedEventStateStringValues.REALIZED,
+                PlannedEventStateStringValues.ACCEPTED, PlannedEventStateStringValues.CANCELED), declaredStates);
+        assertEquals(declaredStates.size(), recordedItems.size());
+
+        for (PlannedEventState state : PlannedEventState.values()) {
+            GanttChartItemTooltip tooltip = recordedItemLabelled("EV-" + state.getStringValue()).tooltip;
+
+            assertEquals(Arrays.asList(
+                    translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY, EVENT_TYPE_PREFIX + EVENT_TYPE,
+                            EVENT_STATE_PREFIX + state.getStringValue()),
+                    translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, FALSE_KEY)),
+                    tooltip.getContent());
+            verify(translationService).translate(EVENT_STATE_PREFIX + state.getStringValue(), locale);
+        }
+
+        verify(translationService, never()).translate(
+                Matchers.eq(ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNSPECIFIED_KEY),
+                Matchers.any(Locale.class), Matchers.<String> anyVararg());
+        verify(translationService, never()).translate(
+                Matchers.eq(ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNKNOWN_KEY), Matchers.any(Locale.class),
+                Matchers.<String> anyVararg());
+    }
+
+    @Test
+    public final void shouldLabelPlannedEventWithoutStateAsUnspecified() {
+        // given
+        plannedEvents.add(plannedEvent("EV-NULL-STATE", null, true, "2026-09-29 06:00:00", "2026-09-29 10:00:00", lineL1,
+                null, null));
+        plannedEvents.add(plannedEvent("EV-EMPTY-STATE", "", false, "2026-09-29 06:00:00", "2026-09-29 10:00:00", lineL2,
+                null, null));
+        plannedEvents.add(plannedEvent("EV-BLANK-STATE", " \t", false, "2026-09-29 06:00:00", "2026-09-29 10:00:00", lineL3,
+                null, null));
+
+        // when
+        resolver.resolve(scale, context, locale);
+
+        // then
+        assertEquals(Arrays.asList(
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY, EVENT_TYPE_PREFIX + EVENT_TYPE,
+                        ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNSPECIFIED_KEY),
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, TRUE_KEY)),
+                recordedItemLabelled("EV-NULL-STATE").tooltip.getContent());
+
+        for (String eventNumber : Arrays.asList("EV-EMPTY-STATE", "EV-BLANK-STATE")) {
+            assertEquals(Arrays.asList(
+                    translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY, EVENT_TYPE_PREFIX + EVENT_TYPE,
+                            ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNSPECIFIED_KEY),
+                    translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, FALSE_KEY)),
+                    recordedItemLabelled(eventNumber).tooltip.getContent());
+        }
+
+        verify(translationService, times(3)).translate(ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNSPECIFIED_KEY,
+                locale);
+        verify(translationService, never()).translate(Matchers.startsWith(EVENT_STATE_PREFIX), Matchers.any(Locale.class),
+                Matchers.<String> anyVararg());
+        verify(translationService, never()).translate(
+                Matchers.eq(ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNKNOWN_KEY), Matchers.any(Locale.class),
+                Matchers.<String> anyVararg());
+    }
+
+    @Test
+    public final void shouldLabelPlannedEventWithUndeclaredStateAsUnknownWithoutTranslatingTheState() {
+        // given
+        List<String> undeclaredStates = Arrays.asList("<img src=x onerror=alert(1)>", "09unknown", "03PLANNED", " 03planned");
+
+        for (int index = 0; index < undeclaredStates.size(); index++) {
+            plannedEvents.add(plannedEvent("EV-UNDECLARED-" + index, undeclaredStates.get(index), false, "2026-09-29 06:00:00",
+                    "2026-09-29 10:00:00", lineL1, null, null));
+        }
+
+        // when
+        resolver.resolve(scale, context, locale);
+
+        // then
+        assertEquals(undeclaredStates.size(), recordedItems.size());
+
+        for (int index = 0; index < undeclaredStates.size(); index++) {
+            GanttChartItemTooltip tooltip = recordedItemLabelled("EV-UNDECLARED-" + index).tooltip;
+
+            assertEquals(Arrays.asList(
+                    translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY, EVENT_TYPE_PREFIX + EVENT_TYPE,
+                            ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNKNOWN_KEY),
+                    translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, FALSE_KEY)),
+                    tooltip.getContent());
+
+            for (String line : tooltip.getContent()) {
+                assertFalse(line, line.contains("<img"));
+                assertFalse(line, line.contains("onerror"));
+                assertFalse(line, line.contains("09unknown"));
+                assertFalse(line, line.contains("03PLANNED"));
+                assertFalse(line, line.contains("03planned"));
+            }
+        }
+
+        verify(translationService, times(undeclaredStates.size())).translate(
+                ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNKNOWN_KEY, locale);
+        verify(translationService, never()).translate(Matchers.startsWith(EVENT_STATE_PREFIX), Matchers.any(Locale.class),
+                Matchers.<String> anyVararg());
+        verify(translationService, never()).translate(
+                Matchers.eq(ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNSPECIFIED_KEY),
+                Matchers.any(Locale.class), Matchers.<String> anyVararg());
+
+        ArgumentCaptor<String> codeCaptor = ArgumentCaptor.forClass(String.class);
+
+        verify(translationService, atLeastOnce()).translate(codeCaptor.capture(), Matchers.any(Locale.class),
+                Matchers.<String> anyVararg());
+
+        for (String code : codeCaptor.getAllValues()) {
+            for (String undeclaredState : undeclaredStates) {
+                assertFalse(code, code.contains(undeclaredState.trim()));
+            }
+        }
     }
 
     @Test
@@ -1870,7 +2054,7 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
 
         stubStringField(productionLine, ProductionLineFields.NUMBER, number);
         stubBooleanField(productionLine, ProductionLineFields.PRODUCTION, production);
-        stubBooleanField(productionLine, ProductionLineFields.ACTIVE, active);
+        given(productionLine.isActive()).willReturn(active);
 
         return productionLine;
     }
@@ -2006,7 +2190,7 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
 
         for (Entity productionLine : productionLines) {
             if (production.booleanValue() == productionLine.getBooleanField(ProductionLineFields.PRODUCTION)
-                    && active.booleanValue() == productionLine.getBooleanField(ProductionLineFields.ACTIVE)) {
+                    && active.booleanValue() == productionLine.isActive()) {
                 rows.add(mapOf(PRODUCTION_LINE_ID_ALIAS, productionLine.getId(), NUMBER_ALIAS, numberOf(productionLine)));
             }
         }
@@ -2679,6 +2863,33 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
             }
 
             return translated((String) arguments[0], translationArgs.toArray(new String[translationArgs.size()]));
+        }
+
+    }
+
+    /**
+     * Answers the translation of each given code with its given text, and every other translation as
+     * {@link TranslationAnswer} does.
+     */
+    private static final class FixedTranslationAnswer implements Answer<String> {
+
+        private final Map<String, String> translations;
+
+        private final TranslationAnswer defaultAnswer = new TranslationAnswer();
+
+        private FixedTranslationAnswer(final Map<String, String> translations) {
+            this.translations = translations;
+        }
+
+        @Override
+        public String answer(final InvocationOnMock invocation) {
+            String code = (String) invocation.getArguments()[0];
+
+            if (translations.containsKey(code)) {
+                return translations.get(code);
+            }
+
+            return defaultAnswer.answer(invocation);
         }
 
     }

@@ -94,6 +94,7 @@ import com.qcadoo.mes.technologies.constants.TechnologiesConstants;
 import com.qcadoo.model.api.DataDefinition;
 import com.qcadoo.model.api.DataDefinitionService;
 import com.qcadoo.model.api.Entity;
+import com.qcadoo.model.api.search.JoinType;
 import com.qcadoo.model.api.search.SearchCriteriaBuilder;
 import com.qcadoo.model.api.search.SearchCriterion;
 import com.qcadoo.model.api.search.SearchOrder;
@@ -106,9 +107,10 @@ import com.qcadoo.model.internal.api.DataAccessService;
  * Tests of {@link ProductionMaintenanceGanttRecomputeService}.
  * <p>
  * The production line schedule positions of each test live in an in-memory position table. Every {@code find()} on the
- * position data definition answers a new criteria builder that accepts only the criteria and orders the recompute queries
- * are expected to use, and reads no row. The builder's {@code list()} and {@code uniqueResult()} select the rows that
- * satisfy them from the position table as it is at that call, and record a read event.
+ * position data definition answers a new criteria builder that accepts only the criteria, orders and inner order alias the
+ * recompute queries are expected to use, and reads no row. The builder's {@code list()} and {@code uniqueResult()} select the
+ * rows that satisfy them from the position table as it is at that call, excluding the rows without an order when the inner
+ * order alias was created, and record a read event.
  * {@link SearchRestrictions} converts every entity through a mocked {@link DataAccessService} into a reference holding only
  * the entity's id: belongs-to criteria built from distinct entities with one id are equal, and a belongs-to criterion selects
  * the rows whose field holds an entity with that id.
@@ -172,6 +174,13 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
     private static final String IN_PROPERTY_NAME_FIELD = "propertyName";
 
     private static final String IN_VALUES_FIELD = "values";
+
+    /**
+     * Element a position query records for {@code createAlias(ORDER, ORDER, JoinType.INNER)}, the only alias the position
+     * criteria builder accepts.
+     */
+    private static final List<Object> INNER_ORDER_ALIAS = Collections.unmodifiableList(Arrays.<Object> asList(
+            ProductionLineSchedulePositionFields.ORDER, ProductionLineSchedulePositionFields.ORDER, JoinType.INNER));
 
     private ProductionMaintenanceGanttRecomputeService recomputeService;
 
@@ -530,6 +539,84 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
         assertUntouched(moved);
         assertEquals(1, steps.size());
+    }
+
+    @Test
+    public final void shouldChainOriginRowFromLatestPredecessorWithOrder() {
+        // given: m moves from A 09:00 to B 10:00-11:00; A holds a1 06:00-07:00, aWithoutOrder 08:00-08:45 without an order
+        // and a2 11:00; B holds no position after the drop start
+        Entity a1Order = order(52L);
+        Entity a1 = position(11L, lineA, a1Order, "06:00", "07:00");
+        Entity aWithoutOrder = position(14L, lineA, null, "08:00", "08:45");
+        Entity moved = position(MOVED_ID, lineB, order(51L), "10:00", "11:00");
+        Entity a2 = position(12L, lineA, order(53L), "11:00", "12:00");
+
+        // when
+        recompute(moved, lineA, "09:00", lineB, "10:00");
+
+        // then: a2 is chained from a1, the latest position with an order at or before the vacated start; aWithoutOrder is
+        // neither the predecessor nor recomputed
+        InOrder inOrder = inOrder(a2, psExecutor);
+        verifyRecomputedAndSaved(inOrder, a2, "07:15", "08:15");
+        verifyEachSavedOnce(a2);
+
+        assertChainedFrom(a2, lineA, "07:00", a1Order);
+
+        // then: the predecessor query joins the position's order inner after the schedule and line criteria and still
+        // excludes m by id; neither candidate query joins the order
+        assertEquals(3, positionQueries.size());
+        assertEquals(Arrays.<Object> asList(
+                SearchRestrictions.belongsTo(ProductionLineSchedulePositionFields.PRODUCTION_LINE_SCHEDULE, schedule),
+                SearchRestrictions.belongsTo(ProductionLineSchedulePositionFields.PRODUCTION_LINE, lineA), INNER_ORDER_ALIAS,
+                SearchRestrictions.idNe(MOVED_ID), SearchRestrictions.le(ProductionLineSchedulePositionFields.START_TIME,
+                        at("09:00")), SearchOrders.desc(ProductionLineSchedulePositionFields.START_TIME)),
+                positionQueries.get(1));
+        assertFalse(positionQueries.get(0).contains(INNER_ORDER_ALIAS));
+        assertFalse(positionQueries.get(2).contains(INNER_ORDER_ALIAS));
+
+        assertUntouched(a1);
+        assertUntouched(aWithoutOrder);
+        assertUntouched(moved);
+        assertEquals(1, steps.size());
+    }
+
+    @Test
+    public final void shouldChainLaterSameRowMoveFromLatestPredecessorWithOrder() {
+        // given: m moves on A from 08:00-09:00 to 11:00-12:00; A holds a1 06:00-07:00, aWithoutOrder 07:30-07:45 without an
+        // order, p 10:00 and q 13:00; origin and destination are distinct entities of row A
+        Entity a1Order = order(52L);
+        Entity a1 = position(11L, lineA, a1Order, "06:00", "07:00");
+        Entity aWithoutOrder = position(14L, lineA, null, "07:30", "07:45");
+        Entity movedOrder = order(51L);
+        Entity moved = position(MOVED_ID, lineA, movedOrder, "11:00", "12:00");
+        Entity p = position(12L, lineA, order(53L), "10:00", "11:00");
+        Entity q = position(13L, lineA, order(54L), "13:00", "14:00");
+        Entity originLine = entityWithIdOf(lineA);
+        Entity destinationLine = entityWithIdOf(lineA);
+
+        // when
+        recompute(moved, originLine, "08:00", destinationLine, "11:00");
+
+        // then: p is chained from a1, the latest position with an order at or before the vacated start, and q from m;
+        // aWithoutOrder is neither the predecessor nor recomputed
+        InOrder inOrder = inOrder(p, q, psExecutor);
+        verifyRecomputedAndSaved(inOrder, p, "07:15", "08:15");
+        verifyRecomputedAndSaved(inOrder, q, "12:15", "13:15");
+        verifyEachSavedOnce(p, q);
+
+        assertChainedFrom(p, destinationLine, "07:00", a1Order);
+        assertChainedFrom(q, destinationLine, "12:00", movedOrder);
+
+        // then: the candidate query does not join the order; the predecessor query joins it inner and excludes m by id
+        assertEquals(2, positionQueries.size());
+        assertFalse(positionQueries.get(0).contains(INNER_ORDER_ALIAS));
+        assertTrue(positionQueries.get(1).contains(INNER_ORDER_ALIAS));
+        assertTrue(positionQueries.get(1).contains(SearchRestrictions.idNe(MOVED_ID)));
+
+        assertUntouched(a1);
+        assertUntouched(aWithoutOrder);
+        assertUntouched(moved);
+        assertEquals(2, steps.size());
     }
 
     @Test
@@ -970,6 +1057,92 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
         verify(b2, never()).setField(anyString(), any());
         verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor);
+    }
+
+    @Test
+    public final void shouldRejectBeforeAnySchedulingCallWhenScheduleHasNoStartTime() {
+        // given: the schedule has no start time; m moves from A 09:00 to B 11:00-12:00; A holds a2 11:00; B holds b2 13:00
+        stubDateField(schedule, ProductionLineScheduleFields.START_TIME, null);
+
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity a2 = position(12L, lineA, order(52L), "11:00", "12:00");
+        Entity b2 = position(22L, lineB, order(53L), "13:00", "14:00");
+
+        // when
+        try {
+            recompute(moved, lineA, "09:00", lineB, "11:00");
+
+            fail("MoveRejectedException expected");
+        } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
+            // then
+            assertEquals(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, e.getMessageKey());
+            assertEquals(0, e.getArgs().length);
+        }
+
+        // then: the position queries ran; no scheduling service or executor was called and no candidate was changed
+        assertEquals(3, positionQueries.size());
+        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor);
+        assertTrue(steps.isEmpty());
+        verify(a2, never()).setField(anyString(), any());
+        verify(b2, never()).setField(anyString(), any());
+        assertUntouched(moved);
+    }
+
+    @Test
+    public final void shouldRejectSameRowMoveBeforeAnySchedulingCallWhenScheduleHasNoStartTime() {
+        // given: the schedule has no start time; m moves on A from 08:00-09:00 to 11:00-12:00; A holds p 10:00 and q 13:00;
+        // origin and destination are distinct entities of row A
+        stubDateField(schedule, ProductionLineScheduleFields.START_TIME, null);
+
+        Entity moved = position(MOVED_ID, lineA, order(51L), "11:00", "12:00");
+        Entity p = position(12L, lineA, order(52L), "10:00", "11:00");
+        Entity q = position(13L, lineA, order(53L), "13:00", "14:00");
+        Entity originLine = entityWithIdOf(lineA);
+        Entity destinationLine = entityWithIdOf(lineA);
+
+        // when
+        try {
+            recompute(moved, originLine, "08:00", destinationLine, "11:00");
+
+            fail("MoveRejectedException expected");
+        } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
+            // then
+            assertEquals(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, e.getMessageKey());
+            assertEquals(0, e.getArgs().length);
+        }
+
+        // then: the position queries ran; no scheduling service or executor was called and no candidate was changed
+        assertEquals(2, positionQueries.size());
+        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor);
+        assertTrue(steps.isEmpty());
+        verify(p, never()).setField(anyString(), any());
+        verify(q, never()).setField(anyString(), any());
+        assertUntouched(moved);
+    }
+
+    @Test
+    public final void shouldRecomputeNothingWithoutScheduleStartTimeWhenNeitherRowHasPositionsAfterAffectedStart() {
+        // given: the schedule has no start time; m moves from A 09:00 to B 11:00-12:00; A holds only a1 06:00-08:00 and B
+        // only b1 08:00-09:00
+        stubDateField(schedule, ProductionLineScheduleFields.START_TIME, null);
+
+        Entity a1 = position(11L, lineA, order(52L), "06:00", "08:00");
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity b1 = position(21L, lineB, order(53L), "08:00", "09:00");
+
+        // when
+        recompute(moved, lineA, "09:00", lineB, "11:00");
+
+        // then: no rejection; the position queries ran, the schedule start was not read, and no scheduling service or
+        // executor was called
+        assertEquals(3, positionQueries.size());
+        verify(schedule, never()).getDateField(ProductionLineScheduleFields.START_TIME);
+        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor);
+        assertTrue(steps.isEmpty());
+
+        assertUntouched(a1);
+        assertUntouched(b1);
+        assertUntouched(moved);
     }
 
     @Test
@@ -1914,11 +2087,13 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
     }
 
     /**
-     * Records known criteria of {@code add}, known orders of {@code addOrder} and the limit of {@code setMaxResults}, and
-     * answers them with the builder itself. Answers {@code list()} and {@code uniqueResult()} with the rows of the position
-     * table, as it is at that call, that satisfy every recorded criterion, sorted by the recorded orders and cut to the
-     * limit, and records a read event. Fails on unknown criteria, unknown orders, a {@code uniqueResult()} matching more than
-     * one row and every other builder method.
+     * Records known criteria of {@code add}, known orders of {@code addOrder}, {@code createAlias(ORDER, ORDER,
+     * JoinType.INNER)} as {@link #INNER_ORDER_ALIAS} and the limit of {@code setMaxResults}, and answers them with the builder
+     * itself. Answers {@code list()} and {@code uniqueResult()} with the rows of the position table, as it is at that call,
+     * that satisfy every recorded criterion and, when the inner order alias was recorded, have an order, sorted by the recorded
+     * orders and cut to the limit, and records a read event. Fails on unknown criteria, unknown orders, any other
+     * {@code createAlias} call (another association, alias or join type, or the two-argument form), a {@code uniqueResult()}
+     * matching more than one row and every other builder method.
      */
     private final class PositionCriteriaBuilderAnswer implements Answer<Object> {
 
@@ -1964,6 +2139,17 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
                 return invocation.getMock();
             }
+            if ("createAlias".equals(methodName)) {
+                List<Object> alias = Arrays.asList(arguments);
+
+                if (!INNER_ORDER_ALIAS.equals(alias)) {
+                    throw new AssertionError("Unexpected alias: " + alias);
+                }
+
+                query.add(INNER_ORDER_ALIAS);
+
+                return invocation.getMock();
+            }
             if ("setMaxResults".equals(methodName)) {
                 maxResults = (Integer) arguments[0];
 
@@ -1999,7 +2185,7 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
             List<Entity> selected = new ArrayList<Entity>();
 
             for (Entity row : positionTable) {
-                if (matchesEveryCriterion(row)) {
+                if (matchesEveryCriterion(row) && matchesInnerOrderAlias(row)) {
                     selected.add(row);
                 }
             }
@@ -2027,6 +2213,14 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
             }
 
             return true;
+        }
+
+        /**
+         * Returns whether the row has an order, or {@code true} when the query recorded no inner order alias.
+         */
+        private boolean matchesInnerOrderAlias(final Entity row) {
+            return !query.contains(INNER_ORDER_ALIAS)
+                    || row.getBelongsToField(ProductionLineSchedulePositionFields.ORDER) != null;
         }
 
     }

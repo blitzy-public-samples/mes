@@ -64,9 +64,9 @@ public class ProductionMaintenanceGanttListeners {
      * <ul>
      * <li>no move request on the component (the built-in handler already rejected the move): returns without calling the move
      * service and without accepting or rejecting;</li>
-     * <li>{@code move} returns: calls {@link GanttChartComponentState#acceptMove()}, which renders the refreshed board, or,
-     * when the board cannot be refreshed or rendered, an accepted move result with {@code reloadRequired} and a message asking
-     * to reload the board; the move service is not called again;</li>
+     * <li>{@code move} returns: calls {@link GanttChartComponentState#acceptMove()}, which renders the refreshed board with
+     * the accepted move result; an exception {@code acceptMove} throws because the board cannot be refreshed propagates
+     * unchanged, and the move service is not called again;</li>
      * <li>{@code move} throws {@link ProductionMaintenanceGanttMoveService.MoveRejectedException}: calls
      * {@link GanttChartComponentState#rejectMove(String, String...)} with the exception's message key and arguments;</li>
      * <li>{@code move} throws a runtime exception that

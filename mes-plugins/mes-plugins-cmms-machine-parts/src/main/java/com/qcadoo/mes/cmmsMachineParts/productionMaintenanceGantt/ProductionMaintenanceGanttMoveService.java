@@ -71,12 +71,15 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * <li>loads the one production line whose number equals the target row name; none or several reject;</li>
  * <li>runs {@link ProductionMaintenanceGanttMoveValidator#validate(Entity, Entity, GanttChartMoveRequest)} against the position
  * as stored;</li>
+ * <li>requires a basic parameter to exist, as reported by
+ * {@link ProductionMaintenanceGanttMoveValidator#isBasicParameterPresent()}, which creates none;</li>
  * <li>saves the position with the target production line and the dropped start and end through
  * {@link DataDefinition#save(Entity)}, which runs the model's validators and save hooks;</li>
  * <li>recomputes the positions after the move on the origin and destination rows through
  * {@link ProductionMaintenanceGanttRecomputeService#recompute(Entity, Entity, Entity, Date, Entity, Date)}.</li>
  * </ol>
- * The first three steps reject with {@link #OPTIMISTIC_LOCK_KEY}. An invalid save rejects with the saved entity's first global
+ * The first three steps reject with {@link #OPTIMISTIC_LOCK_KEY}. A missing basic parameter rejects with
+ * {@link #SAVE_FAILED_KEY} before the position is changed or saved. An invalid save rejects with the saved entity's first global
  * error, else its first field error, else {@link #SAVE_FAILED_KEY}. A recompute failure rejects with
  * {@link #RECOMPUTE_FAILED_KEY}, except a concurrency conflict (see {@link #isConcurrencyConflict(Throwable)}), which is
  * rethrown unchanged. Every exception thrown out of {@code move}, a {@link MoveRejectedException} included, rolls the
@@ -192,6 +195,13 @@ public class ProductionMaintenanceGanttMoveService {
 
         if (rejection.isPresent()) {
             throw new MoveRejectedException(rejection.get().getMessageKey(), rejection.get().getArgs());
+        }
+
+        if (!productionMaintenanceGanttMoveValidator.isBasicParameterPresent()) {
+            LOG.debug("Gantt move of production line schedule position {} rejected with {}: no basic parameter exists",
+                    position.getId(), SAVE_FAILED_KEY);
+
+            throw new MoveRejectedException(SAVE_FAILED_KEY);
         }
 
         Entity originLine = position.getBelongsToField(ProductionLineSchedulePositionFields.PRODUCTION_LINE);

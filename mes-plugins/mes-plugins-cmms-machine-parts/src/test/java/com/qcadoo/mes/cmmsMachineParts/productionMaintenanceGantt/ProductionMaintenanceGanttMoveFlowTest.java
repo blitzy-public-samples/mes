@@ -77,6 +77,7 @@ import com.qcadoo.localization.api.TranslationService;
 import com.qcadoo.localization.api.utils.DateUtils;
 import com.qcadoo.mes.basic.ParameterService;
 import com.qcadoo.mes.basic.ShiftsService;
+import com.qcadoo.mes.basic.constants.BasicConstants;
 import com.qcadoo.mes.cmmsMachineParts.constants.CmmsMachinePartsConstants;
 import com.qcadoo.mes.cmmsMachineParts.listeners.ProductionMaintenanceGanttListeners;
 import com.qcadoo.mes.orders.DefaultProductionLineScheduleServicePPSImpl;
@@ -103,6 +104,7 @@ import com.qcadoo.mes.technologies.constants.TechnologyFields;
 import com.qcadoo.model.api.DataDefinition;
 import com.qcadoo.model.api.DataDefinitionService;
 import com.qcadoo.model.api.Entity;
+import com.qcadoo.model.api.search.JoinType;
 import com.qcadoo.model.api.search.SearchCriteriaBuilder;
 import com.qcadoo.model.api.search.SearchCriterion;
 import com.qcadoo.model.api.search.SearchOrder;
@@ -135,16 +137,18 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * into references holding only the entity's id: belongs-to criteria built from distinct entities with one id are equal, and a
  * belongs-to criterion selects the rows whose field holds an entity with that id.
  * <p>
- * Mocked: the data definitions, {@link ShiftsService} (the nearest working date of a start is the start itself),
- * {@link ParameterService}, {@link PluginManager} (every plugin disabled), {@link TranslationService} and the
- * {@link GanttChartComponentState} whose {@code getMoveRequest()} returns the move request. The position data definition
- * answers {@code find()} with a builder that records its criteria, orders and maximum result count, and selects the fixture
- * positions satisfying every recorded criterion in their current state, sorted by the recorded orders. The production line data
- * definition answers the same way. The order and technology data definitions answer the same way over the fixture orders
- * and technologies, accepting only an {@code id in} criterion over the orders of a2 and b2 or over the technologies of those
- * orders. Unknown criteria, unknown orders and unknown builder methods fail the test. The planned event data definition
- * answers {@code find(String)} of {@link ProductionMaintenanceGanttChartItemResolver#SHUTDOWN_EVENTS_QUERY} bound with the
- * move's slot, requires shutdown and the id of the target row with the fixture's planned event rows, and fails on
+ * Mocked: the data definitions (the basic parameter data definition counts one parameter), {@link ShiftsService} (the nearest
+ * working date of a start is the start itself), {@link ParameterService} (a parameter whose
+ * {@code canChangeProdLineForAcceptedOrders} is false), {@link PluginManager} (every plugin disabled),
+ * {@link TranslationService} and the {@link GanttChartComponentState} whose {@code getMoveRequest()} returns the move request.
+ * The position data definition answers {@code find()} with a builder that records its criteria, orders, inner order alias and
+ * maximum result count, and selects the fixture positions satisfying every recorded criterion in their current state, and
+ * having an order when the inner order alias was created, sorted by the recorded orders. The production line data definition
+ * answers the same way. The order and technology data definitions answer the same way over the fixture orders and
+ * technologies, accepting only an {@code id in} criterion over the orders of a2 and b2 or over the technologies of those
+ * orders. Unknown criteria, unknown orders, any other alias and unknown builder methods fail the test. The planned event data
+ * definition answers {@code find(String)} of {@link ProductionMaintenanceGanttChartItemResolver#SHUTDOWN_EVENTS_QUERY} bound
+ * with the move's slot, requires shutdown and the id of the target row with the fixture's planned event rows, and fails on
  * {@code find()}, on any other query and on any other parameter.
  * <p>
  * Fixture, on 2026-10-01: draft schedule 7 starting at 06:00, calculated on the time consuming technology basis, with
@@ -279,6 +283,12 @@ public class ProductionMaintenanceGanttMoveFlowTest {
 
     private static final Long CHANGEOVER_ID = 31L;
 
+    /**
+     * Arguments of {@code createAlias(ORDER, ORDER, JoinType.INNER)}, the only alias the fixture criteria builders accept.
+     */
+    private static final List<Object> INNER_ORDER_ALIAS = Collections.unmodifiableList(Arrays.<Object> asList(
+            ProductionLineSchedulePositionFields.ORDER, ProductionLineSchedulePositionFields.ORDER, JoinType.INNER));
+
     private ProductionMaintenanceGanttListeners listeners;
 
     private ProductionMaintenanceGanttChartItemResolver resolver;
@@ -294,6 +304,9 @@ public class ProductionMaintenanceGanttMoveFlowTest {
 
     @Mock
     private DataDefinition positionDD, productionLineDD, plannedEventDD, orderDD, technologyDD;
+
+    @Mock
+    private DataDefinition parameterDD;
 
     @Mock
     private ShiftsService shiftsService;
@@ -450,6 +463,8 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         given(dataDefinitionService.get(OrdersConstants.PLUGIN_IDENTIFIER, OrdersConstants.MODEL_ORDER)).willReturn(orderDD);
         given(dataDefinitionService.get(TechnologiesConstants.PLUGIN_IDENTIFIER, TechnologiesConstants.MODEL_TECHNOLOGY))
                 .willReturn(technologyDD);
+        given(dataDefinitionService.get(BasicConstants.PLUGIN_IDENTIFIER, BasicConstants.MODEL_PARAMETER))
+                .willReturn(parameterDD);
 
         FixtureFindAnswer positionFindAnswer = new FixtureFindAnswer(positions, positionConditions(), positionOrders());
         FixtureFindAnswer productionLineFindAnswer = new FixtureFindAnswer(productionLines, productionLineConditions(),
@@ -461,6 +476,7 @@ public class ProductionMaintenanceGanttMoveFlowTest {
                 technologyB2), idInConditions(Arrays.asList(technologyA2.getId(), technologyB2.getId())),
                 new LinkedHashMap<SearchOrder, Comparator<Entity>>());
 
+        given(parameterDD.count()).willReturn(1L);
         given(positionDD.get(MOVED_POSITION_ID)).willReturn(movedPosition);
         given(positionDD.save(movedPosition)).willReturn(movedPosition);
         given(positionDD.find()).willAnswer(positionFindAnswer);
@@ -783,6 +799,40 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         verify(pluginManager, never()).isPluginEnabled(ORDERS_FOR_SUBPRODUCTS_GENERATION_PLUGIN);
     }
 
+    @Test
+    public final void shouldRejectWithSaveFailedWhenNoBasicParameterExists() {
+        // given: the basic parameter data definition holds no parameter
+        given(parameterDD.count()).willReturn(0L);
+        usePsImplementations(recordingPsImplementation);
+
+        // when
+        listeners.moveItem(view, gantt, new String[0]);
+
+        // then: the shutdown and working-hours checks ran, the move is rejected with saveFailed, and nothing is saved or
+        // recomputed
+        verify(gantt).rejectMove(eq(ProductionMaintenanceGanttMoveService.SAVE_FAILED_KEY), Matchers.<String> anyVararg());
+        verify(gantt, never()).acceptMove();
+        assertTrue(recordingPsImplementation.getCalls().isEmpty());
+
+        assertOnLine(movedPosition, LINE_A_ID);
+        assertNotRecomputed(movedPosition, MOVED_START, MOVED_END);
+        assertNotRecomputed(positionA1, A1_START, A1_END);
+        assertNotRecomputed(positionA2, A2_START, A2_END);
+        assertNotRecomputed(positionB1, B1_START, B1_END);
+        assertNotRecomputed(positionB2, B2_START, B2_END);
+        assertDownstreamRowsUnchanged();
+
+        verify(plannedEventDD).find(ProductionMaintenanceGanttChartItemResolver.SHUTDOWN_EVENTS_QUERY);
+        verify(shiftsService).getNearestWorkingDate(new DateTime(date(SLOT_FROM)), lineBByNumber);
+        verify(positionDD, never()).save(any(Entity.class));
+        verify(positionDD, never()).fastSave(any(Entity.class));
+        verify(positionDD, never()).find();
+        verify(parameterService, never()).getParameter();
+        verify(parameterDD, times(2)).count();
+        verify(parameterDD, never()).save(any(Entity.class));
+        verify(parameterDD, never()).create();
+    }
+
 
     /**
      * Verifies that the listener rejected the move with {@code RECOMPUTE_FAILED_KEY}, never accepted it, that no position was
@@ -1006,7 +1056,7 @@ public class ProductionMaintenanceGanttMoveFlowTest {
                 ProductionLineFields.NUMBER, LINE_B_NUMBER));
         conditions.put(SearchRestrictions.eq(ProductionLineFields.PRODUCTION, true), new TrueFieldCondition(
                 ProductionLineFields.PRODUCTION));
-        conditions.put(SearchRestrictions.eq(ProductionLineFields.ACTIVE, true), new TrueFieldCondition(ProductionLineFields.ACTIVE));
+        conditions.put(SearchRestrictions.eq(ProductionLineFields.ACTIVE, true), new ActiveCondition());
 
         return conditions;
     }
@@ -1317,10 +1367,12 @@ public class ProductionMaintenanceGanttMoveFlowTest {
     }
 
     /**
-     * Records known criteria of {@code add}, known orders of {@code addOrder} and the limit of {@code setMaxResults}, and
-     * answers them with the builder itself. Answers {@code list()} and {@code uniqueResult()} with the rows that satisfy every
-     * recorded criterion in their current state, sorted by the recorded orders and cut to the limit. Fails on unknown criteria,
-     * unknown orders, a {@code uniqueResult()} matching more than one row and every other builder method.
+     * Records known criteria of {@code add}, known orders of {@code addOrder}, {@code createAlias(ORDER, ORDER,
+     * JoinType.INNER)} and the limit of {@code setMaxResults}, and answers them with the builder itself. Answers
+     * {@code list()} and {@code uniqueResult()} with the rows that satisfy every recorded criterion in their current state and,
+     * when the inner order alias was created, have an order, sorted by the recorded orders and cut to the limit. Fails on
+     * unknown criteria, unknown orders, any other {@code createAlias} call, a {@code uniqueResult()} matching more than one row
+     * and every other builder method.
      */
     private static final class FixtureCriteriaBuilderAnswer implements Answer<Object> {
 
@@ -1333,6 +1385,8 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         private final List<Object> query = new ArrayList<Object>();
 
         private Integer maxResults;
+
+        private boolean innerOrderAlias;
 
         private FixtureCriteriaBuilderAnswer(final List<Entity> rows, final Map<SearchCriterion, EntityCondition> conditions,
                 final Map<SearchOrder, Comparator<Entity>> orders) {
@@ -1368,6 +1422,17 @@ public class ProductionMaintenanceGanttMoveFlowTest {
 
                 return invocation.getMock();
             }
+            if ("createAlias".equals(methodName)) {
+                List<Object> alias = Arrays.asList(arguments);
+
+                if (!INNER_ORDER_ALIAS.equals(alias)) {
+                    throw new AssertionError("Unexpected alias: " + alias);
+                }
+
+                innerOrderAlias = true;
+
+                return invocation.getMock();
+            }
             if ("setMaxResults".equals(methodName)) {
                 maxResults = (Integer) arguments[0];
 
@@ -1399,7 +1464,7 @@ public class ProductionMaintenanceGanttMoveFlowTest {
             List<Entity> selected = new ArrayList<Entity>();
 
             for (Entity row : rows) {
-                if (matchesEveryCriterion(row)) {
+                if (matchesEveryCriterion(row) && matchesInnerOrderAlias(row)) {
                     selected.add(row);
                 }
             }
@@ -1427,6 +1492,13 @@ public class ProductionMaintenanceGanttMoveFlowTest {
             }
 
             return true;
+        }
+
+        /**
+         * Returns whether the row has an order, or {@code true} when no inner order alias was created.
+         */
+        private boolean matchesInnerOrderAlias(final Entity row) {
+            return !innerOrderAlias || row.getBelongsToField(ProductionLineSchedulePositionFields.ORDER) != null;
         }
 
     }
@@ -1702,6 +1774,18 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         @Override
         public boolean matches(final Entity entity) {
             return entity.getBooleanField(fieldName);
+        }
+
+    }
+
+    /**
+     * Satisfied when the entity is active.
+     */
+    private static final class ActiveCondition implements EntityCondition {
+
+        @Override
+        public boolean matches(final Entity entity) {
+            return entity.isActive();
         }
 
     }

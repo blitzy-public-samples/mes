@@ -34,6 +34,36 @@
                    action="#{form}.fireEvent(showProductionMaintenanceGantt);">
             <script>
                 <![CDATA[
+                    var showProductionMaintenanceGanttItem = #{window}.getRibbonItem("productionMaintenanceGantt.showProductionMaintenanceGantt");
+                    var showProductionMaintenanceGanttAnchor = showProductionMaintenanceGanttItem.element.find("a");
+
+                    // Sets aria-disabled and the tab stop of the button's anchor from the item's enabled state:
+                    // enabled - aria-disabled="false" and no tabindex; disabled - aria-disabled="true" and tabindex="-1".
+                    function updateShowProductionMaintenanceGanttAccessibility() {
+                        if (showProductionMaintenanceGanttItem.isEnabled()) {
+                            showProductionMaintenanceGanttAnchor.attr("aria-disabled", "false").removeAttr("tabindex");
+                        } else {
+                            showProductionMaintenanceGanttAnchor.attr("aria-disabled", "true").attr("tabindex", "-1");
+                        }
+                    }
+
+                    updateShowProductionMaintenanceGanttAccessibility();
+
+                    // Re-applies the anchor attributes after every change of the item's class attribute,
+                    // whichever ribbon call enables or disables the item.
+                    new MutationObserver(updateShowProductionMaintenanceGanttAccessibility).observe(showProductionMaintenanceGanttItem.element[0], {
+                        attributes: true,
+                        attributeFilter: ["class"]
+                    });
+
+                    // Cancels the anchor's default navigation for a click on the disabled item, in the capture phase,
+                    // before the ribbon's own click handler runs.
+                    showProductionMaintenanceGanttItem.element[0].addEventListener("click", function(event) {
+                        if (!showProductionMaintenanceGanttItem.isEnabled()) {
+                            event.preventDefault();
+                        }
+                    }, true);
+
                     #{form}.addOnChangeListener({
                         onSetValue: function(value) {
                             var showProductionMaintenanceGantt = #{window}.getRibbonItem("productionMaintenanceGantt.showProductionMaintenanceGantt");

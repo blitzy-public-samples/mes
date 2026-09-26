@@ -1643,8 +1643,7 @@ public class ProductionMaintenanceGanttMoveValidatorTest {
 
         conditions.put(SearchRestrictions.eq(ProductionLineFields.PRODUCTION, true), new TrueFieldCondition(
                 ProductionLineFields.PRODUCTION));
-        conditions.put(SearchRestrictions.eq(ProductionLineFields.ACTIVE, true), new TrueFieldCondition(
-                ProductionLineFields.ACTIVE));
+        conditions.put(SearchRestrictions.eq(ProductionLineFields.ACTIVE, true), new ActiveCondition());
 
         return conditions;
     }
@@ -1687,6 +1686,18 @@ public class ProductionMaintenanceGanttMoveValidatorTest {
         @Override
         public boolean matches(final Entity entity) {
             return entity.getBooleanField(fieldName);
+        }
+
+    }
+
+    /**
+     * Satisfied when the entity is active.
+     */
+    private static final class ActiveCondition implements EntityCondition {
+
+        @Override
+        public boolean matches(final Entity entity) {
+            return entity.isActive();
         }
 
     }

@@ -42,6 +42,7 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.verifyZeroInteractions;
@@ -82,6 +83,7 @@ import org.springframework.transaction.annotation.Transactional;
 import com.qcadoo.localization.api.utils.DateUtils;
 import com.qcadoo.mes.basic.ParameterService;
 import com.qcadoo.mes.basic.ShiftsService;
+import com.qcadoo.mes.basic.constants.BasicConstants;
 import com.qcadoo.mes.cmmsMachineParts.constants.CmmsMachinePartsConstants;
 import com.qcadoo.mes.cmmsMachineParts.constants.PlannedEventFields;
 import com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt.ProductionMaintenanceGanttMoveService.MoveRejectedException;
@@ -115,19 +117,22 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * The service runs against a spy of a real {@link ProductionMaintenanceGanttMoveValidator} whose collaborators are
  * mocks stubbed so that every check passes: the order's technology allows both production lines, no planned event
  * requires a shutdown, the nearest working date of the target line is the slot start itself, and the stored position
- * equals the item as rendered. The production line data definition answers {@code find()} with a builder that records
- * its criteria, orders and maximum result count, and selects the fixture entities satisfying every recorded criterion.
- * Unknown criteria, unknown orders and unknown builder methods fail the test. The planned event data definition answers
- * {@code find(String)} of {@link ProductionMaintenanceGanttChartItemResolver#SHUTDOWN_EVENTS_QUERY} with projection
- * rows of the fixture planned events the query selects, and fails on {@code find()}, on any other query and on a
- * missing or unexpected parameter.
+ * equals the item as rendered. The basic parameter data definition counts one parameter, and {@link ParameterService}
+ * returns a parameter whose {@code canChangeProdLineForAcceptedOrders} is false. The production line data definition
+ * answers {@code find()} with a builder that records its criteria, orders and maximum result count, and selects the fixture
+ * entities satisfying every recorded criterion. Unknown criteria, unknown orders and unknown builder methods fail the test.
+ * The planned event data definition answers {@code find(String)} of
+ * {@link ProductionMaintenanceGanttChartItemResolver#SHUTDOWN_EVENTS_QUERY} with projection rows of the fixture planned
+ * events the query selects, and fails on {@code find()}, on any other query and on a missing or unexpected parameter.
  * <p>
- * Tests that depart from this passing setup change it in three ways:
+ * Tests that depart from this passing setup change it in four ways:
  * <ul>
  * <li>routing, shutdown-window and working-hours tests change the answer of the collaborator of their own check: the
  * candidate production lines of the order's technology, the planned events, or the nearest working date;</li>
  * <li>stale-position, schedule-state, schedule-membership, context, unknown-position, target-row and item-id tests change a
  * field of the stored position or schedule, the position returned for the item's id, or an input of the move request;</li>
+ * <li>basic parameter tests make the basic parameter data definition count no parameter, or return no basic parameter data
+ * definition;</li>
  * <li>invalid-save tests make the save of the position return null or an invalid entity, and recompute tests make the
  * recompute service throw.</li>
  * </ul>
@@ -192,6 +197,9 @@ public class ProductionMaintenanceGanttMoveServiceTest {
     private DataDefinition positionDD, productionLineDD, plannedEventDD;
 
     @Mock
+    private DataDefinition parameterDD;
+
+    @Mock
     private GanttChartItem item;
 
     private Entity schedule, parameter, order, position, savedPosition;
@@ -223,6 +231,8 @@ public class ProductionMaintenanceGanttMoveServiceTest {
                 ProductionLinesConstants.MODEL_PRODUCTION_LINE)).willReturn(productionLineDD);
         given(dataDefinitionService.get(CmmsMachinePartsConstants.PLUGIN_IDENTIFIER,
                 CmmsMachinePartsConstants.MODEL_PLANNED_EVENT)).willReturn(plannedEventDD);
+        given(dataDefinitionService.get(BasicConstants.PLUGIN_IDENTIFIER, BasicConstants.MODEL_PARAMETER)).willReturn(
+                parameterDD);
 
         given(productionLineDD.find()).willAnswer(
                 new FixtureFindAnswer(productionLines, productionLineConditions(), Collections
@@ -242,6 +252,7 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         parameter = mockEntity(1L);
         stubBooleanField(parameter, ParameterFieldsO.CAN_CHANGE_PROD_LINE_FOR_ACCEPTED_ORDERS, false);
 
+        given(parameterDD.count()).willReturn(1L);
         given(parameterService.getParameter()).willReturn(parameter);
 
         order = order(ORDER_NUMBER);
@@ -857,6 +868,87 @@ public class ProductionMaintenanceGanttMoveServiceTest {
     }
 
     @Test
+    public final void shouldRejectWithSaveFailedAfterEveryCheckWhenNoBasicParameterExists() {
+        // given
+        given(parameterDD.count()).willReturn(0L);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.SAVE_FAILED_KEY);
+        assertEveryCheckRanBeforeBasicParameterCheck(request);
+        assertNothingPersisted();
+        verify(parameterService, never()).getParameter();
+        verify(parameterDD, times(2)).count();
+        verifyNoMoreInteractions(parameterDD);
+    }
+
+    @Test
+    public final void shouldRejectWithSaveFailedAfterEveryCheckWhenBasicParameterModelIsMissing() {
+        // given
+        given(dataDefinitionService.get(BasicConstants.PLUGIN_IDENTIFIER, BasicConstants.MODEL_PARAMETER)).willReturn(null);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.SAVE_FAILED_KEY);
+        assertEveryCheckRanBeforeBasicParameterCheck(request);
+        assertNothingPersisted();
+        verify(parameterService, never()).getParameter();
+        verifyZeroInteractions(parameterDD);
+    }
+
+    @Test
+    public final void shouldRejectRoutingMismatchBeforeMissingBasicParameter() {
+        // given
+        givenCandidateLines(lineL1);
+        given(parameterDD.count()).willReturn(0L);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveValidator.ROUTING_MISMATCH_KEY);
+        verify(validatorSpy).checkRouting(position, lineL2);
+        verify(productionLineSchedulePositionValidators).getProductionLinesFromTechnology(position,
+                Collections.singletonList(lineL2), true, false);
+        verify(validatorSpy, never()).checkShutdownWindow(Matchers.any(Entity.class), Matchers.any(Date.class),
+                Matchers.any(Date.class));
+        verify(validatorSpy, times(1)).isBasicParameterPresent();
+        verify(parameterService, never()).getParameter();
+        assertNothingPersisted();
+    }
+
+    @Test
+    public final void shouldCountBasicParameterWithoutCreatingItBeforeSaveOfAcceptedMove() {
+        // given
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        moveService.move(request);
+
+        // then
+        InOrder inOrder = inOrder(validatorSpy, positionDD, recomputeService);
+
+        inOrder.verify(validatorSpy).checkConcurrentEdit(position, request);
+        inOrder.verify(validatorSpy).isBasicParameterPresent();
+        inOrder.verify(positionDD).save(position);
+        inOrder.verify(recomputeService).recompute(schedule, savedPosition, lineL1, positionStart, lineL2, slotFrom);
+
+        verify(parameterDD, times(2)).count();
+        verifyNoMoreInteractions(parameterDD);
+        verify(parameterService, times(1)).getParameter();
+    }
+
+    @Test
     public final void shouldWrapRecomputeExceptionAsRecomputeFailed() {
         // given
         IllegalStateException failure = new IllegalStateException("no finish date");
@@ -1189,6 +1281,23 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         assertEquals("fixture SearchCriteriaBuilder", builder.toString());
     }
 
+    @Test
+    public final void shouldSelectProductionLinesByEntityActivityForActiveCriterionInFixtureBuilder() {
+        // given
+        Entity inactiveLine = productionLine(4L, UNKNOWN_LINE_NUMBER);
+
+        given(inactiveLine.isActive()).willReturn(false);
+        productionLines.add(inactiveLine);
+
+        // when
+        List<Entity> activeLines = productionLineDD.find().add(SearchRestrictions.eq(ProductionLineFields.ACTIVE, true))
+                .list().getEntities();
+
+        // then
+        assertEquals(Arrays.asList(lineL1, lineL2, lineL3), activeLines);
+        assertFalse(lineL1.getBooleanField(ProductionLineFields.ACTIVE));
+    }
+
     private MoveRejectedException rejectionOf(final GanttChartMoveRequest request) {
         MoveRejectedException rejection = null;
 
@@ -1223,6 +1332,20 @@ public class ProductionMaintenanceGanttMoveServiceTest {
     private void assertValidatorNeverCalled() {
         verify(validatorSpy, never()).validate(Matchers.any(Entity.class), Matchers.any(Entity.class),
                 Matchers.any(GanttChartMoveRequest.class));
+    }
+
+    /**
+     * Asserts that the routing, shutdown window, working hours and concurrent edit checks ran in this order on the stored
+     * position and the target line L2, and that the move service then checked the basic parameter once.
+     */
+    private void assertEveryCheckRanBeforeBasicParameterCheck(final GanttChartMoveRequest request) {
+        InOrder inOrder = inOrder(validatorSpy);
+
+        inOrder.verify(validatorSpy).checkRouting(position, lineL2);
+        inOrder.verify(validatorSpy).checkShutdownWindow(lineL2, slotFrom, slotTo);
+        inOrder.verify(validatorSpy).checkWorkingHours(lineL2, slotFrom);
+        inOrder.verify(validatorSpy).checkConcurrentEdit(position, request);
+        inOrder.verify(validatorSpy).isBasicParameterPresent();
     }
 
     private void givenCandidateLines(final Entity... candidateLines) {
@@ -1332,8 +1455,7 @@ public class ProductionMaintenanceGanttMoveServiceTest {
 
         conditions.put(SearchRestrictions.eq(ProductionLineFields.PRODUCTION, true), new TrueFieldCondition(
                 ProductionLineFields.PRODUCTION));
-        conditions.put(SearchRestrictions.eq(ProductionLineFields.ACTIVE, true), new TrueFieldCondition(
-                ProductionLineFields.ACTIVE));
+        conditions.put(SearchRestrictions.eq(ProductionLineFields.ACTIVE, true), new ActiveCondition());
 
         for (String number : Arrays.asList(ORIGIN_LINE_NUMBER, TARGET_LINE_NUMBER, OTHER_LINE_NUMBER, UNKNOWN_LINE_NUMBER)) {
             conditions.put(SearchRestrictions.eq(ProductionLineFields.NUMBER, number), new StringFieldCondition(
@@ -1382,6 +1504,18 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         @Override
         public boolean matches(final Entity entity) {
             return entity.getBooleanField(fieldName);
+        }
+
+    }
+
+    /**
+     * Satisfied when the entity is active.
+     */
+    private static final class ActiveCondition implements EntityCondition {
+
+        @Override
+        public boolean matches(final Entity entity) {
+            return entity.isActive();
         }
 
     }

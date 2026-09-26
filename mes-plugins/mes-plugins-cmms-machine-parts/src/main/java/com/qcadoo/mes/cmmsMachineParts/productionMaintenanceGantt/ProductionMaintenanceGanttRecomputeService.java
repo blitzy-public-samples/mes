@@ -51,6 +51,7 @@ import com.qcadoo.mes.technologies.constants.TechnologiesConstants;
 import com.qcadoo.model.api.DataDefinition;
 import com.qcadoo.model.api.DataDefinitionService;
 import com.qcadoo.model.api.Entity;
+import com.qcadoo.model.api.search.JoinType;
 import com.qcadoo.model.api.search.SearchOrders;
 import com.qcadoo.model.api.search.SearchRestrictions;
 
@@ -71,9 +72,9 @@ import com.qcadoo.model.api.search.SearchRestrictions;
  * <li>Only positions of the schedule on that row, other than the moved position (compared by id), whose start time is strictly
  * after the affected start are recomputed, in (start time, id) order. Positions starting at or before the affected start are
  * neither read into a chain nor written.</li>
- * <li>On a cross-row move the origin chain runs first and is seeded from the row predecessor (the latest other position starting
- * at or before the vacated start); the destination chain follows and is seeded from the moved position. A {@code null} origin
- * line runs the destination chain only.</li>
+ * <li>On a cross-row move the origin chain runs first and is seeded from the row predecessor (the latest other position with an
+ * order starting at or before the vacated start; positions without an order are never a predecessor); the destination chain
+ * follows and is seeded from the moved position. A {@code null} origin line runs the destination chain only.</li>
  * <li>On a same-row move one chain runs: the positions starting at or before the drop start are recomputed after the row
  * predecessor, then the caches are seeded from the moved position and the remaining positions are recomputed.</li>
  * <li>With no predecessor the caches start empty and the scheduling services use their own database lookups.</li>
@@ -90,6 +91,8 @@ import com.qcadoo.model.api.search.SearchRestrictions;
  * <ul>
  * <li>before any executor call, when a candidate has no order, an order has no technology, or the load does not return a
  * candidate's order or its technology;</li>
+ * <li>before any scheduling service or executor call, when the call has candidates and the schedule has no
+ * {@link ProductionLineScheduleFields#START_TIME}; a call without candidates does not read it;</li>
  * <li>when the executor produces no data for the chain's production line, including when the schedule names no known
  * calculation basis.</li>
  * </ul>
@@ -136,7 +139,8 @@ public class ProductionMaintenanceGanttRecomputeService {
      * @param slotStart
      *            start time of the dropped slot
      * @throws ProductionMaintenanceGanttMoveService.MoveRejectedException
-     *             with {@link ProductionMaintenanceGanttMoveService#RECOMPUTE_FAILED_KEY} when a candidate cannot be recomputed
+     *             with {@link ProductionMaintenanceGanttMoveService#RECOMPUTE_FAILED_KEY} when a candidate cannot be recomputed,
+     *             including when the schedule has no start time
      * @throws IllegalArgumentException
      *             when a required argument is missing
      */
@@ -175,18 +179,20 @@ public class ProductionMaintenanceGanttRecomputeService {
         List<Entity> chainCandidates = new ArrayList<Entity>(originCandidates);
         chainCandidates.addAll(destinationCandidates);
         CandidateReferences references = loadCandidateReferences(chainCandidates);
+        Date scheduleStartTime = requireScheduleStartTime(schedule, chainCandidates);
 
         if (originLine != null) {
             Map<Long, Date> originFinishCache = new HashMap<Long, Date>();
             Map<Long, Entity> originOrderCache = new HashMap<Long, Entity>();
             seedCaches(originPredecessor, originLine, originFinishCache, originOrderCache);
-            processChain(schedule, basis, originLine, originCandidates, references, originFinishCache, originOrderCache);
+            processChain(scheduleStartTime, basis, originLine, originCandidates, references, originFinishCache,
+                    originOrderCache);
         }
 
         Map<Long, Date> destinationFinishCache = new HashMap<Long, Date>();
         Map<Long, Entity> destinationOrderCache = new HashMap<Long, Entity>();
         seedCaches(movedPosition, destinationLine, destinationFinishCache, destinationOrderCache);
-        processChain(schedule, basis, destinationLine, destinationCandidates, references, destinationFinishCache,
+        processChain(scheduleStartTime, basis, destinationLine, destinationCandidates, references, destinationFinishCache,
                 destinationOrderCache);
     }
 
@@ -199,6 +205,7 @@ public class ProductionMaintenanceGanttRecomputeService {
         List<Entity> candidates = findCandidates(positionDD, schedule, line, movedPositionId, affectedStart);
         Entity predecessor = findPredecessor(positionDD, schedule, line, movedPositionId, affectedStart);
         CandidateReferences references = loadCandidateReferences(candidates);
+        Date scheduleStartTime = requireScheduleStartTime(schedule, candidates);
 
         List<Entity> beforeAnchor = new ArrayList<Entity>();
         List<Entity> afterAnchor = new ArrayList<Entity>();
@@ -214,9 +221,9 @@ public class ProductionMaintenanceGanttRecomputeService {
         Map<Long, Date> finishCache = new HashMap<Long, Date>();
         Map<Long, Entity> orderCache = new HashMap<Long, Entity>();
         seedCaches(predecessor, line, finishCache, orderCache);
-        processChain(schedule, basis, line, beforeAnchor, references, finishCache, orderCache);
+        processChain(scheduleStartTime, basis, line, beforeAnchor, references, finishCache, orderCache);
         seedCaches(movedPosition, line, finishCache, orderCache);
-        processChain(schedule, basis, line, afterAnchor, references, finishCache, orderCache);
+        processChain(scheduleStartTime, basis, line, afterAnchor, references, finishCache, orderCache);
     }
 
     /**
@@ -235,14 +242,17 @@ public class ProductionMaintenanceGanttRecomputeService {
     }
 
     /**
-     * Returns the schedule's latest position on the given production line, other than the moved position, starting at or before
-     * the affected start, or {@code null} when there is none.
+     * Returns the schedule's latest position with an order on the given production line, other than the moved position,
+     * starting at or before the affected start, or {@code null} when there is none. Positions without an order are excluded
+     * by an inner join on the position's order.
      */
     private Entity findPredecessor(final DataDefinition positionDD, final Entity schedule, final Entity line,
             final Long movedPositionId, final Date affectedStart) {
         return positionDD.find()
                 .add(SearchRestrictions.belongsTo(ProductionLineSchedulePositionFields.PRODUCTION_LINE_SCHEDULE, schedule))
                 .add(SearchRestrictions.belongsTo(ProductionLineSchedulePositionFields.PRODUCTION_LINE, line))
+                .createAlias(ProductionLineSchedulePositionFields.ORDER, ProductionLineSchedulePositionFields.ORDER,
+                        JoinType.INNER)
                 .add(SearchRestrictions.idNe(movedPositionId))
                 .add(SearchRestrictions.le(ProductionLineSchedulePositionFields.START_TIME, affectedStart))
                 .addOrder(SearchOrders.desc(ProductionLineSchedulePositionFields.START_TIME)).setMaxResults(1).uniqueResult();
@@ -318,13 +328,33 @@ public class ProductionMaintenanceGanttRecomputeService {
     }
 
     /**
-     * Recomputes the given positions one after another on one production line, sharing the chain caches.
+     * Returns the schedule's {@link ProductionLineScheduleFields#START_TIME} when the given candidates are not empty, and
+     * {@code null} without reading it when they are.
+     *
+     * @throws ProductionMaintenanceGanttMoveService.MoveRejectedException
+     *             with {@link ProductionMaintenanceGanttMoveService#RECOMPUTE_FAILED_KEY} when there are candidates and the
+     *             schedule has no start time
      */
-    private void processChain(final Entity schedule, final DurationOfOrderCalculatedOnBasis basis, final Entity line,
+    private Date requireScheduleStartTime(final Entity schedule, final List<Entity> candidates) {
+        if (candidates.isEmpty()) {
+            return null;
+        }
+        Date scheduleStartTime = schedule.getDateField(ProductionLineScheduleFields.START_TIME);
+        if (scheduleStartTime == null) {
+            LOG.warn("Production line schedule {} has no start time; {} production line schedule positions cannot be recomputed",
+                    schedule.getId(), candidates.size());
+        }
+        return requirePresent(scheduleStartTime);
+    }
+
+    /**
+     * Recomputes the given positions one after another on one production line from the given schedule start time, sharing the
+     * chain caches.
+     */
+    private void processChain(final Date scheduleStartTime, final DurationOfOrderCalculatedOnBasis basis, final Entity line,
             final List<Entity> candidates, final CandidateReferences references, final Map<Long, Date> finishCache,
             final Map<Long, Entity> orderCache) {
         LOG.debug("Recomputing {} production line schedule positions on production line {}", candidates.size(), line.getId());
-        Date scheduleStartTime = schedule.getDateField(ProductionLineScheduleFields.START_TIME);
         for (Entity candidate : candidates) {
             recomputePosition(basis, line, scheduleStartTime, candidate, references, finishCache, orderCache);
         }

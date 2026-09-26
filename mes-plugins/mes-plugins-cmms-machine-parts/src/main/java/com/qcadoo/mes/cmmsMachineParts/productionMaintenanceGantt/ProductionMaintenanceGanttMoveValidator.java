@@ -320,17 +320,30 @@ public class ProductionMaintenanceGanttMoveValidator {
 
     /**
      * Returns the {@code canChangeProdLineForAcceptedOrders} flag of the basic parameter. Returns false, without calling
-     * {@link ParameterService#getParameter()}, when the basic parameter data definition is missing or holds no parameter; no
-     * basic parameter is created.
+     * {@link ParameterService#getParameter()}, when {@link #isBasicParameterPresent()} is false, that is when the basic
+     * parameter data definition is missing or holds no parameter; no basic parameter is created.
      */
     private boolean canChangeProdLineForAcceptedOrders() {
-        DataDefinition parameterDD = dataDefinitionService.get(BasicConstants.PLUGIN_IDENTIFIER, BasicConstants.MODEL_PARAMETER);
-
-        if (parameterDD == null || parameterDD.count() == 0L) {
+        if (!isBasicParameterPresent()) {
             return false;
         }
 
         return parameterService.getParameter().getBooleanField(ParameterFieldsO.CAN_CHANGE_PROD_LINE_FOR_ACCEPTED_ORDERS);
+    }
+
+    /**
+     * Returns true when the basic parameter data definition exists and holds at least one parameter.
+     * <p>
+     * The parameters are counted with {@link DataDefinition#count()}. {@link ParameterService#getParameter()} is not called,
+     * and no basic parameter is created or saved.
+     *
+     * @return true when a basic parameter exists, false when the basic parameter data definition is missing or holds no
+     *         parameter
+     */
+    public boolean isBasicParameterPresent() {
+        DataDefinition parameterDD = dataDefinitionService.get(BasicConstants.PLUGIN_IDENTIFIER, BasicConstants.MODEL_PARAMETER);
+
+        return parameterDD != null && parameterDD.count() > 0L;
     }
 
     /**

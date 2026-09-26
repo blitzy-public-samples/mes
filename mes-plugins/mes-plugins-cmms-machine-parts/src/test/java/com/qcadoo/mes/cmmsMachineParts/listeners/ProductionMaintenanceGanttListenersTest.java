@@ -24,7 +24,6 @@
 package com.qcadoo.mes.cmmsMachineParts.listeners;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
@@ -45,7 +44,6 @@ import static org.springframework.test.util.ReflectionTestUtils.setField;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -96,8 +94,8 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * <p>
  * Two tests run the listener against a real, move-enabled {@link GanttChartComponentState} whose moveItem event dropped
  * ORD-1 onto LINE-2, with the move service mocked: one renders the refreshed board with the accepted move result, and one
- * renders an accepted move result with {@code reloadRequired} and the reload-required message when the refresh after the
- * move fails.
+ * propagates the resolver exception of the refresh after the move without calling the move service again, after which the
+ * component fails to render.
  * <p>
  * Two tests cover {@link ProductionMaintenanceGanttListeners#fillTitle(ViewDefinitionState)} with a mocked
  * {@link TranslationService}: on an initialized view and on a view after reload.
@@ -124,13 +122,7 @@ public class ProductionMaintenanceGanttListenersTest {
 
     private static final String L_ACCEPTED = "accepted";
 
-    private static final String L_RELOAD_REQUIRED = "reloadRequired";
-
     private static final String L_TRANSLATED_PREFIX = "translated:";
-
-    private static final String L_MESSAGE = "message";
-
-    private static final String L_RELOAD_REQUIRED_MESSAGE = "qcadooView.gantt.move.reloadRequired";
 
     private ProductionMaintenanceGanttListeners productionMaintenanceGanttListeners;
 
@@ -190,39 +182,43 @@ public class ProductionMaintenanceGanttListenersTest {
 
     /**
      * Runs against a real {@link GanttChartComponentState} whose resolver fails on the refresh after the move service
-     * returned: the listener throws nothing, calls the move service exactly once and resolves exactly twice (the built-in
-     * handler and one refresh); the content is only an accepted move result for position 11 with {@code reloadRequired} set
-     * to true and the reload-required message, the component carries no message, and the view receives none.
+     * returned: the listener throws the resolver's {@link IllegalStateException} unchanged, calls the move service exactly
+     * once with no further interaction and resolves exactly twice (the built-in handler and one refresh); rendering the
+     * component then throws an {@link IllegalStateException} naming position 11, and the view receives no message.
      */
     @Test
-    public final void shouldAnswerAcceptedMoveRequiringReloadWithoutRetryWhenRefreshFailsAfterMove() throws Exception {
+    public final void shouldPropagateRefreshFailureAfterMoveWithoutRetry() throws Exception {
         // given
         GanttChartItemResolver resolver = mock(GanttChartItemResolver.class);
         GanttChartComponentState realGantt = createMovedRealGantt(resolver);
         GanttChartMoveRequest realMoveRequest = realGantt.getMoveRequest();
         assertNotNull(realMoveRequest);
-        doThrow(new IllegalStateException("resolver failed after commit")).when(resolver).resolve(any(GanttChartScale.class),
-                any(JSONObject.class), any(Locale.class));
+        IllegalStateException refreshFailure = new IllegalStateException("resolver failed after commit");
+        doThrow(refreshFailure).when(resolver).resolve(any(GanttChartScale.class), any(JSONObject.class), any(Locale.class));
 
         // when
-        productionMaintenanceGanttListeners.moveItem(view, realGantt, new String[0]);
+        try {
+            productionMaintenanceGanttListeners.moveItem(view, realGantt, new String[0]);
 
-        // then
+            fail("IllegalStateException expected");
+        } catch (IllegalStateException e) {
+            // then
+            assertSame(refreshFailure, e);
+        }
+
         verify(productionMaintenanceGanttMoveService, times(1)).move(realMoveRequest);
         verifyNoMoreInteractions(productionMaintenanceGanttMoveService);
         verify(resolver, times(2)).resolve(any(GanttChartScale.class), any(JSONObject.class), any(Locale.class));
 
-        JSONObject rendered = realGantt.render();
-        JSONObject content = rendered.getJSONObject(L_CONTENT);
-        assertEquals(Collections.singleton(L_MOVE_RESULT), keySet(content));
-        JSONObject result = content.getJSONObject(L_MOVE_RESULT);
-        assertEquals(new HashSet<String>(Arrays.asList(L_ITEM_ID, L_ACCEPTED, L_RELOAD_REQUIRED, L_MESSAGE)), keySet(result));
-        assertTrue(result.getBoolean(L_ACCEPTED));
-        assertTrue(result.getBoolean(L_RELOAD_REQUIRED));
-        assertEquals(L_RELOAD_REQUIRED_MESSAGE, result.getString(L_MESSAGE));
-        assertEquals(L_POSITION_ID.longValue(), result.getLong(L_ITEM_ID));
+        IllegalStateException renderFailure = null;
+        try {
+            realGantt.render();
+        } catch (IllegalStateException e) {
+            renderFailure = e;
+        }
+        assertNotNull(renderFailure);
+        assertTrue(renderFailure.getMessage(), renderFailure.getMessage().contains("item " + L_POSITION_ID + " "));
 
-        assertEquals(0, rendered.getJSONArray("messages").length());
         verify(view, never()).addMessage(anyString(), any(MessageType.class), Matchers.<String> anyVararg());
     }
 
@@ -254,7 +250,6 @@ public class ProductionMaintenanceGanttListenersTest {
         assertEquals(new HashSet<String>(Arrays.asList(L_ITEM_ID, L_ACCEPTED)), keySet(result));
         assertTrue(result.getBoolean(L_ACCEPTED));
         assertEquals(L_POSITION_ID.longValue(), result.getLong(L_ITEM_ID));
-        assertFalse(result.has(L_RELOAD_REQUIRED));
         assertEquals(0, rendered.getJSONArray("messages").length());
     }
 

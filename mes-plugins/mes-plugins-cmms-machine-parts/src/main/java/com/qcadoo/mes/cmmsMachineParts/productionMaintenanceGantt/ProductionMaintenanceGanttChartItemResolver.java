@@ -49,6 +49,7 @@ import com.qcadoo.mes.basic.constants.BasicConstants;
 import com.qcadoo.mes.basic.constants.ProductFields;
 import com.qcadoo.mes.cmmsMachineParts.constants.CmmsMachinePartsConstants;
 import com.qcadoo.mes.cmmsMachineParts.constants.PlannedEventFields;
+import com.qcadoo.mes.cmmsMachineParts.states.constants.PlannedEventState;
 import com.qcadoo.mes.orders.constants.OrderFields;
 import com.qcadoo.mes.orders.constants.OrdersConstants;
 import com.qcadoo.mes.orders.constants.ProductionLineScheduleFields;
@@ -82,16 +83,18 @@ import com.qcadoo.view.api.components.ganttChart.GanttChartScale;
  * User-entered display strings are HTML-escaped before they become item labels or tooltip lines. Overlapping items are left
  * to the Gantt component's collision detection.
  * <p>
- * Every read is one HQL query that selects only the columns the board shows, through
- * {@link DataDefinition#find(String)}, without a row count and without loading whole entities:
+ * Every read is one HQL query through {@link DataDefinition#find(String)}, without a row count and without loading whole
+ * entities. Besides the columns the board shows, the queries select ids: the schedule id with its state, the production
+ * line id with each seeded line number, the position id that becomes a draft position's entity id, and the production line
+ * and division ids that associate planned events with rows and resolve their production lines:
  * <ol>
- * <li>the state of the schedule;</li>
- * <li>the numbers of the production lines seeding the rows;</li>
+ * <li>the id and state of the schedule;</li>
+ * <li>the ids and numbers of the production lines seeding the rows;</li>
  * <li>the positions of the schedule overlapping the scale, joined with their production line, order and product;</li>
  * <li>the planned events overlapping the scale that are placed on at least one production line, each with the ids and
  * numbers of its own production line and of its workstation's production line, and its division id;</li>
- * <li>only when some of those events have neither production line, the production lines of their divisions, in one
- * query for all of them.</li>
+ * <li>only when some of those events have neither production line, the ids and numbers of the production lines of their
+ * divisions, with the division ids, in one query for all of them.</li>
  * </ol>
  * {@link #findShutdownEventNumbers(Entity, Date, Date)} reads planned events the same way, restricted to events that
  * require a shutdown and can be placed on one given production line.
@@ -132,6 +135,16 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
      * Second tooltip line of a planned event: {0} yes/no label of the requires-shutdown flag.
      */
     public static final String ITEM_REQUIRES_SHUTDOWN_KEY = "cmmsMachineParts.productionMaintenanceGantt.item.requiresShutdown";
+
+    /**
+     * State label of a planned event without a state.
+     */
+    public static final String ITEM_STATE_UNSPECIFIED_KEY = "cmmsMachineParts.productionMaintenanceGantt.item.stateUnspecified";
+
+    /**
+     * State label of a planned event whose state is none of the declared states.
+     */
+    public static final String ITEM_STATE_UNKNOWN_KEY = "cmmsMachineParts.productionMaintenanceGantt.item.stateUnknown";
 
     private static final String PLANNED_EVENT_TYPE_VALUE_PREFIX = "cmmsMachineParts.plannedEvent.type.value.";
 
@@ -684,12 +697,45 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
     private GanttChartItemTooltipBuilder getPlannedEventTooltip(final Entity event, final String label,
             final boolean requiresShutdown, final Locale locale) {
         String typeLabel = escape(translate(PLANNED_EVENT_TYPE_VALUE_PREFIX + event.getStringField(L_EVENT_TYPE), locale));
-        String stateLabel = translate(PLANNED_EVENT_STATE_VALUE_PREFIX + event.getStringField(L_EVENT_STATE), locale);
+        String stateLabel = stateLabel(event.getStringField(L_EVENT_STATE), locale);
         String requiresShutdownLabel = translate(requiresShutdown ? TRUE_KEY : FALSE_KEY, locale);
 
         return new GanttChartItemTooltipBuilder().withHeader(label)
                 .addLineToContent(translate(ITEM_PLANNED_EVENT_KEY, locale, typeLabel, stateLabel))
                 .addLineToContent(translate(ITEM_REQUIRES_SHUTDOWN_KEY, locale, requiresShutdownLabel));
+    }
+
+    /**
+     * Returns the HTML-escaped state label of a planned event: the translation of {@link #ITEM_STATE_UNSPECIFIED_KEY} when
+     * the state is null or blank; the translation of the state's value key when the state is the string value of one of the
+     * {@link PlannedEventState} constants; otherwise the translation of {@link #ITEM_STATE_UNKNOWN_KEY}. A message code is
+     * built only from the string value of a declared state, never from the given state.
+     * <p>
+     * For example {@code 03planned} gives the translation of {@code cmmsMachineParts.plannedEvent.state.value.03planned},
+     * and {@code 09archived} gives the translation of {@link #ITEM_STATE_UNKNOWN_KEY}.
+     *
+     * @param state
+     *            the persisted state of the planned event, may be null
+     * @param locale
+     *            the locale of the translation
+     * @return the escaped state label
+     */
+    private String stateLabel(final String state, final Locale locale) {
+        String messageCode = ITEM_STATE_UNKNOWN_KEY;
+
+        if (StringUtils.isBlank(state)) {
+            messageCode = ITEM_STATE_UNSPECIFIED_KEY;
+        } else {
+            for (PlannedEventState declaredState : PlannedEventState.values()) {
+                if (declaredState.getStringValue().equals(state)) {
+                    messageCode = PLANNED_EVENT_STATE_VALUE_PREFIX + declaredState.getStringValue();
+
+                    break;
+                }
+            }
+        }
+
+        return escape(translate(messageCode, locale));
     }
 
     /**

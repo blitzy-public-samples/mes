@@ -39,6 +39,18 @@
 				<component type="input" name="title" reference="title"
 					hasLabel="false" defaultEnabled="false" >
 					<option type="textRepresentationOnDisabled" value="true" />
+					<script>
+						<![CDATA[
+							var boardTitleText = $("#" + this.elementSearchName + "_text");
+
+							// Marks the title's text representation as the level-one heading of the board.
+							boardTitleText.attr("role", "heading").attr("aria-level", "1");
+
+							// Marks the window content body, which holds the title and the gantt but not the ribbon,
+							// as the main landmark named by the heading.
+							boardTitleText.closest(".windowContainerContentBody").attr("role", "main").attr("aria-labelledby", boardTitleText.attr("id"));
+						]]>
+					</script>
 				</component>
 			</layoutElement>
 			<layoutElement column="1" row="2" height="7">
