@@ -32,7 +32,7 @@
 		<ribbon>
 			<template name="standardFormTemplate" includeItems="navigation.back" />
 		</ribbon>
-		<!-- main tab: title and gantt, translated as cmmsMachineParts.productionMaintenanceGantt.window.mainTab.<name> -->
+		<!-- main tab: title and gantt; translation key prefix cmmsMachineParts.productionMaintenanceGantt.window.mainTab., key suffixes title.label and gantt.header.label -->
 		<component type="gridLayout" name="gridLayout" columns="1"
 			rows="8" hasBorders="true">
 			<layoutElement column="1" row="1">
@@ -43,7 +43,6 @@
 						<![CDATA[
 							var boardTitleText = $("#" + this.elementSearchName + "_text");
 
-							// Marks the title's text representation as the level-one heading of the board.
 							boardTitleText.attr("role", "heading").attr("aria-level", "1");
 
 							// Marks the window content body, which holds the title and the gantt but not the ribbon,

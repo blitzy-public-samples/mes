@@ -130,8 +130,10 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * Real instances: the listener, the move service, the validator, {@link ProductionMaintenanceGanttChartItemResolver}, the
  * recompute service, {@link ProductionLineScheduleService}, {@link ProductionLineSchedulePositionValidators},
  * {@link ProductionLineScheduleServicePSExecutorService} and {@link ProductionLineScheduleServicePPSExecutorService}. The
- * executor services hold the implementation lists each test sets: {@link RecordingPsImplementation},
- * {@link DisabledSchedulingPsImplementation}, or a Mockito spy of {@link DefaultProductionLineScheduleServicePSImpl} or
+ * executor services start with {@link RecordingPsImplementation} as the only PS implementation and a plain instance of
+ * {@link DefaultProductionLineScheduleServicePPSImpl} as the only PPS implementation. Each test then replaces one list with a
+ * list of one implementation: the PS list with {@link RecordingPsImplementation}, {@link DisabledSchedulingPsImplementation}
+ * or a Mockito spy of {@link DefaultProductionLineScheduleServicePSImpl}, or the PPS list with a Mockito spy of
  * {@link DefaultProductionLineScheduleServicePPSImpl}. {@link PluginUtilsService} is initialised with a mocked
  * {@link PluginStateResolver}, and {@link SearchRestrictions} converts entities through a mocked {@link DataAccessService}
  * into references holding only the entity's id: belongs-to criteria built from distinct entities with one id are equal, and a
@@ -1277,10 +1279,11 @@ public class ProductionMaintenanceGanttMoveFlowTest {
     }
 
     /**
-     * Answers a position mock from a field map: {@code setField} stores a value, {@code getField}, {@code getDateField},
-     * {@code getBelongsToField} and {@code getStringField} read it, date values are copied on the way in and out,
-     * {@code getId} returns the id, {@code getDataDefinition} the position data definition and {@code isValid} true. Every other
-     * method returns the Mockito default.
+     * Answers a position mock from a field map that starts with the id under {@code id}. {@code putField} and {@code setField}
+     * store a value, a date as a copy; {@code getField}, {@code getBelongsToField} and {@code getStringField} return the stored
+     * value itself; {@code getDateField} returns the stored value, a date as a copy. {@code getId} returns the id,
+     * {@code getDataDefinition} the position data definition and {@code isValid} true. Every other method returns the Mockito
+     * default.
      */
     private static final class PositionFieldsAnswer implements Answer<Object> {
 
@@ -1372,7 +1375,8 @@ public class ProductionMaintenanceGanttMoveFlowTest {
      * {@code list()} and {@code uniqueResult()} with the rows that satisfy every recorded criterion in their current state and,
      * when the inner order alias was created, have an order, sorted by the recorded orders and cut to the limit. Fails on
      * unknown criteria, unknown orders, any other {@code createAlias} call, a {@code uniqueResult()} matching more than one row
-     * and every other builder method.
+     * and every other method {@link SearchCriteriaBuilder} declares, {@code existsAliasForAssociation} included. Methods
+     * {@link Object} declares return the Mockito default.
      */
     private static final class FixtureCriteriaBuilderAnswer implements Answer<Object> {
 
@@ -1453,7 +1457,7 @@ public class ProductionMaintenanceGanttMoveFlowTest {
 
                 return selected.get(0);
             }
-            if (SearchCriteriaBuilder.class.equals(invocation.getMethod().getReturnType())) {
+            if (SearchCriteriaBuilder.class.equals(invocation.getMethod().getDeclaringClass())) {
                 throw new AssertionError("Unexpected builder method: " + methodName);
             }
 

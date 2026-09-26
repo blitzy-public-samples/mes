@@ -122,12 +122,17 @@ import com.qcadoo.model.internal.api.DataAccessService;
  * cached, the order of the in-memory order table on that line with the latest finish date at or before the date received.
  * The {@code getFinishDateWithChildren}, {@code getPreviousOrder} and executor answers fail unless the date they receive is
  * the one the preceding call of the same step answered, and the executor answers also fail unless the previous order they
- * receive is the one {@code getPreviousOrder} answered. Every answer records what it received and answered in the step.
+ * receive is the one {@code getPreviousOrder} answered. The {@code getFinishDate} answer starts the step with the line, the
+ * order and a copy of the finish cache it received and records the date it answered in it; the
+ * {@code getFinishDateWithChildren} and {@code getPreviousOrder} answers record what they received and answered in the step.
  * <p>
- * Both executor services answer {@code createProductionLinePositionNewData} with a start {@value #CHANGEOVER_MINUTES}
- * minutes after the finish date they received and an end {@value #DURATION_MINUTES} minutes after that start, put under the
- * id of the line they received or of {@code executorDataLine}, and record every call as a create event. Their first call
- * of a test adds the rows created by {@code positionInsertedAtFirstCreate} to the position table.
+ * Both executor services answer {@code createProductionLinePositionNewData} by recording their executor and the finish date
+ * and previous order they received in the step, recording every call as a create event and, while
+ * {@code executorProducesData} is set, putting new data only into the map they received: a start
+ * {@value #CHANGEOVER_MINUTES} minutes after the finish date and an end {@value #DURATION_MINUTES} minutes after that start,
+ * under the id of the line they received or of {@code executorDataLine}. Their first call of a test adds the rows created by
+ * {@code positionInsertedAtFirstCreate} to the position table. Both answer {@code savePosition} by requiring the position's
+ * step to have run on the same executor and recording a save event.
  * <p>
  * Row A is production line {@value #LINE_A_ID_VALUE} and row B is production line {@value #LINE_B_ID_VALUE}. All times are
  * on {@value #DAY}; the schedule starts at {@value #SCHEDULE_START}. Positions belong to the fixture schedule unless a test
@@ -1957,8 +1962,9 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
         }
 
         /**
-         * Returns the order of the order table on the given production line, compared by id, whose finish date is the latest
-         * at or before the given date, or {@code null} when there is none.
+         * Returns the order of the order table whose production line matches the given line by id and whose finish date is
+         * the latest at or before the given date; among orders with equal latest finish dates, the first in table order; or
+         * {@code null} when there is none.
          */
         private Entity findLatestOrderFinishedBy(final Entity line, final Date date) {
             Entity latestOrder = null;
@@ -2093,7 +2099,7 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
      * that satisfy every recorded criterion and, when the inner order alias was recorded, have an order, sorted by the recorded
      * orders and cut to the limit, and records a read event. Fails on unknown criteria, unknown orders, any other
      * {@code createAlias} call (another association, alias or join type, or the two-argument form), a {@code uniqueResult()}
-     * matching more than one row and every other builder method.
+     * matching more than one row and every other {@link SearchCriteriaBuilder} method.
      */
     private final class PositionCriteriaBuilderAnswer implements Answer<Object> {
 
@@ -2174,7 +2180,7 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
                 return selected.get(0);
             }
-            if (SearchCriteriaBuilder.class.equals(invocation.getMethod().getReturnType())) {
+            if (SearchCriteriaBuilder.class.equals(invocation.getMethod().getDeclaringClass())) {
                 throw new AssertionError("Unexpected builder method: " + methodName);
             }
 

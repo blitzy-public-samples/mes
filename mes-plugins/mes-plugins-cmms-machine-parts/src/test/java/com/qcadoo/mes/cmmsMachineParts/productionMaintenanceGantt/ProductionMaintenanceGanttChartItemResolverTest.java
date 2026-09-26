@@ -122,12 +122,15 @@ import com.qcadoo.view.api.components.ganttChart.GanttChartScale;
  * Unit tests of {@link ProductionMaintenanceGanttChartItemResolver}.
  * <p>
  * The data definitions answer {@code find(String)} with a query builder that records the query, its bound parameters and
- * every call made on it, and answers {@code list()} or {@code uniqueResult()} with projection rows computed from the fixture
- * entities by the semantics of that query. The builder fails with an {@link AssertionError} on an unknown query, on a query
- * run on another data definition, on a missing, unexpected, repeated or differently bound parameter, on a result read other
- * than the query's one, and on every other call; the criteria {@code find()} and {@code findWithAlias(String)} fail as
- * well. A projection row answers only the typed getters of the aliases its query selects, and a query result answers only
- * {@code getEntities()}.
+ * every call made on it until the result was read, and answers {@code list()} or {@code uniqueResult()} with projection
+ * rows computed from the fixture entities by the semantics of that query. {@code find(String)} fails with an
+ * {@link AssertionError} on an unknown query and on a query run on another data definition, and the criteria {@code find()}
+ * and {@code findWithAlias(String)} fail as well. The builder fails with an {@link AssertionError} on a missing, unexpected,
+ * repeated or differently bound parameter, on a result read other than the query's one, on any call after the result was
+ * read and on every other call. The builder exempts {@code toString()} from these failures and from the recording: it
+ * answers it with a description of its query, also after the result was read.
+ * A projection row answers only {@code toString()} and the typed getters of the aliases its query selects, and a query
+ * result answers only {@code getEntities()} and {@code toString()}.
  * <p>
  * The scale records every created item and answers with a mocked item exposing the recorded row name, label, tooltip and
  * entity id. Translations answer with their code, followed by their arguments in brackets when there are any. The warnings
@@ -1073,6 +1076,162 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
     }
 
     @Test
+    public final void shouldLabelEveryDeclaredPlannedEventTypeWithItsTypeTranslation() {
+        // given
+        for (PlannedEventType type : PlannedEventType.values()) {
+            plannedEvents.add(plannedEventOfType("EV-" + type.getStringValue(), type.getStringValue(), lineL1));
+        }
+
+        // when
+        resolver.resolve(scale, context, locale);
+
+        // then
+        List<String> declaredTypes = new ArrayList<String>();
+
+        for (PlannedEventType type : PlannedEventType.values()) {
+            declaredTypes.add(type.getStringValue());
+        }
+
+        assertEquals(Arrays.asList("01review", "02repairs", "03externalService", "04udtReview", "05meterReading", "06manual",
+                "07additionalWork", "08afterReview"), declaredTypes);
+        assertEquals(declaredTypes.size(), recordedItems.size());
+
+        for (PlannedEventType type : PlannedEventType.values()) {
+            GanttChartItemTooltip tooltip = recordedItemLabelled("EV-" + type.getStringValue()).tooltip;
+
+            assertEquals(Arrays.asList(
+                    translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY,
+                            EVENT_TYPE_PREFIX + type.getStringValue(), EVENT_STATE_PREFIX + PlannedEventStateStringValues.PLANNED),
+                    translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, FALSE_KEY)),
+                    tooltip.getContent());
+            verify(translationService).translate(EVENT_TYPE_PREFIX + type.getStringValue(), locale);
+        }
+
+        verify(translationService, never()).translate(
+                Matchers.eq(ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNSPECIFIED_KEY),
+                Matchers.any(Locale.class), Matchers.<String> anyVararg());
+        verify(translationService, never()).translate(
+                Matchers.eq(ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNKNOWN_KEY), Matchers.any(Locale.class),
+                Matchers.<String> anyVararg());
+    }
+
+    @Test
+    public final void shouldLabelPlannedEventWithoutTypeAsUnspecified() {
+        // given
+        plannedEvents.add(plannedEventOfType("EV-NULL-TYPE", null, lineL1));
+        plannedEvents.add(plannedEventOfType("EV-EMPTY-TYPE", "", lineL2));
+        plannedEvents.add(plannedEventOfType("EV-BLANK-TYPE", " \t", lineL3));
+
+        // when
+        resolver.resolve(scale, context, locale);
+
+        // then
+        assertEquals(3, recordedItems.size());
+
+        for (String eventNumber : Arrays.asList("EV-NULL-TYPE", "EV-EMPTY-TYPE", "EV-BLANK-TYPE")) {
+            assertEquals(Arrays.asList(
+                    translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY,
+                            ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNSPECIFIED_KEY, EVENT_STATE_PREFIX
+                                    + PlannedEventStateStringValues.PLANNED),
+                    translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, FALSE_KEY)),
+                    recordedItemLabelled(eventNumber).tooltip.getContent());
+        }
+
+        verify(translationService, times(3)).translate(ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNSPECIFIED_KEY,
+                locale);
+        verify(translationService, never()).translate(Matchers.startsWith(EVENT_TYPE_PREFIX), Matchers.any(Locale.class),
+                Matchers.<String> anyVararg());
+        verify(translationService, never()).translate(
+                Matchers.eq(ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNKNOWN_KEY), Matchers.any(Locale.class),
+                Matchers.<String> anyVararg());
+    }
+
+    @Test
+    public final void shouldLabelPlannedEventWithUndeclaredTypeAsUnknownWithoutTranslatingTheType() {
+        // given
+        List<String> undeclaredTypes = Arrays.asList("<img src=x onerror=alert(1)>", "09imported", "02REPAIRS", " 02repairs");
+
+        for (int index = 0; index < undeclaredTypes.size(); index++) {
+            plannedEvents.add(plannedEventOfType("EV-UNDECLARED-TYPE-" + index, undeclaredTypes.get(index), lineL1));
+        }
+
+        // when
+        resolver.resolve(scale, context, locale);
+
+        // then
+        assertEquals(undeclaredTypes.size(), recordedItems.size());
+
+        for (int index = 0; index < undeclaredTypes.size(); index++) {
+            GanttChartItemTooltip tooltip = recordedItemLabelled("EV-UNDECLARED-TYPE-" + index).tooltip;
+
+            assertEquals(Arrays.asList(
+                    translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY,
+                            ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNKNOWN_KEY, EVENT_STATE_PREFIX
+                                    + PlannedEventStateStringValues.PLANNED),
+                    translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, FALSE_KEY)),
+                    tooltip.getContent());
+
+            for (String line : tooltip.getContent()) {
+                assertFalse(line, line.contains("<img"));
+                assertFalse(line, line.contains("onerror"));
+                assertFalse(line, line.contains("09imported"));
+                assertFalse(line, line.contains("02REPAIRS"));
+                assertFalse(line, line.contains("02repairs"));
+            }
+        }
+
+        verify(translationService, times(undeclaredTypes.size())).translate(
+                ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNKNOWN_KEY, locale);
+        verify(translationService, never()).translate(Matchers.startsWith(EVENT_TYPE_PREFIX), Matchers.any(Locale.class),
+                Matchers.<String> anyVararg());
+        verify(translationService, never()).translate(
+                Matchers.eq(ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNSPECIFIED_KEY),
+                Matchers.any(Locale.class), Matchers.<String> anyVararg());
+
+        ArgumentCaptor<String> codeCaptor = ArgumentCaptor.forClass(String.class);
+
+        verify(translationService, atLeastOnce()).translate(codeCaptor.capture(), Matchers.any(Locale.class),
+                Matchers.<String> anyVararg());
+
+        for (String code : codeCaptor.getAllValues()) {
+            for (String undeclaredType : undeclaredTypes) {
+                assertFalse(code, code.contains(undeclaredType.trim()));
+            }
+        }
+    }
+
+    @Test
+    public final void shouldEscapeTranslatedFallbackTypeLabelsInTooltip() {
+        // given
+        Map<String, String> translations = new HashMap<String, String>();
+
+        translations.put(ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNSPECIFIED_KEY, "<u>Unspecified</u>");
+        translations.put(ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNKNOWN_KEY, "<s>Unknown</s> & \"other\"");
+
+        doAnswer(new FixedTranslationAnswer(translations)).when(translationService).translate(Matchers.anyString(),
+                Matchers.any(Locale.class), Matchers.<String> anyVararg());
+
+        plannedEvents.add(plannedEventOfType("EV-NO-TYPE", null, lineL1));
+        plannedEvents.add(plannedEventOfType("EV-OTHER-TYPE", "<b>09imported</b>", lineL2));
+
+        // when
+        resolver.resolve(scale, context, locale);
+
+        // then
+        assertEquals(Arrays.asList(
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY, "&lt;u&gt;Unspecified&lt;/u&gt;",
+                        EVENT_STATE_PREFIX + PlannedEventStateStringValues.PLANNED),
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, FALSE_KEY)),
+                recordedItemLabelled("EV-NO-TYPE").tooltip.getContent());
+        assertEquals(Arrays.asList(
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY,
+                        "&lt;s&gt;Unknown&lt;/s&gt; &amp; &quot;other&quot;", EVENT_STATE_PREFIX
+                                + PlannedEventStateStringValues.PLANNED),
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, FALSE_KEY)),
+                recordedItemLabelled("EV-OTHER-TYPE").tooltip.getContent());
+    }
+
+    @Test
     public final void shouldDescribePositionOrderAndProductInTooltip() {
         // given
         positions.add(position(71L, lineL1, order("ORD-T", product("P-T", "Tooltip product")), "2026-09-28 08:00:00",
@@ -1824,6 +1983,59 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
     }
 
     @Test
+    public final void shouldCutLogValueBeforeSurrogatePairStraddlingMaximumLength() {
+        // given
+        String surrogatePair = new String(Character.toChars(0x1F600));
+        String pairStraddlingCut = StringUtils.repeat('a', LOG_VALUE_MAX_LENGTH - 1) + surrogatePair;
+        String pairStraddlingCutThenLineBreak = StringUtils.repeat('d', LOG_VALUE_MAX_LENGTH - 1) + surrogatePair
+                + "\nWARN forged";
+        String quoteThenPairStraddlingCut = StringUtils.repeat('q', LOG_VALUE_MAX_LENGTH - 2) + "\"" + surrogatePair;
+
+        // when
+        String pairStraddlingCutLogValue = ProductionMaintenanceGanttChartItemResolver.toLogValue(pairStraddlingCut);
+        String pairStraddlingCutThenLineBreakLogValue = ProductionMaintenanceGanttChartItemResolver
+                .toLogValue(pairStraddlingCutThenLineBreak);
+        String quoteThenPairStraddlingCutLogValue = ProductionMaintenanceGanttChartItemResolver
+                .toLogValue(quoteThenPairStraddlingCut);
+
+        // then
+        assertEquals(2, surrogatePair.length());
+        assertTrue(Character.isHighSurrogate(pairStraddlingCut.charAt(LOG_VALUE_MAX_LENGTH - 1)));
+        assertTrue(Character.isLowSurrogate(pairStraddlingCut.charAt(LOG_VALUE_MAX_LENGTH)));
+
+        assertEquals("\"" + StringUtils.repeat('a', LOG_VALUE_MAX_LENGTH - 1) + "\"... (65 characters)",
+                pairStraddlingCutLogValue);
+        assertEquals("\"" + StringUtils.repeat('d', LOG_VALUE_MAX_LENGTH - 1) + "\"... (77 characters)",
+                pairStraddlingCutThenLineBreakLogValue);
+        assertEquals("\"" + StringUtils.repeat('q', LOG_VALUE_MAX_LENGTH - 2) + "\\\"\"... (65 characters)",
+                quoteThenPairStraddlingCutLogValue);
+
+        for (String logValue : Arrays.asList(pairStraddlingCutLogValue, pairStraddlingCutThenLineBreakLogValue,
+                quoteThenPairStraddlingCutLogValue)) {
+            assertFalse(logValue, logValue.indexOf(surrogatePair.charAt(0)) >= 0);
+            assertFalse(logValue, logValue.indexOf(surrogatePair.charAt(1)) >= 0);
+        }
+    }
+
+    @Test
+    public final void shouldKeepSurrogatePairEndingAtMaximumLengthWhole() {
+        // given
+        String surrogatePair = new String(Character.toChars(0x1F600));
+        String pairEndingAtCut = StringUtils.repeat('e', LOG_VALUE_MAX_LENGTH - 2) + surrogatePair + "f";
+        String pairEndingValueOfMaximumLength = StringUtils.repeat('g', LOG_VALUE_MAX_LENGTH - 2) + surrogatePair;
+
+        // when
+        String pairEndingAtCutLogValue = ProductionMaintenanceGanttChartItemResolver.toLogValue(pairEndingAtCut);
+        String pairEndingValueOfMaximumLengthLogValue = ProductionMaintenanceGanttChartItemResolver
+                .toLogValue(pairEndingValueOfMaximumLength);
+
+        // then
+        assertEquals("\"" + StringUtils.repeat('e', LOG_VALUE_MAX_LENGTH - 2) + surrogatePair + "\"... (65 characters)",
+                pairEndingAtCutLogValue);
+        assertEquals("\"" + pairEndingValueOfMaximumLength + "\"", pairEndingValueOfMaximumLengthLogValue);
+    }
+
+    @Test
     public final void shouldLogMalformedScheduleIdOnOneEscapedLine() {
         // given
         JSONObject forgedIdContext = scheduleContext("x\r\nWARN forged");
@@ -1859,6 +2071,21 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
         verifyZeroInteractions(dataDefinitionService);
         assertEquals(Collections.singletonList(INVALID_SCHEDULE_ID_MESSAGE + "\"" + StringUtils.repeat('9', LOG_VALUE_MAX_LENGTH)
                 + "\"... (200 characters)"), loggedWarnings());
+    }
+
+    @Test
+    public final void shouldLogOverlongMalformedScheduleIdCutBeforeSurrogatePairStraddlingMaximumLength() {
+        // given
+        String overlongId = StringUtils.repeat('9', LOG_VALUE_MAX_LENGTH - 1) + new String(Character.toChars(0x1F600)) + "9";
+
+        // when
+        Map<String, List<GanttChartItem>> items = resolver.resolve(scale, scheduleContext(overlongId), locale);
+
+        // then
+        assertTrue(items.isEmpty());
+        verifyZeroInteractions(dataDefinitionService);
+        assertEquals(Collections.singletonList(INVALID_SCHEDULE_ID_MESSAGE + "\""
+                + StringUtils.repeat('9', LOG_VALUE_MAX_LENGTH - 1) + "\"... (66 characters)"), loggedWarnings());
     }
 
     private void verifyNoScheduleQueried() {
@@ -2109,6 +2336,19 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
         stubBelongsToField(plannedEvent, PlannedEventFields.PRODUCTION_LINE, productionLine);
         stubBelongsToField(plannedEvent, PlannedEventFields.WORKSTATION, workstation);
         stubBelongsToField(plannedEvent, PlannedEventFields.DIVISION, division);
+
+        return plannedEvent;
+    }
+
+    /**
+     * Returns a planned event of the given type in the planned state, without a shutdown, placed on the given production
+     * line and overlapping the scale.
+     */
+    private Entity plannedEventOfType(final String number, final String type, final Entity productionLine) {
+        Entity plannedEvent = plannedEvent(number, PlannedEventStateStringValues.PLANNED, false, "2026-09-29 06:00:00",
+                "2026-09-29 10:00:00", productionLine, null, null);
+
+        stubStringField(plannedEvent, PlannedEventFields.TYPE, type);
 
         return plannedEvent;
     }
@@ -2421,6 +2661,12 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
         private final Map<String, String> setters = new LinkedHashMap<String, String>();
 
         /**
+         * Creates the expectation of one query from its data definition, its result method and the setter of each parameter.
+         *
+         * @param dataDefinition
+         *            the data definition whose {@code find(String)} must receive the query
+         * @param resultMethod
+         *            the name of the builder method that must read the result: {@code list} or {@code uniqueResult}
          * @param parametersAndSetters
          *            parameter names, each followed by the name of the builder method that must bind it
          */
@@ -2494,8 +2740,9 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
     }
 
     /**
-     * Records the parameters bound on a query builder and answers its result method with the emulated rows; fails on every
-     * other call and on any call after the result was read.
+     * Records the parameters bound on a query builder and the name of every call made on it until the result was read, and
+     * answers its result method with the emulated rows; fails on every other call and on any call after the result was read.
+     * Exempts {@code toString()} from both failures and from the recording, answering it with a description of the query.
      */
     private final class QueryBuilderAnswer implements Answer<Object> {
 
@@ -2580,7 +2827,8 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
     }
 
     /**
-     * Answers {@code getEntities()} of a query result with the given rows and fails on every other call.
+     * Answers {@code getEntities()} of a query result with the given rows and {@code toString()} with a description of the
+     * result, and fails on every other call.
      */
     private static final class SearchResultAnswer implements Answer<Object> {
 
@@ -2607,8 +2855,8 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
     }
 
     /**
-     * Answers the typed field getters of a projection row with the value of the given alias, failing on an alias the row does
-     * not have, on a value of another type and on every other call.
+     * Answers the typed field getters of a projection row with the value of the given alias and {@code toString()} with the
+     * row's fields, failing on an alias the row does not have, on a value of another type and on every other call.
      */
     private static final class ProjectionRowAnswer implements Answer<Object> {
 

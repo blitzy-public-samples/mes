@@ -2,7 +2,7 @@
  * ***************************************************************************
  * Copyright (c) 2010 Qcadoo Limited
  * Project: Qcadoo MES
- * Version: 1.4
+ * Version: 1.5-SNAPSHOT
  *
  * This file is part of Qcadoo.
  *
@@ -29,29 +29,55 @@
  * Runs against a started application whose database holds mes_db_en.sql and fixture.sql:
  *
  *   node --test-reporter=tap acceptance.test.js --base-url http://localhost:<port> --user <login> --password <password>
- *        --db-uri postgresql://<user>:<password>@localhost:<port>/<db> --chrome <path to chrome-headless-shell>
+ *        --db-uri postgresql://<user>@localhost:<port>/<db>?passfile=<file> --chrome <path to chrome-headless-shell>
  *        --base-day YYYY-MM-DD
  *
  * Tested toolchain: Node.js v22.23.2, Chrome for Testing headless shell 154.0.8037.57, PostgreSQL 14 with its psql,
  * on Linux. Before it parses the arguments, the runner throws unless it runs on Linux with /proc/net/tcp and on
- * Node.js 22 or later with the global fetch, WebSocket and Headers.prototype.getSetCookie.
+ * Node.js 22 or later with the global fetch, WebSocket and Headers.prototype.getSetCookie. Once the arguments are
+ * parsed, it sets process.title to 'node acceptance.test.js' and throws unless /proc/self/cmdline then reads exactly
+ * that title.
+ *
+ * Worker isolation: before it registers a case and again before it starts Chrome, the runner checks the worker. A
+ * process is admitted when it is part of the run (this process, its ancestors and the processes admitted by an earlier
+ * check that found nothing; the process that runs run-acceptance.sh next to this file, else this process, and the
+ * members of this process's process group, each with its descendants), pid 1, a kernel thread or a server (a holder,
+ * or the non-root account, of a TCP socket listening on the --base-url port or a --db-uri port, with its descendants).
+ * A traced process of the run is an intrusion: the check throws. Co-tenancy is a process that is not admitted, a
+ * socket of /proc/net/tcp, tcp6, udp and udp6 that belongs to no admitted process, a process that cannot be
+ * inspected, a /proc, /proc/self/mountinfo or /proc/net table that cannot be read or parsed, and, unless the runner
+ * runs as root, /proc mounted with hidepid: the check writes one warning line to stderr with the number of findings
+ * and at most 10 of them, and the run continues. Processes outside the run can read the --password argument and
+ * reach Chrome's DevTools endpoint. In a worker of its own, a private process list and a private network namespace
+ * holding only this run, the application and its database server, the checks write no warning. A finding counts once
+ * an immediate second check finds it again. From the first check until the after hook, the runner checks every 500 ms
+ * for intrusions only: a traced process of the run, and, once Chrome runs, any connection to Chrome's DevTools port
+ * other than its own. An intrusion found while the run runs stops Chrome, fails every later case and the after hook,
+ * and sets the exit status to 1.
  *
  * Arguments, checked before any case is registered:
  *   --base-url  a loopback http or https origin (localhost, 127.0.0.0/8 or [::1]) without user name, password, path,
  *               query or fragment.
- *   --db-uri    a postgresql:// or postgres:// URI in libpq 14 syntax: well-formed percent escapes other than %00,
- *               key=value query parameters that libpq accepts other than service, hosts that are loopback hosts or
- *               absolute socket directories, loopback hostaddr values, and a database name; it is passed to psql as
- *               given, with application_name appended.
+ *   --db-uri    a URI in libpq 14 syntax that starts with postgresql:// or postgres:// in lower case: well-formed
+ *               percent escapes other than %00, at most one '@', only as the end of the user name and password before
+ *               the first '/' and '?' (%40 elsewhere), key=value query parameters that libpq accepts other than
+ *               service, hosts that are loopback hosts or absolute socket directories, loopback hostaddr values, and a
+ *               database name. psql gets it with any password moved into a mode-600 password file of a private
+ *               temporary directory and with application_name appended, and runs without the environment variables
+ *               whose names start with PG other than PGCONNECT_TIMEOUT. A server that psql reaches over TCP on an
+ *               address other than a loopback address is refused before any case.
  *   --chrome    an executable file, as a path or as a name found on PATH.
- *   --user      a non-blank login.
+ *   --user      a non-blank login without control characters (U+0000-U+001F, U+007F-U+009F, U+2028 and U+2029).
  *
- * Before any case, the before hook reads, and only reads, the database and /proc: the database comment must equal
- * qcadoo-acceptance:productionMaintenanceGantt; exactly one process must listen on the --base-url port; that process
- * must hold at least one connection to the server of the database, every such connection must be a loopback
- * connection to that database, and it must hold no loopback connection to another PostgreSQL server. Otherwise every
- * case fails without an HTTP request, a browser or a database write. flushApplicationBackendStats terminates only the
- * idle backends of that database that serve connections of that same process.
+ * Before any case, the before hook first verifies the target with checks that only read the database and /proc: the
+ * database comment must equal qcadoo-acceptance:productionMaintenanceGantt; exactly one process must listen on the
+ * --base-url port; that process must hold at least one connection to the server of the database, every such
+ * connection must be a loopback connection to that database, and it must hold no loopback connection to another
+ * PostgreSQL server. When a check fails, the hook throws and every case fails without an HTTP request, a browser or a
+ * database write. Only after every check passes does the hook read the expected English messages and the fixture ids,
+ * launch Chrome, log in and open the board of the rowMapping schedule. flushApplicationBackendStats selects the client
+ * backends of that database that are idle when observed and serve connections of that same process, then terminates
+ * every selected backend, including one that has become active since it was selected.
  *
  * http: cases post view events with Node's fetch. browser: cases drive the board in headless Chrome through the
  * DevTools Protocol with real mouse input. Database state is read, and concurrent transactions are run, with psql.
@@ -60,7 +86,7 @@
 
 'use strict';
 
-const { test, before, after } = require('node:test');
+const { test, before, beforeEach, after } = require('node:test');
 const assert = require('node:assert/strict');
 const childProcess = require('node:child_process');
 const fs = require('node:fs');
@@ -72,7 +98,7 @@ const path = require('node:path');
 // ---------------------------------------------------------------------------------------------------------------
 
 const USAGE = 'usage: node acceptance.test.js --base-url <http://localhost:port> --user <login> --password <password> '
-    + '--db-uri <postgresql://user:password@localhost:port/db> --chrome <path> --base-day <YYYY-MM-DD>';
+    + '--db-uri <postgresql://user@localhost:port/db?passfile=file> --chrome <path> --base-day <YYYY-MM-DD>';
 
 const ARGUMENT_NAMES = ['base-url', 'user', 'password', 'db-uri', 'chrome', 'base-day'];
 
@@ -165,10 +191,43 @@ function percentDecode(text) {
     }
 }
 
+// Beginnings of a libpq connection URI, in lower case.
+const DATABASE_URI_PREFIXES = ['postgresql://', 'postgres://'];
+
+/**
+ * Splits a URI that starts with one of DATABASE_URI_PREFIXES into { prefix, userInfo, rest, query }:
+ * - prefix: the DATABASE_URI_PREFIXES entry it starts with;
+ * - userInfo: the text between the prefix and the first '@' when that '@' comes before the first '/' and the first
+ *   '?' after the prefix, else null;
+ * - rest: the text after that '@' (after the prefix when userInfo is null) up to the first '?';
+ * - query: the text after that '?', or null when there is none.
+ * Example: 'postgresql://u:p@localhost:5432/db?a=1' gives { prefix: 'postgresql://', userInfo: 'u:p',
+ * rest: 'localhost:5432/db', query: 'a=1' }.
+ */
+function splitDatabaseUri(value) {
+    const prefix = DATABASE_URI_PREFIXES.find((candidate) => value.startsWith(candidate));
+    const body = value.slice(prefix.length);
+    const at = body.indexOf('@');
+    const authorityEnd = body.search(/[/?]/);
+    const hasUserInfo = at >= 0 && (authorityEnd < 0 || at < authorityEnd);
+    const afterUserInfo = hasUserInfo ? body.slice(at + 1) : body;
+    const queryStart = afterUserInfo.indexOf('?');
+
+    return {
+        prefix,
+        userInfo: hasUserInfo ? body.slice(0, at) : null,
+        rest: queryStart < 0 ? afterUserInfo : afterUserInfo.slice(0, queryStart),
+        query: queryStart < 0 ? null : afterUserInfo.slice(queryStart + 1)
+    };
+}
+
 /**
  * Validates --db-uri. Throws with the usage line unless the value:
  * - has no leading or trailing white space and no '#';
  * - writes every '%' as a two-digit hex escape other than %00;
+ * - starts with 'postgresql://' or 'postgres://' in lower case (DATABASE_URI_PREFIXES);
+ * - holds at most one '@', and only as the end of the user information: before the first '/' and the first '?' after
+ *   that beginning;
  * - is a postgresql:// or postgres:// URI;
  * - has a query, when it holds '?', of '&'-separated key=value parameters with no empty parameter and a single '=',
  *   each key in LIBPQ_URI_PARAMETERS, or ssl=true;
@@ -187,6 +246,16 @@ function validateDatabaseUri(value) {
     }
     if (/%(?![0-9A-Fa-f]{2})/.test(value) || /%00/.test(value)) {
         throw new Error(`--db-uri must write every '%' as a two-digit hex escape other than %00\n${USAGE}`);
+    }
+    if (!DATABASE_URI_PREFIXES.some((prefix) => value.startsWith(prefix))) {
+        throw new Error(`--db-uri must start with postgresql:// or postgres:// in lower case\n${USAGE}`);
+    }
+
+    const atSigns = value.split('@').length - 1;
+
+    if (atSigns > 1 || (atSigns === 1 && splitDatabaseUri(value).userInfo === null)) {
+        throw new Error(`--db-uri may hold '@' only once, at the end of the user name and password, before the first `
+            + `'/' and '?'; write any other '@' as %40\n${USAGE}`);
     }
 
     let url;
@@ -269,11 +338,27 @@ function resolveChrome(value) {
     return executable;
 }
 
+// Characters escapeControlCharacters writes as \uXXXX and --user must not hold: the C0 controls U+0000-U+001F, DEL
+// U+007F, the C1 controls U+0080-U+009F, and the line and paragraph separators U+2028 and U+2029.
+const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/g;
+
+/**
+ * Returns the text with every character of CONTROL_CHARACTERS written as \u and four upper-case hex digits; the result
+ * holds no line break. For example, 'a\r\nb' becomes 'a\u000D\u000Ab'.
+ */
+function escapeControlCharacters(text) {
+    return String(text).replace(CONTROL_CHARACTERS,
+        (character) => `\\u${character.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}`);
+}
+
 /**
  * Parses `--name value` and `--name=value` arguments, then normalizes and validates the values with parseBaseUrl,
  * validateDatabaseUri and resolveChrome. Throws with the usage line when an argument is unknown, a value is missing,
- * --user is blank, --base-day is not a calendar date in the YYYY-MM-DD form, or a value fails its validation. Returns
- * { baseUrl, httpPort, user, password, dbUri, chrome, baseDay, baseDayMillis }; dbUri is --db-uri unchanged.
+ * --user is blank or holds a character of CONTROL_CHARACTERS, --base-day is not a calendar date in the YYYY-MM-DD form
+ * (any year 0000 to 9999, taken as written), or a value fails its validation. Messages echo no argument text other than
+ * an unexpected argument, an unknown argument name or a rejected --base-day, each written through
+ * escapeControlCharacters. Returns { baseUrl, httpPort, user, password, dbUri, chrome, baseDay, baseDayMillis }; dbUri
+ * is --db-uri unchanged, and baseDayMillis is wallClockMillis of --base-day at 00:00:00.
  */
 function parseArguments(argv) {
     const values = {};
@@ -282,7 +367,7 @@ function parseArguments(argv) {
         const argument = argv[index];
 
         if (!argument.startsWith('--')) {
-            throw new Error(`unexpected argument ${argument}\n${USAGE}`);
+            throw new Error(`unexpected argument ${escapeControlCharacters(argument)}\n${USAGE}`);
         }
 
         const separator = argument.indexOf('=');
@@ -299,7 +384,7 @@ function parseArguments(argv) {
         }
 
         if (!ARGUMENT_NAMES.includes(name)) {
-            throw new Error(`unknown argument --${name}\n${USAGE}`);
+            throw new Error(`unknown argument --${escapeControlCharacters(name)}\n${USAGE}`);
         }
         if (value === undefined || value === '' || (separator < 0 && value.startsWith('--'))) {
             throw new Error(`missing value of --${name}\n${USAGE}`);
@@ -315,14 +400,19 @@ function parseArguments(argv) {
     }
 
     const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(values['base-day']);
-    const dayMillis = day ? Date.UTC(Number(day[1]), Number(day[2]) - 1, Number(day[3])) : NaN;
+    const dayMillis = day ? wallClockMillis(Number(day[1]), Number(day[2]), Number(day[3])) : NaN;
 
     if (!day || Number.isNaN(dayMillis) || new Date(dayMillis).toISOString().slice(0, 10) !== values['base-day']) {
-        throw new Error(`--base-day must be a calendar date in the YYYY-MM-DD form, got ${values['base-day']}\n${USAGE}`);
+        throw new Error(`--base-day must be a calendar date in the YYYY-MM-DD form, got `
+            + `${escapeControlCharacters(values['base-day'])}\n${USAGE}`);
     }
 
     if (values.user.trim() === '') {
         throw new Error(`--user must not be blank\n${USAGE}`);
+    }
+    if (values.user.search(CONTROL_CHARACTERS) >= 0) {
+        throw new Error(`--user must not hold control characters (U+0000-U+001F, U+007F-U+009F, U+2028 or U+2029)\n`
+            + USAGE);
     }
 
     const { baseUrl, httpPort } = parseBaseUrl(values['base-url']);
@@ -375,9 +465,603 @@ function checkRuntime() {
     }
 }
 
+// Largest number of findings an isolation error or warning names.
+const ISOLATION_OFFENDER_LIMIT = 10;
+
+// End of the co-tenancy warning of an isolation check.
+const ISOLATION_EXPOSURE = 'The run continues; processes outside this run can read the --password argument and '
+    + 'reach the DevTools endpoint of Chrome';
+
+// Interval of the isolation watch, which checks for intrusions from the first isolation check until the after hook,
+// in milliseconds.
+const ISOLATION_WATCH_INTERVAL_MS = 500;
+
+// Command line of the runner in /proc/<pid>/cmdline once process.title is set.
+const PROCESS_TITLE = 'node acceptance.test.js';
+
+// PF_KTHREAD, the flag of a kernel thread in the flags field of /proc/<pid>/stat.
+const PF_KTHREAD = 0x00200000;
+
+// Port of a --db-uri that names none, the PostgreSQL default.
+const DEFAULT_DATABASE_PORT = 5432;
+
+// Names of the TCP states of /proc/net/tcp and tcp6, by their hexadecimal code.
+const TCP_STATE_NAMES = {
+    '01': 'ESTABLISHED', '02': 'SYN_SENT', '03': 'SYN_RECV', '04': 'FIN_WAIT1', '05': 'FIN_WAIT2', '06': 'TIME_WAIT',
+    '07': 'CLOSE', '08': 'CLOSE_WAIT', '09': 'LAST_ACK', '0A': 'LISTEN', '0B': 'CLOSING', '0C': 'NEW_SYN_RECV'
+};
+
+/**
+ * Reads /proc/<pid>/stat and /proc/<pid>/status of every process of /proc and returns a Map from each pid, a string, to
+ * { ppid, pgid, start, kernel, euid, tracer }: ppid, pgid and start are the parent pid, the process group id and the
+ * start time (fields 4, 5 and 22 of stat), kernel whether the flags field of stat holds PF_KTHREAD, euid the effective
+ * uid of the Uid: line of status and tracer its TracerPid: value; all but kernel are decimal strings. Pushes '/proc
+ * cannot be listed' to `violations` when /proc cannot be read, and 'process <pid> cannot be inspected' for a process
+ * whose files fail to read with an error other than ENOENT and ESRCH or lack one of those fields. A process that has
+ * exited is skipped.
+ */
+function readProcesses(violations) {
+    const processes = new Map();
+    let names;
+
+    try {
+        names = fs.readdirSync('/proc');
+    } catch (error) {
+        violations.push('/proc cannot be listed');
+        return processes;
+    }
+
+    for (const pid of names.filter((name) => /^\d+$/.test(name))) {
+        let stat;
+        let status;
+
+        try {
+            stat = fs.readFileSync(`/proc/${pid}/stat`, 'latin1');
+            status = fs.readFileSync(`/proc/${pid}/status`, 'latin1');
+        } catch (error) {
+            if (error.code !== 'ENOENT' && error.code !== 'ESRCH') {
+                violations.push(`process ${pid} cannot be inspected`);
+            }
+
+            continue;
+        }
+
+        // The fields after the parenthesised command name, from the state (field 3 of stat) on.
+        const nameEnd = stat.lastIndexOf(')');
+        const fields = stat.slice(nameEnd + 2).split(' ');
+        const lines = status.split('\n').map((line) => line.split(/[ \t]+/).filter((field) => field !== ''));
+        const uids = lines.find((line) => line[0] === 'Uid:');
+        const tracer = lines.find((line) => line[0] === 'TracerPid:');
+
+        if (nameEnd < 0 || fields.length < 20 || ![1, 2, 6, 19].every((index) => /^\d+$/.test(fields[index]))
+            || !uids || uids.length !== 5 || !uids.slice(1).every((uid) => /^\d+$/.test(uid))
+            || !tracer || tracer.length !== 2 || !/^\d+$/.test(tracer[1])) {
+            violations.push(`process ${pid} cannot be inspected`);
+            continue;
+        }
+
+        processes.set(pid, {
+            ppid: fields[1],
+            pgid: fields[2],
+            start: fields[19],
+            kernel: (Number(fields[6]) & PF_KTHREAD) !== 0,
+            euid: uids[2],
+            tracer: tracer[1]
+        });
+    }
+
+    return processes;
+}
+
+/** Returns the pids from `pid` up through its parent, its parent's parent and so on, as far as `processes` holds them. */
+function ancestorChain(pid, processes) {
+    const chain = [];
+    let current = pid;
+
+    while (processes.has(current) && !chain.includes(current)) {
+        chain.push(current);
+        current = processes.get(current).ppid;
+    }
+
+    return chain;
+}
+
+/** Returns the Set of the pids of `roots` that `processes` holds and of all their descendants. */
+function descendantsOf(roots, processes) {
+    const children = new Map();
+
+    for (const [pid, info] of processes) {
+        if (!children.has(info.ppid)) {
+            children.set(info.ppid, []);
+        }
+
+        children.get(info.ppid).push(pid);
+    }
+
+    const members = new Set();
+    const pending = roots.filter((pid) => processes.has(pid));
+
+    while (pending.length > 0) {
+        const pid = pending.pop();
+
+        if (!members.has(pid)) {
+            members.add(pid);
+            pending.push(...(children.get(pid) || []));
+        }
+    }
+
+    return members;
+}
+
+/**
+ * Returns the run root of `chain`, the ancestor chain of this process with this process first: the member farthest
+ * from this process whose descriptor 255, the descriptor bash reads a script from, links to the file run-acceptance.sh
+ * next to this file; this process when no member does.
+ */
+function runRoot(chain) {
+    let script;
+
+    try {
+        script = fs.realpathSync(path.join(__dirname, 'run-acceptance.sh'));
+    } catch (error) {
+        return chain[0];
+    }
+
+    let root = chain[0];
+
+    for (const pid of chain) {
+        let link;
+
+        try {
+            link = fs.readlinkSync(`/proc/${pid}/fd/255`);
+        } catch (error) {
+            continue;
+        }
+
+        if (link === script) {
+            root = pid;
+        }
+    }
+
+    return root;
+}
+
+/** Returns the inodes of the sockets the process `pid` holds, read from its /proc/<pid>/fd links; empty when unreadable. */
+function socketInodes(pid) {
+    const inodes = new Set();
+    let entries;
+
+    try {
+        entries = fs.readdirSync(`/proc/${pid}/fd`);
+    } catch (error) {
+        return inodes;
+    }
+
+    for (const entry of entries) {
+        let link;
+
+        try {
+            link = fs.readlinkSync(`/proc/${pid}/fd/${entry}`);
+        } catch (error) {
+            // A descriptor closed while the links are read is skipped.
+            continue;
+        }
+
+        const match = /^socket:\[(\d+)\]$/.exec(link);
+
+        if (match) {
+            inodes.add(match[1]);
+        }
+    }
+
+    return inodes;
+}
+
+/**
+ * Returns the entries of the tables /proc/net/<protocol> of `protocols` as { protocol, state, local, remote, localPort,
+ * remotePort, uid, inode }: state is the hexadecimal state code in upper case, local and remote the address:port
+ * fields in upper case as the table writes them, localPort and remotePort their decimal ports, uid and inode decimal
+ * strings. A missing table is skipped. Throws when a table cannot be read or holds a line that is not an entry.
+ */
+function socketTable(protocols) {
+    const entries = [];
+
+    for (const protocol of protocols) {
+        const table = `/proc/net/${protocol}`;
+        let text;
+
+        try {
+            text = fs.readFileSync(table, 'latin1');
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                continue;
+            }
+
+            throw new Error(`${table} cannot be read (${error.code})`);
+        }
+
+        for (const line of text.split('\n').slice(1)) {
+            const fields = line.split(/[ \t]+/).filter((field) => field !== '');
+
+            if (fields.length === 0) {
+                continue;
+            }
+
+            const local = /^[0-9A-F]+:([0-9A-F]{4})$/i.exec(fields[1] || '');
+            const remote = /^[0-9A-F]+:([0-9A-F]{4})$/i.exec(fields[2] || '');
+
+            if (!local || !remote || !/^[0-9A-F]{2}$/i.test(fields[3] || '') || !/^\d+$/.test(fields[7] || '')
+                || !/^\d+$/.test(fields[9] || '')) {
+                throw new Error(`${table} holds a line that is not a socket entry`);
+            }
+
+            entries.push({
+                protocol,
+                state: fields[3].toUpperCase(),
+                local: fields[1].toUpperCase(),
+                remote: fields[2].toUpperCase(),
+                localPort: parseInt(local[1], 16),
+                remotePort: parseInt(remote[1], 16),
+                uid: fields[7],
+                inode: fields[9]
+            });
+        }
+    }
+
+    return entries;
+}
+
+/**
+ * Collects the findings of worker isolation once. `trustedPorts` is the Set of the TCP ports of the application and
+ * database servers the run uses; `remembered` holds the '<pid>:<start>' keys of the processes admitted by an earlier
+ * check that found nothing; `full` is false for a collection of intrusions only. The run is this process with
+ * its ancestors, the remembered processes that still run, and the run root (runRoot) and the members of this process's
+ * process group when its id is not 0, each with all its descendants. A process is admitted when it belongs to the run,
+ * is pid 1 or a kernel thread, or is a server: a holder of a TCP socket listening on a trusted port, a process whose
+ * effective uid is the uid of such a socket when that uid is neither 0 nor the runner's effective uid, or a
+ * descendant of either. Returns { coTenancy, intrusion, admitted }:
+ *   - intrusion: 'process <pid> is traced by process <tracer>' for every process of the run whose TracerPid is not 0;
+ *   - coTenancy, in this order:
+ *     - '/proc/self/mountinfo cannot be read, ...' when that file cannot be read or is empty;
+ *     - unless the runner runs as root, '/proc is mounted with hidepid=<value>, ...' for every hidepid option other
+ *       than hidepid=0 and hidepid=off in the mount options (field 6) or the super options (the last field) of a
+ *       /proc/self/mountinfo line whose mount point (field 5) is /proc;
+ *     - the entries of readProcesses;
+ *     - the message of socketTable when a table of /proc/net/tcp, tcp6, udp and udp6 cannot be read or parsed;
+ *     - 'process <pid> (uid <uid>) is not part of this run' for every process that is not admitted, naming its
+ *       effective uid;
+ *     - 'a <protocol> socket on local port <port> (uid <uid>) belongs to no process of this run' for every socket of
+ *       those tables whose inode is not 0, that no admitted process holds and whose uid is not the uid of a server as
+ *       above, other than a TCP socket whose local port is a trusted port and whose uid is the uid of a socket
+ *       listening on that port;
+ *   - admitted: the keys of the admitted processes.
+ * With `full` false, it reads only /proc/<pid>/stat and status and the descriptor 255 of the ancestors, coTenancy
+ * holds only the entries of readProcesses, and admitted holds the keys of the run.
+ * Entries name pids, uids, ports and /proc paths only, never a command line, an environment or an argument value.
+ */
+function isolationViolationsOnce(trustedPorts, remembered, full = true) {
+    const effectiveUid = String(process.geteuid());
+    const coTenancy = [];
+    const intrusion = [];
+
+    if (full) {
+        let mountinfo = '';
+
+        try {
+            mountinfo = fs.readFileSync('/proc/self/mountinfo', 'utf8');
+        } catch (error) {
+            mountinfo = '';
+        }
+
+        if (mountinfo === '') {
+            coTenancy.push('/proc/self/mountinfo cannot be read, so the process list cannot be checked');
+        } else if (effectiveUid !== '0') {
+            for (const line of mountinfo.split('\n')) {
+                const fields = line.split(' ');
+
+                if (fields[4] !== '/proc') {
+                    continue;
+                }
+
+                for (const option of `${fields[5]},${fields[fields.length - 1]}`.split(',')) {
+                    const value = option.startsWith('hidepid=') ? option.slice('hidepid='.length) : null;
+
+                    if (value !== null && value !== '0' && value !== 'off') {
+                        coTenancy.push(`/proc is mounted with hidepid=${value}, so other accounts' processes cannot be `
+                            + 'listed');
+                    }
+                }
+            }
+        }
+    }
+
+    const processes = readProcesses(coTenancy);
+    const self = String(process.pid);
+    const chain = ancestorChain(self, processes);
+    const group = processes.has(self) ? processes.get(self).pgid : '0';
+    const key = (pid) => `${pid}:${processes.get(pid).start}`;
+    const roots = [runRoot(chain)];
+
+    for (const [pid, info] of processes) {
+        if (group !== '0' && info.pgid === group) {
+            roots.push(pid);
+        }
+    }
+
+    const run = descendantsOf(roots, processes);
+
+    for (const pid of processes.keys()) {
+        if (chain.includes(pid) || remembered.has(key(pid))) {
+            run.add(pid);
+        }
+    }
+
+    for (const pid of run) {
+        const { tracer } = processes.get(pid);
+
+        if (tracer !== '0') {
+            intrusion.push(`process ${pid} is traced by process ${tracer}`);
+        }
+    }
+
+    if (!full) {
+        return { coTenancy, intrusion, admitted: new Set([...run].map(key)) };
+    }
+
+    let table = [];
+
+    try {
+        table = socketTable(['tcp', 'tcp6', 'udp', 'udp6']);
+    } catch (error) {
+        coTenancy.push(error.message);
+    }
+
+    const isTcp = (entry) => entry.protocol === 'tcp' || entry.protocol === 'tcp6';
+    const listening = table.filter((entry) => isTcp(entry) && entry.state === '0A' && trustedPorts.has(entry.localPort));
+    const listeningInodes = new Set(listening.map((entry) => entry.inode));
+    const serverAccounts = new Set(listening.map((entry) => entry.uid)
+        .filter((uid) => uid !== '0' && uid !== effectiveUid));
+    const holders = new Map();
+    const serverRoots = [];
+
+    for (const [pid, info] of processes) {
+        for (const inode of socketInodes(pid)) {
+            if (!holders.has(inode)) {
+                holders.set(inode, []);
+            }
+
+            holders.get(inode).push(pid);
+
+            if (listeningInodes.has(inode)) {
+                serverRoots.push(pid);
+            }
+        }
+
+        if (serverAccounts.has(info.euid)) {
+            serverRoots.push(pid);
+        }
+    }
+
+    const servers = descendantsOf(serverRoots, processes);
+    const isAdmitted = (pid) => run.has(pid) || servers.has(pid) || pid === '1' || processes.get(pid).kernel;
+    const admitted = new Set();
+
+    for (const [pid, info] of processes) {
+        if (isAdmitted(pid)) {
+            admitted.add(key(pid));
+        } else {
+            coTenancy.push(`process ${pid} (uid ${info.euid}) is not part of this run`);
+        }
+    }
+
+    for (const entry of table) {
+        if (entry.inode === '0' || serverAccounts.has(entry.uid) || (holders.get(entry.inode) || []).some(isAdmitted)) {
+            continue;
+        }
+        if (isTcp(entry) && trustedPorts.has(entry.localPort)
+            && listening.some((server) => server.localPort === entry.localPort && server.uid === entry.uid)) {
+            continue;
+        }
+
+        coTenancy.push(`a ${entry.protocol} socket on local port ${entry.localPort} (uid ${entry.uid}) belongs to no `
+            + 'process of this run');
+    }
+
+    return { coTenancy, intrusion, admitted };
+}
+
+// '<pid>:<start>' keys of the processes the isolation checks of this runner that found nothing have admitted.
+const ISOLATION_ADMITTED = new Set();
+
+/**
+ * Returns { coTenancy, intrusion }, the findings of worker isolation of the Set of trusted ports `trustedPorts` (see
+ * isolationViolationsOnce, with `full` false for intrusions only, coTenancy then empty): none when a first collection
+ * finds none, and otherwise the findings of that collection that a second one, made at once, finds again. When none
+ * remain, adds the keys of the processes the first collection admitted to ISOLATION_ADMITTED.
+ */
+function workerIsolation(trustedPorts, full = true) {
+    const first = isolationViolationsOnce(trustedPorts, ISOLATION_ADMITTED, full);
+    let coTenancy = full ? [...new Set(first.coTenancy)] : [];
+    let intrusion = [...new Set(first.intrusion)];
+
+    if (coTenancy.length > 0 || intrusion.length > 0) {
+        const second = isolationViolationsOnce(trustedPorts, ISOLATION_ADMITTED, full);
+        const coTenancyAgain = new Set(second.coTenancy);
+        const intrusionAgain = new Set(second.intrusion);
+
+        coTenancy = coTenancy.filter((finding) => coTenancyAgain.has(finding));
+        intrusion = intrusion.filter((finding) => intrusionAgain.has(finding));
+    }
+
+    if (coTenancy.length === 0 && intrusion.length === 0) {
+        first.admitted.forEach((admittedKey) => ISOLATION_ADMITTED.add(admittedKey));
+    }
+
+    return { coTenancy, intrusion };
+}
+
+/** Returns at most ISOLATION_OFFENDER_LIMIT of the findings joined with '; ', and the number of the others. */
+function isolationReport(findings) {
+    const more = findings.length > ISOLATION_OFFENDER_LIMIT
+        ? `; and ${findings.length - ISOLATION_OFFENDER_LIMIT} more` : '';
+
+    return `${findings.slice(0, ISOLATION_OFFENDER_LIMIT).join('; ')}${more}`;
+}
+
+/**
+ * Returns the TCP ports of the database servers of --db-uri (checked by validateDatabaseUri): the ports of the last
+ * port query parameter, else of the authority, each item of a comma-separated list that is a port 1-65535;
+ * DEFAULT_DATABASE_PORT when there is none.
+ */
+function databasePorts(value) {
+    const url = new URL(value);
+    let ports = url.port;
+
+    for (const token of url.search.slice(1).split('&')) {
+        const parts = token.split('=');
+
+        if (parts.length === 2 && percentDecode(parts[0]) === 'port') {
+            ports = percentDecode(parts[1]) || '';
+        }
+    }
+
+    const numbers = ports.split(',').map((item) => item.trim()).filter((item) => /^\d{1,5}$/.test(item))
+        .map(Number).filter((port) => port >= 1 && port <= 65535);
+
+    return numbers.length > 0 ? numbers : [DEFAULT_DATABASE_PORT];
+}
+
+/**
+ * Checks worker isolation with workerIsolation(TRUSTED_PORTS) before the step `purpose` names. Throws when the check
+ * finds an intrusion; the error names `purpose` and the intrusions as isolationReport gives them. When it finds
+ * co-tenancy only, writes one warning line to stderr, through escapeControlCharacters, naming `purpose`, the number of
+ * findings, the findings as isolationReport gives them and ISOLATION_EXPOSURE, and returns.
+ *
+ * Example: assertIsolatedWorker('before it starts Chrome') throws "acceptance.test.js stops before it starts Chrome:
+ * worker isolation check failed: process 4242 is traced by process 4250" while a process of the run is traced, and
+ * writes "acceptance.test.js: warning: worker isolation check before it starts Chrome: the worker is not private
+ * (1 finding): process 4300 (uid 0) is not part of this run. The run continues; ..." while an unrelated process runs.
+ */
+function assertIsolatedWorker(purpose) {
+    const { coTenancy, intrusion } = workerIsolation(TRUSTED_PORTS);
+
+    if (intrusion.length > 0) {
+        throw new Error(`acceptance.test.js stops ${purpose}: worker isolation check failed: `
+            + isolationReport(intrusion));
+    }
+    if (coTenancy.length > 0) {
+        const count = `${coTenancy.length} finding${coTenancy.length === 1 ? '' : 's'}`;
+
+        process.stderr.write(`${escapeControlCharacters(`acceptance.test.js: warning: worker isolation check ${purpose}: `
+            + `the worker is not private (${count}): ${isolationReport(coTenancy)}. ${ISOLATION_EXPOSURE}`)}\n`);
+    }
+}
+
+// The error of the isolation watch once it has found an intrusion, or null.
+let ISOLATION_ERROR = null;
+
+// Interval timer of the isolation watch, or null while it does not run.
+let ISOLATION_TIMER = null;
+
+// DevTools client whose DevTools port the isolation watch checks (DevTools.devToolsPortViolations), or null.
+let ISOLATION_DEVTOOLS = null;
+
+/**
+ * Collects the intrusions of workerIsolation(TRUSTED_PORTS, false) and the violations of
+ * ISOLATION_DEVTOOLS.devToolsPortViolations(), which are intrusions too, and hands them to failIsolation when there
+ * are any. An error while collecting counts as an intrusion. Does nothing once ISOLATION_ERROR is set.
+ */
+function checkIsolation() {
+    if (ISOLATION_ERROR !== null) {
+        return;
+    }
+
+    let intrusion;
+
+    try {
+        intrusion = workerIsolation(TRUSTED_PORTS, false).intrusion;
+
+        if (ISOLATION_DEVTOOLS !== null) {
+            intrusion = [...new Set(intrusion.concat(ISOLATION_DEVTOOLS.devToolsPortViolations()))];
+        }
+    } catch (error) {
+        intrusion = [error.message];
+    }
+
+    if (intrusion.length > 0) {
+        failIsolation(intrusion);
+    }
+}
+
+/**
+ * Acts on the first call only: stops the isolation watch, sets ISOLATION_ERROR, which names the intrusions as
+ * isolationReport gives them, writes it to stderr, sets process.exitCode to 1 and stops the Chrome of
+ * ISOLATION_DEVTOOLS (DevTools.stopForIsolation). From then on every case fails in the beforeEach hook, every DevTools
+ * command is rejected and the after hook fails.
+ */
+function failIsolation(intrusion) {
+    if (ISOLATION_ERROR !== null) {
+        return;
+    }
+
+    stopIsolationWatch();
+    ISOLATION_ERROR = new Error('acceptance.test.js stopped the run: worker isolation check failed while it ran: '
+        + isolationReport(intrusion));
+    process.exitCode = 1;
+    process.stderr.write(`${ISOLATION_ERROR.message}\n`);
+
+    if (ISOLATION_DEVTOOLS !== null) {
+        ISOLATION_DEVTOOLS.stopForIsolation(ISOLATION_ERROR);
+    }
+}
+
+/**
+ * Runs checkIsolation, which checks for intrusions only, every ISOLATION_WATCH_INTERVAL_MS until stopIsolationWatch or
+ * failIsolation.
+ */
+function startIsolationWatch() {
+    ISOLATION_TIMER = setInterval(checkIsolation, ISOLATION_WATCH_INTERVAL_MS);
+    ISOLATION_TIMER.unref();
+}
+
+/** Stops the isolation watch. */
+function stopIsolationWatch() {
+    clearInterval(ISOLATION_TIMER);
+    ISOLATION_TIMER = null;
+}
+
+/**
+ * Sets process.title to PROCESS_TITLE, then throws unless /proc/self/cmdline, without its trailing NUL bytes, equals
+ * PROCESS_TITLE exactly. The error never quotes the command line.
+ */
+function replaceCommandLine() {
+    process.title = PROCESS_TITLE;
+
+    let cmdline;
+
+    try {
+        cmdline = fs.readFileSync('/proc/self/cmdline', 'latin1');
+    } catch (error) {
+        throw new Error(`acceptance.test.js cannot read /proc/self/cmdline after setting process.title: ${error.code}`);
+    }
+
+    if (cmdline.replace(/\0+$/, '') !== PROCESS_TITLE) {
+        throw new Error(`acceptance.test.js could not replace its command line: /proc/self/cmdline does not read `
+            + `'${PROCESS_TITLE}' after process.title was set to it`);
+    }
+}
+
 checkRuntime();
 
 const ARGS = parseArguments(process.argv.slice(2));
+
+replaceCommandLine();
+
+// TCP ports of the application and database servers of the run.
+const TRUSTED_PORTS = new Set([ARGS.httpPort].concat(databasePorts(ARGS.dbUri)));
+
+assertIsolatedWorker('before it registers a case');
+startIsolationWatch();
 
 // ---------------------------------------------------------------------------------------------------------------
 // Constants
@@ -423,8 +1107,11 @@ const SIGNAL_CLEANUP_TIMEOUT_MS = 15000;
 // Hosts a DevTools endpoint may name.
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
 
-// Longest excerpt of a browser response body quoted in an error message.
+// Longest excerpt of an external text quoted in an error message by diagnosticText and responseExcerpt.
 const RESPONSE_EXCERPT_LENGTH = 300;
+
+// Literal values diagnosticText replaces by [redacted], longest first (see diagnosticSecrets).
+const DIAGNOSTIC_SECRETS = diagnosticSecrets(ARGS);
 
 // Deadline for the board to become idle after a drop, and the time without a board request event that counts as idle.
 const DRAG_IDLE_TIMEOUT_MS = 30000;
@@ -460,8 +1147,8 @@ class FatalError extends Error {
 
 /**
  * Calls `probe` every `interval` ms until it returns a truthy value, and returns that value. Throws, naming
- * `description`, the last probe error and the text of `detail()`, when `timeout` ms pass first. A FatalError thrown by
- * the probe ends the poll at once.
+ * `description`, the message of the last probe error and the text of `detail()`, each through diagnosticText, when
+ * `timeout` ms pass first. A FatalError thrown by the probe ends the poll at once.
  */
 async function waitFor(description, probe, { timeout = 30000, interval = 100, detail = null } = {}) {
     const deadline = Date.now() + timeout;
@@ -486,8 +1173,8 @@ async function waitFor(description, probe, { timeout = 30000, interval = 100, de
 
         if (Date.now() >= deadline) {
             throw new Error(`timed out after ${timeout} ms waiting for ${description}`
-                + (lastError ? `: ${lastError.message}` : '')
-                + (detail ? `; last state: ${detail()}` : ''));
+                + (lastError ? `: ${diagnosticText(lastError.message)}` : '')
+                + (detail ? `; last state: ${diagnosticText(detail())}` : ''));
         }
 
         await pause(interval);
@@ -502,23 +1189,45 @@ function pad2(value) {
     return String(value).padStart(2, '0');
 }
 
-/** Parses 'YYYY-MM-DD HH:MM:SS' into wall-clock milliseconds, computed with Date.UTC. */
+/**
+ * Returns the wall-clock milliseconds (UTC milliseconds of the same fields) of a date and time in the proleptic
+ * Gregorian calendar, built with setUTCFullYear and setUTCHours on new Date(0): the year is taken as written, the
+ * years 0000 to 0099 included, month is 1 to 12, and a field out of its range rolls over into the next larger one.
+ * For example, wallClockMillis(99, 1, 1) is the millisecond of 0099-01-01 00:00:00, not of 1999-01-01.
+ */
+function wallClockMillis(year, month, day, hours = 0, minutes = 0, seconds = 0) {
+    const date = new Date(0);
+
+    date.setUTCFullYear(year, month - 1, day);
+    date.setUTCHours(hours, minutes, seconds, 0);
+
+    return date.getTime();
+}
+
+/**
+ * Parses 'YYYY-MM-DD HH:MM:SS' into wall-clock milliseconds with wallClockMillis, for every year 0000 to 9999. Throws,
+ * quoting the text through escapeControlCharacters, when it does not have that form.
+ */
 function parseWallClock(text) {
     const match = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(text);
 
     if (!match) {
-        throw new Error(`not a wall-clock date YYYY-MM-DD HH:MM:SS: ${text}`);
+        throw new Error(`not a wall-clock date YYYY-MM-DD HH:MM:SS: ${escapeControlCharacters(text)}`);
     }
 
-    return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5]),
+    return wallClockMillis(Number(match[1]), Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5]),
         Number(match[6]));
 }
 
-/** Formats wall-clock milliseconds as 'YYYY-MM-DD HH:MM:SS' with the getUTC* accessors. */
+/**
+ * Formats wall-clock milliseconds as 'YYYY-MM-DD HH:MM:SS' with the getUTC* accessors and the year padded to four
+ * digits; parseWallClock reads the result back for every year 0000 to 9999.
+ */
 function formatWallClock(millis) {
     const date = new Date(millis);
+    const year = String(date.getUTCFullYear()).padStart(4, '0');
 
-    return `${date.getUTCFullYear()}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())} `
+    return `${year}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())} `
         + `${pad2(date.getUTCHours())}:${pad2(date.getUTCMinutes())}:${pad2(date.getUTCSeconds())}`;
 }
 
@@ -549,6 +1258,9 @@ const PSQL_CHILDREN = new Set();
 // Temporary directories removed by the after hook.
 const TEMP_DIRS = new Set();
 
+// Promise of the single run of releaseResources, or null before it starts.
+let RELEASE = null;
+
 // Deadline of an ordinary psql query, in ms.
 const PSQL_QUERY_TIMEOUT_MS = 60000;
 
@@ -570,10 +1282,22 @@ const PSQL_LINE_LIMIT = 65536;
 // Characters of psql standard error kept as a rolling tail.
 const PSQL_STDERR_TAIL = 16384;
 
-// PGCONNECT_TIMEOUT, in seconds, of psql processes when the environment sets none.
+// PGCONNECT_TIMEOUT, in seconds, of every psql process; a connect_timeout parameter of --db-uri takes precedence over it.
 const PSQL_CONNECT_TIMEOUT_SECONDS = '10';
 
+// Outcome of the first psqlConnectionUri call, { uri } or { error }; null before that call.
+let PSQL_CONNECTION = null;
+
+/**
+ * Creates the directory <system temporary directory>/pmg-acceptance-<prefix>-* and adds it to TEMP_DIRS. Throws,
+ * creating nothing, once releaseResources has started.
+ */
 function makeTempDir(prefix) {
+    if (RELEASE !== null) {
+        throw new Error(`the temporary directory pmg-acceptance-${prefix}-* was not created: acceptance.test.js is `
+            + 'releasing its resources');
+    }
+
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), `pmg-acceptance-${prefix}-`));
 
     TEMP_DIRS.add(directory);
@@ -581,20 +1305,108 @@ function makeTempDir(prefix) {
     return directory;
 }
 
-/** Returns --db-uri with application_name=pmg-acceptance-<app> appended. */
-function databaseUri(app) {
-    const separator = ARGS.dbUri.includes('?') ? '&' : '?';
-
-    return `${ARGS.dbUri}${separator}application_name=${encodeURIComponent(`pmg-acceptance-${app}`)}`;
+/** Returns the text as a field of a libpq password file: every \ written as \\ and every : as \:. */
+function pgpassField(text) {
+    return text.replace(/[\\:]/g, (character) => `\\${character}`);
 }
 
-/** Returns a copy of process.env whose PGCONNECT_TIMEOUT is PSQL_CONNECT_TIMEOUT_SECONDS when process.env sets none. */
-function psqlEnvironment() {
-    const environment = Object.assign({}, process.env);
+/**
+ * Returns --db-uri (validated by validateDatabaseUri) without its password:
+ * - the user information keeps its user name followed by '@', and is dropped with its '@' when the user name is empty;
+ * - every query parameter whose percent-decoded key is password is removed.
+ * The effective password is the percent-decoded value of the last password parameter, else the percent-decoded
+ * password of the user information. When it is not empty, it is written as the line `*:*:*:*:<password>` (escaped by
+ * pgpassField) to the file pgpass, mode 600, in a new directory of makeTempDir('pgpass'), and every passfile parameter
+ * is replaced by one passfile parameter naming that file; otherwise the passfile parameters stay as given.
+ * Example: 'postgresql://u:p@localhost/db?passfile=x' gives 'postgresql://u@localhost/db?passfile=<encoded file>'.
+ * Throws when the password does not percent-decode to UTF-8 or holds a line break, or when the file is accessible to
+ * other users. The message never holds the password.
+ */
+function passwordlessDatabaseUri(value) {
+    const { prefix, userInfo, rest, query } = splitDatabaseUri(value);
+    const userEnd = userInfo === null ? -1 : userInfo.indexOf(':');
+    const user = userInfo === null ? '' : (userEnd < 0 ? userInfo : userInfo.slice(0, userEnd));
+    const passwords = userEnd < 0 ? [] : [userInfo.slice(userEnd + 1)];
+    const parameters = [];
 
-    if (environment.PGCONNECT_TIMEOUT === undefined) {
-        environment.PGCONNECT_TIMEOUT = PSQL_CONNECT_TIMEOUT_SECONDS;
+    for (const token of query === null ? [] : query.split('&')) {
+        const key = percentDecode(token.slice(0, token.indexOf('=')));
+
+        if (key === 'password') {
+            passwords.push(token.slice(token.indexOf('=') + 1));
+        } else {
+            parameters.push({ key, token });
+        }
     }
+
+    const password = passwords.length > 0 ? percentDecode(passwords[passwords.length - 1]) : '';
+
+    if (password === null) {
+        throw new Error('the password of --db-uri does not percent-decode to UTF-8');
+    }
+    if (/[\r\n]/.test(password)) {
+        throw new Error('the password of --db-uri holds a line break, which a libpq password file cannot hold');
+    }
+
+    let tokens = parameters.map((parameter) => parameter.token);
+
+    if (password !== '') {
+        const file = path.join(makeTempDir('pgpass'), 'pgpass');
+
+        fs.writeFileSync(file, `*:*:*:*:${pgpassField(password)}\n`, { mode: 0o600, flag: 'wx' });
+
+        if ((fs.statSync(file).mode & 0o077) !== 0) {
+            throw new Error(`the password file ${file} is accessible to other users`);
+        }
+
+        tokens = parameters.filter((parameter) => parameter.key !== 'passfile').map((parameter) => parameter.token)
+            .concat(`passfile=${encodeURIComponent(file)}`);
+    }
+
+    return `${prefix}${user === '' ? '' : `${user}@`}${rest}${tokens.length > 0 ? `?${tokens.join('&')}` : ''}`;
+}
+
+/**
+ * Returns passwordlessDatabaseUri(ARGS.dbUri), computed on the first call; every later call returns the same URI, or
+ * throws the same error, without writing another password file.
+ */
+function psqlConnectionUri() {
+    if (PSQL_CONNECTION === null) {
+        try {
+            PSQL_CONNECTION = { uri: passwordlessDatabaseUri(ARGS.dbUri) };
+        } catch (error) {
+            PSQL_CONNECTION = { error };
+        }
+    }
+    if (PSQL_CONNECTION.error) {
+        throw PSQL_CONNECTION.error;
+    }
+
+    return PSQL_CONNECTION.uri;
+}
+
+/** Returns psqlConnectionUri() with application_name=pmg-acceptance-<app> appended. */
+function databaseUri(app) {
+    const uri = psqlConnectionUri();
+    const separator = uri.includes('?') ? '&' : '?';
+
+    return `${uri}${separator}application_name=${encodeURIComponent(`pmg-acceptance-${app}`)}`;
+}
+
+/**
+ * Returns a copy of process.env without the variables whose names start with PG, and with PGCONNECT_TIMEOUT set to
+ * PSQL_CONNECT_TIMEOUT_SECONDS.
+ */
+function psqlEnvironment() {
+    const environment = {};
+
+    for (const [name, value] of Object.entries(process.env)) {
+        if (!name.startsWith('PG')) {
+            environment[name] = value;
+        }
+    }
+
+    environment.PGCONNECT_TIMEOUT = PSQL_CONNECT_TIMEOUT_SECONDS;
 
     return environment;
 }
@@ -620,7 +1432,8 @@ function sqlLabel(sql) {
  * done settles once the process has closed or has failed to start. It resolves when psql exited with 0 and no failure or
  * stream error was recorded, and otherwise rejects with an error naming the app, the operation, the exit status or the
  * recorded failure (start failure, missing standard stream, deadline, output limit, line handler error), the stream
- * errors and the standard error tail (the last PSQL_STDERR_TAIL characters).
+ * errors and the standard error tail (the last PSQL_STDERR_TAIL characters). Once releaseResources has started,
+ * spawnPsql starts no process: done rejects at once with an error saying the runner is releasing its resources.
  *
  * write(text) and end(text) write to standard input and return false, writing nothing, once the process has closed or
  * its standard input has ended. terminate(error) records error as the failure, sends SIGTERM and schedules SIGKILL.
@@ -716,6 +1529,13 @@ function spawnPsql(app, { operation = 'psql session', timeout = PSQL_QUERY_TIMEO
     };
     handle.terminate = terminate;
     handle.isClosed = () => closed;
+
+    if (RELEASE !== null) {
+        failure = new Error(`${context} was not started: acceptance.test.js is releasing its resources`);
+        finish(null, null);
+
+        return handle;
+    }
 
     try {
         handle.child = childProcess.spawn('psql',
@@ -1147,7 +1967,10 @@ class HttpSession {
         return { [this.csrf.header]: this.csrf.token };
     }
 
-    /** Logs in through /j_spring_security_check with the CSRF token of the login page. */
+    /**
+     * Logs in through /j_spring_security_check with the CSRF token of the login page. Throws when the answer is not
+     * loginSuccessfull, with its status, the user through diagnosticText and the answer through responseExcerpt.
+     */
     async login(user, password) {
         const loginPage = await this.request('/login.html?lang=en');
 
@@ -1168,27 +1991,37 @@ class HttpSession {
         });
 
         if (response.text.trim() !== 'loginSuccessfull') {
-            throw new Error(`login as ${user} failed (${response.status}): ${response.text.trim().slice(0, 500)}`);
+            throw new Error(`login as ${diagnosticText(user)} failed (${response.status}): `
+                + responseExcerpt(response.text));
         }
         if (!this.cookies.has('JSESSIONID') || this.cookies.get('JSESSIONID') === sessionBefore) {
             throw new Error('the session id did not change at login');
         }
     }
 
-    /** Opens the board page of the schedule and takes the CSRF token of that page. */
+    /**
+     * Opens the board page of the schedule and takes the CSRF token of that page. Throws unless the answer is an HTTP
+     * 200 text/html page, with its status, its content type through diagnosticText and its body through
+     * responseExcerpt.
+     */
     async openBoard(scheduleId) {
         const response = await this.request(boardUrl(scheduleId));
         const contentType = response.headers.get('content-type') || '';
 
         if (response.status !== 200 || !/text\/html/i.test(contentType)) {
-            throw new Error(`GET ${BOARD_PATH} answered ${response.status} (${contentType}): `
-                + response.text.slice(0, 500));
+            throw new Error(`GET ${BOARD_PATH} answered ${response.status} (${diagnosticText(contentType)}): `
+                + responseExcerpt(response.text));
         }
 
         this.csrf = parseCsrf(response.text);
     }
 
-    /** Posts a view event body to the board and returns the parsed JSON answer. */
+    /**
+     * Posts a view event body to the board and returns the parsed JSON answer. Throws, naming the event, when the
+     * answer is a redirect to the login page (its Location through diagnosticText), not HTTP 200, sessionExpired, an
+     * error page or not JSON (the parser message through diagnosticText). The messages for an answer that is not HTTP
+     * 200, an error page or not JSON quote it through responseExcerpt.
+     */
     async postEvent(body) {
         const response = await this.request(BOARD_PATH, {
             method: 'POST',
@@ -1202,22 +2035,23 @@ class HttpSession {
         const location = response.headers.get('location') || '';
 
         if (response.status >= 300 && response.status < 400 && /login/i.test(location)) {
-            throw new Error(`event ${body.event.name} was redirected to the login page: ${location}`);
+            throw new Error(`event ${body.event.name} was redirected to the login page: ${diagnosticText(location)}`);
         }
         if (response.status !== 200) {
-            throw new Error(`event ${body.event.name} answered ${response.status}: ${text.slice(0, 1000)}`);
+            throw new Error(`event ${body.event.name} answered ${response.status}: ${responseExcerpt(text)}`);
         }
         if (text === 'sessionExpired') {
             throw new Error(`event ${body.event.name} answered sessionExpired`);
         }
         if (text.startsWith('<![CDATA[ERROR PAGE:')) {
-            throw new Error(`event ${body.event.name} answered an error page: ${text.slice(0, 2000)}`);
+            throw new Error(`event ${body.event.name} answered an error page: ${responseExcerpt(text)}`);
         }
 
         try {
             return JSON.parse(text);
         } catch (error) {
-            throw new Error(`event ${body.event.name} answered no JSON (${error.message}): ${text.slice(0, 1000)}`);
+            throw new Error(`event ${body.event.name} answered no JSON (${diagnosticText(error.message)}): `
+                + responseExcerpt(text));
         }
     }
 }
@@ -1606,6 +2440,9 @@ const HELD_READY_PATTERN = /^pmg-ready:(\d+)$/;
 // Standard output line of a held transaction reporting the end of its pg_sleep hold.
 const HELD_HOLD_LINE = 'pmg-held';
 
+// Backend pids of the HeldTransaction sessions that have reported their ready line and have not closed.
+const HELD_BACKEND_PIDS = new Set();
+
 // Time a held transaction has to report its SQL as run, and to close after COMMIT or ROLLBACK, in ms.
 const HELD_ANSWER_TIMEOUT_MS = 30000;
 
@@ -1768,6 +2605,10 @@ class HeldTransaction {
         this.closed.then((error) => {
             const ended = new Error(`${this.context} ended${error ? `: ${error.message}` : ''}`);
 
+            if (this.pid !== null) {
+                HELD_BACKEND_PIDS.delete(this.pid);
+            }
+
             this.ready.reject(ended);
             this.held.reject(ended);
         });
@@ -1778,11 +2619,17 @@ class HeldTransaction {
         return this.session.isClosed();
     }
 
+    /**
+     * Handles a standard output line: the ready line sets pid, adds it to HELD_BACKEND_PIDS until the session closes
+     * and resolves ready; the hold line resolves held.
+     */
     onLine(line) {
         const ready = HELD_READY_PATTERN.exec(line);
 
         if (ready) {
-            this.ready.resolve(Number(ready[1]));
+            this.pid = Number(ready[1]);
+            HELD_BACKEND_PIDS.add(this.pid);
+            this.ready.resolve(this.pid);
         } else if (line === HELD_HOLD_LINE) {
             this.held.resolve();
         }
@@ -1924,8 +2771,9 @@ async function backgroundWrite(writeSql) {
 /**
  * Returns the lock-wait tree rooted at the backend rootPid: the client backends of the acceptance database whose
  * pg_blocking_pids holds rootPid, then, repeatedly, those whose pg_blocking_pids holds a backend already in the tree.
- * Backends named pmg-acceptance* and rootPid itself are left out. Each backend appears once, ordered by pid, as
- * {pid, application, waitEventType, waitEvent, blockedBy}.
+ * The suite's own sessions are left out by pid: rootPid, the backend that runs the query and the backends of
+ * HELD_BACKEND_PIDS. Each backend appears once, ordered by pid, as {pid, application, waitEventType, waitEvent,
+ * blockedBy}.
  */
 async function lockWaitTree(rootPid) {
     const root = Number(rootPid);
@@ -1934,14 +2782,17 @@ async function lockWaitTree(rootPid) {
         throw new Error(`not a backend pid: ${rootPid}`);
     }
 
+    const excluded = Array.from(new Set([root].concat(Array.from(HELD_BACKEND_PIDS)
+        .filter((pid) => Number.isInteger(pid) && pid > 0))));
+
     return psqlJson(`
 WITH RECURSIVE backends AS (
     SELECT pid, application_name, wait_event_type, wait_event, pg_blocking_pids(pid) AS blocked_by
     FROM pg_stat_activity
     WHERE datname = current_database()
       AND backend_type = 'client backend'
-      AND pid <> ${root}
-      AND coalesce(application_name, '') NOT LIKE 'pmg-acceptance%'
+      AND pid <> pg_backend_pid()
+      AND pid <> ALL (ARRAY[${excluded.join(', ')}]::integer[])
 ), tree AS (
     SELECT pid FROM backends WHERE ${root} = ANY (blocked_by)
     UNION
@@ -1956,14 +2807,14 @@ WHERE b.pid IN (SELECT pid FROM tree);
 }
 
 /**
- * Returns pid, application name, state, wait event, blocking pids and query text of every backend of the acceptance
- * database.
+ * Returns pid, application name, state, wait event type, wait event and blocking pids of every backend of the
+ * acceptance database. The rows hold no query text.
  */
 async function activityDump() {
     return psqlJson(`
 SELECT coalesce(json_agg(json_build_object(
            'pid', pid, 'application', application_name, 'state', state, 'waitEventType', wait_event_type,
-           'waitEvent', wait_event, 'blockedBy', to_json(pg_blocking_pids(pid)), 'query', left(query, 300)) ORDER BY pid),
+           'waitEvent', wait_event, 'blockedBy', to_json(pg_blocking_pids(pid))) ORDER BY pid),
        '[]')
 FROM pg_stat_activity
 WHERE datname = current_database();
@@ -1973,8 +2824,8 @@ WHERE datname = current_database();
 /**
  * Cleans up after a failed concurrent case and returns the error to throw. Reads pg_stat_activity, rolls back every
  * transaction that has not been ended, and waits up to CLEANUP_SETTLE_TIMEOUT_MS for the tracked requests. The returned
- * error holds the message of error, each cleanup failure, the outcome of each request and the pg_stat_activity rows, or
- * the error of reading them; its cause is error.
+ * error holds the message of error, each cleanup failure, the outcome of each request and the pg_stat_activity rows of
+ * activityDump, without query text, or the error of reading them; its cause is error.
  */
 async function concurrentFailure(error, transactions, requests) {
     const notes = [];
@@ -2017,14 +2868,23 @@ async function concurrentFailure(error, transactions, requests) {
 
 /**
  * Returns the normalised DevTools endpoint printed by Chrome when it is a ws: URL of a loopback host (127.0.0.1,
- * localhost or [::1]) with an explicit port 1-65535, no user name or password, and a path under /devtools/browser/.
- * Throws, naming the endpoint and the unmet condition, otherwise.
+ * localhost or [::1]) with no user name or password, an explicit port 1-65535, and a path under /devtools/browser/.
+ * Throws, naming the endpoint and the unmet condition, each through diagnosticText, otherwise.
+ *
+ * The port is read as written in the text: the authority is the text between a leading ws:// (in any letter case) and
+ * the first /, \, ? or #, and the port is the run of digits after the : that ends it, looking only at the part after
+ * its last @ and its last ]. A written port 1-65535 is accepted with or without leading zeros, the default ws: port 80
+ * included, which the URL parser reports as no port; an authority without a written port, such as ws://[::1]/... or
+ * ws://localhost:/..., is refused. The user name and password check comes before the port check.
  *
  * Example: devToolsEndpoint('ws://127.0.0.1:41235/devtools/browser/0f3a') returns that URL;
+ * devToolsEndpoint('ws://localhost:80/devtools/browser/x') returns 'ws://localhost/devtools/browser/x';
+ * devToolsEndpoint('ws://[::1]/devtools/browser/x') throws "... it names no port";
  * devToolsEndpoint('ws://10.1.2.3:9222/devtools/browser/x') throws "... host 10.1.2.3 is not a loopback host".
  */
 function devToolsEndpoint(text) {
-    const refusal = (reason) => new Error(`refusing to connect to the DevTools endpoint ${text.slice(0, 200)}: ${reason}`);
+    const refusal = (reason) => new Error(`refusing to connect to the DevTools endpoint ${diagnosticText(text)}: `
+        + diagnosticText(reason));
     let url;
 
     try {
@@ -2039,11 +2899,19 @@ function devToolsEndpoint(text) {
     if (!LOOPBACK_HOSTS.has(url.hostname)) {
         throw refusal(`host ${url.hostname} is not a loopback host`);
     }
-    if (!/^\d+$/.test(url.port) || Number(url.port) < 1 || Number(url.port) > 65535) {
-        throw refusal(`port ${url.port === '' ? '(none)' : url.port} is not a port 1-65535`);
-    }
     if (url.username !== '' || url.password !== '') {
         throw refusal('it carries a user name or password');
+    }
+
+    const authority = /^ws:\/\/([^/\\?#]*)/i.exec(text);
+    const hostAndPort = authority === null ? '' : authority[1].slice(authority[1].lastIndexOf('@') + 1);
+    const writtenPort = /:(\d+)$/.exec(hostAndPort.slice(hostAndPort.lastIndexOf(']') + 1));
+
+    if (writtenPort === null) {
+        throw refusal('it names no port');
+    }
+    if (Number(writtenPort[1]) < 1 || Number(writtenPort[1]) > 65535) {
+        throw refusal(`port ${writtenPort[1]} is not a port 1-65535`);
     }
     if (!url.pathname.startsWith('/devtools/browser/')) {
         throw refusal(`path ${url.pathname} is not under /devtools/browser/`);
@@ -2064,9 +2932,16 @@ class DevTools {
         this.stderrTail = '';
         this.exited = false;
         this.processError = null;
+        this.devToolsWatch = null;
+        this.isolationError = null;
     }
 
-    /** Starts Chrome, connects to its DevTools endpoint and attaches to a new page with Page, Runtime and Network enabled. */
+    /**
+     * Starts Chrome, connects to its DevTools endpoint, has the isolation watch check its DevTools port
+     * (watchDevToolsPort) and attaches to a new page with Page, Runtime and Network enabled. Rejects without starting
+     * Chrome when the isolation watch has stopped the run or assertIsolatedWorker finds an intrusion, and once Chrome
+     * runs when the isolation watch has stopped it. Chrome's standard error is quoted through diagnosticText.
+     */
     async launch(chromePath) {
         const profileDir = makeTempDir('chrome-profile');
         const chromeArgs = ['--headless', '--remote-debugging-port=0', `--user-data-dir=${profileDir}`, '--no-first-run',
@@ -2077,6 +2952,12 @@ class DevTools {
         }
 
         chromeArgs.push('about:blank');
+
+        if (ISOLATION_ERROR !== null) {
+            throw ISOLATION_ERROR;
+        }
+
+        assertIsolatedWorker('before it starts Chrome');
 
         try {
             this.process = childProcess.spawn(chromePath, chromeArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -2120,7 +3001,8 @@ class DevTools {
             });
             chrome.on('exit', (code, signal) => {
                 this.exited = true;
-                settle(new Error(`Chrome exited with ${code === null ? signal : code} before listening: ${startupStderr}`), null);
+                settle(new Error(`Chrome exited with ${code === null ? signal : code} before listening: `
+                    + diagnosticText(startupStderr)), null);
             });
 
             if (!chrome.stderr) {
@@ -2134,8 +3016,8 @@ class DevTools {
                 settle(new Error(`Chrome standard error failed before listening: ${error.message}`), null);
             });
 
-            timer = setTimeout(() => settle(new Error(`Chrome printed no DevTools endpoint within 30 s: ${startupStderr}`),
-                null), 30000);
+            timer = setTimeout(() => settle(new Error('Chrome printed no DevTools endpoint within 30 s: '
+                + diagnosticText(startupStderr)), null), 30000);
 
             chrome.stderr.setEncoding('utf8');
             chrome.stderr.on('data', (chunk) => {
@@ -2147,7 +3029,8 @@ class DevTools {
 
                 startupStderr = (startupStderr + chunk).slice(-8000);
 
-                const match = /DevTools listening on (ws:\/\/\S+)/.exec(startupStderr);
+                // The endpoint counts once its line has ended.
+                const match = /DevTools listening on (ws:\/\/\S+)\r?\n/.exec(startupStderr);
 
                 if (match) {
                     settle(null, match[1]);
@@ -2166,9 +3049,11 @@ class DevTools {
 
         await this.connect(loopbackEndpoint);
 
-        this.socket.addEventListener('message', (event) => this.onMessage(JSON.parse(String(event.data))));
+        this.socket.addEventListener('message', (event) => this.onFrame(event.data));
         this.socket.addEventListener('close', (event) => this.rejectPending((pending) => `DevTools socket closed `
             + `(code ${event.code}) during ${pending.method} (${pending.target})`));
+
+        this.watchDevToolsPort(Number(new URL(loopbackEndpoint).port || 80));
 
         const { targetId } = await this.send('Target.createTarget', { url: 'about:blank' }, null);
         const { sessionId } = await this.send('Target.attachToTarget', { targetId, flatten: true }, null);
@@ -2184,7 +3069,8 @@ class DevTools {
     /**
      * Opens the DevTools socket to the endpoint and settles once: resolves on open; rejects on a socket error, on a
      * close before open (with its code and reason), when Chrome has exited or exits, or when the socket has not opened
-     * within DEVTOOLS_CONNECT_TIMEOUT_MS. On rejection the socket is closed and every listener and timer is removed.
+     * within DEVTOOLS_CONNECT_TIMEOUT_MS. The socket error, the close reason and Chrome's standard error tail are
+     * quoted through diagnosticText. On rejection the socket is closed and every listener and timer is removed.
      */
     connect(endpoint) {
         const socket = new WebSocket(endpoint);
@@ -2232,12 +3118,12 @@ class DevTools {
             onError = (event) => {
                 const cause = (event && (event.message || (event.error && event.error.message))) || 'socket error';
 
-                settle(new Error(`cannot connect to ${endpoint}: ${cause}`));
+                settle(new Error(`cannot connect to ${endpoint}: ${diagnosticText(cause)}`));
             };
             onClose = (event) => settle(new Error(`the DevTools socket ${endpoint} closed before it opened (code `
-                + `${event.code}${event.reason ? `, reason ${event.reason}` : ''})`));
+                + `${event.code}${event.reason ? `, reason ${diagnosticText(event.reason)}` : ''})`));
             onExit = (code, signal) => settle(new Error(`Chrome exited with ${code === null ? signal : code} before the `
-                + `DevTools socket ${endpoint} opened: ${this.stderrTail.trim()}`));
+                + `DevTools socket ${endpoint} opened: ${diagnosticText(this.stderrTail)}`));
 
             socket.addEventListener('open', onOpen);
             socket.addEventListener('error', onError);
@@ -2251,7 +3137,8 @@ class DevTools {
                 + `${DEVTOOLS_CONNECT_TIMEOUT_MS} ms`)), DEVTOOLS_CONNECT_TIMEOUT_MS);
 
             if (this.hasExited()) {
-                settle(new Error(`Chrome exited before the DevTools socket ${endpoint} opened: ${this.stderrTail.trim()}`));
+                settle(new Error(`Chrome exited before the DevTools socket ${endpoint} opened: `
+                    + diagnosticText(this.stderrTail)));
             }
         });
     }
@@ -2267,15 +3154,112 @@ class DevTools {
     }
 
     /**
+     * Starts checking the DevTools port `port` of the running Chrome: notes its listening sockets, the runner's own
+     * connections to them (the entries of /proc/net/tcp and tcp6 whose inode is a socket of this process) and the
+     * entries without a socket (inode 0), such as TIME_WAIT entries, already at a listening address, sets
+     * ISOLATION_DEVTOOLS to this client and runs checkIsolation at once. Throws when the tables show no listening socket
+     * of the port or no connection of the runner to it.
+     */
+    watchDevToolsPort(port) {
+        const table = socketTable(['tcp', 'tcp6']);
+        const listening = new Set(table.filter((entry) => entry.state === '0A' && entry.localPort === port)
+            .map((entry) => entry.local));
+        const inodes = socketInodes(process.pid);
+        const own = new Set(table.filter((entry) => inodes.has(entry.inode) && listening.has(entry.remote))
+            .map((entry) => entry.local));
+
+        if (listening.size === 0 || own.size === 0) {
+            throw new Error(`acceptance.test.js cannot find ${listening.size === 0 ? 'the listening socket of'
+                : 'its own connection to'} the DevTools port ${port} in /proc/net/tcp and tcp6`);
+        }
+
+        const key = (entry) => `${entry.protocol} ${entry.local} ${entry.remote}`;
+        const foreign = (entry) => entry.state !== '0A' && (listening.has(entry.local) || listening.has(entry.remote))
+            && !own.has(entry.local) && !own.has(entry.remote);
+
+        this.devToolsWatch = {
+            port,
+            listening,
+            foreign,
+            key,
+            earlier: new Set(table.filter((entry) => foreign(entry) && entry.inode === '0').map(key))
+        };
+        ISOLATION_DEVTOOLS = this;
+        checkIsolation();
+    }
+
+    /**
+     * Returns, while watchDevToolsPort checks a port, 'a <protocol> connection from port <peer> to the DevTools port
+     * <port> (<state>)' for every entry of /proc/net/tcp and tcp6, in any state but LISTEN, one end of which is a
+     * listening address of the port and neither end of which is one of the runner's own connections, other than the
+     * entries without a socket noted by watchDevToolsPort; an empty list otherwise.
+     */
+    devToolsPortViolations() {
+        const watch = this.devToolsWatch;
+
+        if (!watch) {
+            return [];
+        }
+
+        const violations = [];
+
+        for (const entry of socketTable(['tcp', 'tcp6'])) {
+            if (watch.foreign(entry) && !watch.earlier.has(watch.key(entry))) {
+                const peerPort = watch.listening.has(entry.local) ? entry.remotePort : entry.localPort;
+
+                violations.push(`a ${entry.protocol} connection from port ${peerPort} to the DevTools port `
+                    + `${watch.port} (${TCP_STATE_NAMES[entry.state] || entry.state})`);
+            }
+        }
+
+        return violations;
+    }
+
+    /**
+     * Acts on the first call only: stops checking the DevTools port, records `error` as isolationError, rejects every
+     * command awaiting its reply, closes the socket and sends SIGKILL to Chrome.
+     */
+    stopForIsolation(error) {
+        if (this.isolationError) {
+            return;
+        }
+
+        this.devToolsWatch = null;
+        this.isolationError = error;
+        this.rejectPending((pending) => `${pending.method} (${pending.target}) was abandoned: ${error.message}`);
+
+        if (this.socket) {
+            try {
+                this.socket.close();
+            } catch (closeError) {
+                process.stderr.write(`acceptance.test.js: closing the DevTools socket failed: ${closeError.message}\n`);
+            }
+        }
+
+        if (!this.hasExited()) {
+            try {
+                this.process.kill('SIGKILL');
+            } catch (killError) {
+                process.stderr.write(`acceptance.test.js: sending SIGKILL to Chrome (pid ${this.process.pid}) failed: `
+                    + `${killError.message}\n`);
+            }
+        }
+    }
+
+    /**
      * Sends a command to the page session sessionId, or to the browser when sessionId is null, and resolves with its
-     * result. Rejects at once when the socket is not open. Rejects, and forgets the command, when no reply arrives
-     * within `timeout` ms.
+     * result. Rejects at once when the isolation watch has stopped Chrome or the socket is not open. Rejects, and
+     * forgets the command, when no reply arrives within `timeout` ms. An error reply rejects with its message and data
+     * quoted through diagnosticText.
      *
      * Example: devtools.send('Target.createTarget', { url: 'about:blank' }, null, { timeout: 10000 }).
      */
     send(method, params, sessionId, { timeout = DEVTOOLS_COMMAND_TIMEOUT_MS } = {}) {
         const target = `session ${sessionId || 'browser'}`;
 
+        if (this.isolationError) {
+            return Promise.reject(new Error(`${method} (${target}) was not sent: ${this.isolationError.message}`));
+        }
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
             return Promise.reject(new Error(`${method} (${target}) was not sent: the DevTools socket is not open`));
         }
@@ -2323,6 +3307,42 @@ class DevTools {
         }
     }
 
+    /**
+     * Handles one frame of the DevTools socket: parses it as JSON and hands the object to onMessage. Throws nothing:
+     * when the frame is not a JSON object, or onMessage throws, rejects every command awaiting its reply
+     * (rejectPending) with an error naming the command and the cause, quoted through diagnosticText.
+     */
+    onFrame(data) {
+        let payload;
+
+        try {
+            payload = JSON.parse(String(data));
+        } catch (error) {
+            this.rejectPending((pending) => `${pending.method} (${pending.target}) was abandoned: the DevTools socket `
+                + `delivered a frame that is not JSON (${diagnosticText(error.message)})`);
+
+            return;
+        }
+
+        if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+            this.rejectPending((pending) => `${pending.method} (${pending.target}) was abandoned: the DevTools socket `
+                + 'delivered a frame that is not a JSON object');
+
+            return;
+        }
+
+        try {
+            this.onMessage(payload);
+        } catch (error) {
+            this.rejectPending((pending) => `${pending.method} (${pending.target}) was abandoned: handling a DevTools `
+                + `frame failed (${diagnosticText(error.message)})`);
+        }
+    }
+
+    /**
+     * Settles the command a reply names, rejecting it with the error's message and data through diagnosticText, or
+     * calls the handlers of an event of the page session.
+     */
     onMessage(payload) {
         if (payload.id !== undefined) {
             const pending = this.pending.get(payload.id);
@@ -2335,8 +3355,8 @@ class DevTools {
             clearTimeout(pending.timer);
 
             if (payload.error) {
-                pending.reject(new Error(`${pending.method} failed: ${payload.error.message}`
-                    + (payload.error.data ? ` (${payload.error.data})` : '')));
+                pending.reject(new Error(`${pending.method} failed: ${diagnosticText(payload.error.message)}`
+                    + (payload.error.data ? ` (${diagnosticText(payload.error.data)})` : '')));
             } else {
                 pending.resolve(payload.result || {});
             }
@@ -2368,14 +3388,18 @@ class DevTools {
         return () => this.listeners.get(method).delete(handler);
     }
 
-    /** Evaluates the expression in the page, awaiting a returned promise, and returns its value. */
+    /**
+     * Evaluates the expression in the page, awaiting a returned promise, and returns its value. Throws, quoting the
+     * page's exception text through diagnosticText, when the evaluation throws.
+     */
     async evaluate(expression) {
         const result = await this.command('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
 
         if (result.exceptionDetails) {
             const details = result.exceptionDetails;
 
-            throw new Error(`page evaluation failed: ${(details.exception && details.exception.description) || details.text}`);
+            throw new Error('page evaluation failed: '
+                + diagnosticText((details.exception && details.exception.description) || details.text));
         }
 
         return result.result ? result.result.value : undefined;
@@ -2406,12 +3430,18 @@ class DevTools {
     }
 
     /**
-     * Rejects every command awaiting its reply, closes the socket and stops Chrome: SIGTERM, then SIGKILL when Chrome
-     * still runs after CHROME_EXIT_WAIT_MS, then a last wait of CHROME_EXIT_WAIT_MS. Every step runs whatever the
-     * earlier ones did. Throws, after the last step, one error naming every failed step.
+     * Stops checking the DevTools port, rejects every command awaiting its reply, closes the socket and stops Chrome:
+     * SIGTERM, then SIGKILL when Chrome still runs after CHROME_EXIT_WAIT_MS, then a last wait of CHROME_EXIT_WAIT_MS.
+     * Every step runs whatever the earlier ones did. Throws, after the last step, one error naming every failed step.
      */
     async close() {
         const failures = [];
+
+        this.devToolsWatch = null;
+
+        if (ISOLATION_DEVTOOLS === this) {
+            ISOLATION_DEVTOOLS = null;
+        }
 
         this.rejectPending((pending) => `${pending.method} (${pending.target}) was abandoned: the DevTools client closed`);
 
@@ -2473,18 +3503,173 @@ function headerValue(headers, name) {
 }
 
 /**
- * Returns an excerpt of a response body for an error message: the content of every _csrf meta tag and every _csrf
- * query parameter replaced by [redacted], whitespace runs collapsed to one space, cut to RESPONSE_EXCERPT_LENGTH
- * characters; '(empty body)' for a blank body.
+ * Returns the literal values diagnosticText replaces by [redacted], longest first, without duplicates and empty values:
+ * each password of --db-uri (the password of its user information and every password or sslpassword query parameter)
+ * as written, and the --password value and each percent-decoded --db-uri password in the forms of secretForms.
+ * args is the result of parseArguments.
  */
+function diagnosticSecrets(args) {
+    const written = [];
+    const authority = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]*)/.exec(args.dbUri);
+    const userInfo = authority && authority[1].includes('@')
+        ? authority[1].slice(0, authority[1].lastIndexOf('@')) : '';
+
+    if (userInfo.includes(':')) {
+        written.push(userInfo.slice(userInfo.indexOf(':') + 1));
+    }
+
+    const queryStart = args.dbUri.indexOf('?');
+
+    for (const parameter of queryStart < 0 ? [] : args.dbUri.slice(queryStart + 1).split('&')) {
+        const separator = parameter.indexOf('=');
+
+        if (separator > 0 && ['password', 'sslpassword'].includes(percentDecode(parameter.slice(0, separator)))) {
+            written.push(parameter.slice(separator + 1));
+        }
+    }
+
+    const plain = [args.password].concat(written.map(percentDecode).filter((value) => value !== null));
+    const secrets = new Set(written.concat(...plain.map(secretForms)));
+
+    return Array.from(secrets).filter((secret) => secret !== '').sort((a, b) => b.length - a.length);
+}
+
+/**
+ * Returns the forms in which a secret can appear in a response: as given, URI-component-encoded,
+ * application/x-www-form-urlencoded (space as '+'), inside a JSON string, and HTML-escaped with named or numeric
+ * quote references (&amp; &lt; &gt; with &quot; &#39;, or with &#034; &#039;).
+ */
+function secretForms(secret) {
+    const markup = secret.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    return [
+        secret,
+        encodeURIComponent(secret),
+        new URLSearchParams([['', secret]]).toString().slice(1),
+        JSON.stringify(secret).slice(1, -1),
+        markup.replace(/"/g, '&quot;').replace(/'/g, '&#39;'),
+        markup.replace(/"/g, '&#034;').replace(/'/g, '&#039;')
+    ];
+}
+
+// Words of a key whose value diagnosticText redacts, matched without case anywhere inside the key.
+const CREDENTIAL_KEY_WORDS = 'password|passwd|pwd|secret|token|csrf|authorization|api[_-]?key|jsessionid'
+    + '|session[_-]?id|cookie|credential';
+
+// A whole key of letters, digits, '_', '.' and '-' that holds a word of CREDENTIAL_KEY_WORDS, as the group key.
+const CREDENTIAL_KEY = String.raw`(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9_.-]*?(?:${CREDENTIAL_KEY_WORDS}))`
+    + String.raw`(?=(?<key>[A-Za-z0-9_.-]+))\k<key>`;
+
+// An HTML character reference of a double or a single quote: &quot;, &#34;, &#x22;, &apos;, &#39; or &#x27;.
+const QUOTE_ENTITY = '&(?:quot|#34|#x22|apos|#39|#x27);';
+
+// A value in double quotes, single quotes (backslash escapes included; an unterminated one runs to the end of the
+// text) or QUOTE_ENTITY quotes (up to the next '&', '<' or line break, and the closing reference).
+const QUOTED_VALUE = String.raw`"(?:[^"\\]|\\[\s\S])*"?|'(?:[^'\\]|\\[\s\S])*'?`
+    + String.raw`|${QUOTE_ENTITY}[^&<\r\n]*(?:${QUOTE_ENTITY})?`;
+
+// "key": value, 'key': value and &quot;key&quot;: value with a quoted or a bare value, as in JSON and JavaScript.
+const CREDENTIAL_QUOTED_PAIR = new RegExp(String.raw`(?<quote>["']|${QUOTE_ENTITY})`
+    + String.raw`(?=[A-Za-z0-9_.-]*?(?:${CREDENTIAL_KEY_WORDS}))(?<key>[A-Za-z0-9_.-]+)\k<quote>`
+    + String.raw`(?<separator>\s*:\s*)(?:${QUOTED_VALUE}|[^\s,}\]]*)`, 'gi');
+
+// key=value with a quoted value or a bare value up to '&', white space, a quote, '<' or '>', as in forms, queries and
+// cookies.
+const CREDENTIAL_ASSIGNMENT = new RegExp(String.raw`${CREDENTIAL_KEY}(?<separator>[ \t]*=[ \t]*)`
+    + String.raw`(?:${QUOTED_VALUE}|[^&\s"'<>]*)`, 'gi');
+
+// key 'value' and key "value": a key, spaces or tabs, then a quoted value, as in "Invalid CSRF Token 'value'". A key
+// after the word "Unexpected", as in the JSON.parse message "Unexpected token '<'", is left as it is.
+const CREDENTIAL_MENTION = new RegExp(String.raw`(?<!\bunexpected[ \t]+)${CREDENTIAL_KEY}(?<separator>[ \t]+)`
+    + String.raw`(?:${QUOTED_VALUE})`, 'gi');
+
+// key: value with a quoted value or the rest of the line, as in HTTP headers.
+const CREDENTIAL_HEADER = new RegExp(String.raw`${CREDENTIAL_KEY}(?<separator>[ \t]*:[ \t]*)`
+    + String.raw`(?:${QUOTED_VALUE}|[^\r\n]*)`, 'gi');
+
+// A meta or input tag with the tag name as group 1: attribute values in double or single quotes may hold '>', and a
+// quote or tag left open runs to the end of the text.
+const MARKUP_TAG = /<(meta|input)\b(?:[^>"']|"[^"]*(?:"|$)|'[^']*(?:'|$))*(?:>|$)/gi;
+
+// One attribute of a tag, read from left to right: its name as group 1, then optionally '=' and a value in double
+// quotes (group 2), single quotes (group 3) or bare (group 4); a quote left open runs to the end of the tag.
+const MARKUP_ATTRIBUTE = /([^\s"'>/=]+)(?:\s*=\s*(?:"([^"]*)"?|'([^']*)'?|([^\s"'>]*)))?/g;
+
+/** Returns whether a MARKUP_TAG match has an attribute named name (in any case) whose value is exactly _csrf. */
+function isCsrfTag(tag, tagName) {
+    for (const attribute of tag.slice(1 + tagName.length).matchAll(MARKUP_ATTRIBUTE)) {
+        const value = [attribute[2], attribute[3], attribute[4]].find((part) => part !== undefined);
+
+        if (attribute[1].toLowerCase() === 'name' && value === '_csrf') {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// The user information of a URI, scheme://user:password@, with the scheme as group 1.
+const URI_USER_INFO = /(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s/?#"'<>]*@/g;
+
+// One Java stack frame, 'at pkg.Class.method(File.java:N)' (also HTML-escaped or after a \t escape), or '... N more'.
+const JAVA_STACK_FRAME = String.raw`(?:(?:(?<=\\t)|\b)at\s+[\w$&;#@/-]+(?:\.[\w$&;#@/<>-]+)+\([^()\r\n]*\)`
+    + String.raw`|\.\.\.\s*\d+\s+(?:more|common frames omitted)\b)`;
+
+// A run of Java stack frames separated by white space, <br> tags or the escapes \n, \r and \t.
+const JAVA_STACK_TRACE = new RegExp(String.raw`${JAVA_STACK_FRAME}(?:(?:\s|<br\s*\/?>|\\[nrt])*${JAVA_STACK_FRAME})*`,
+    'gi');
+
+/**
+ * Returns an external text (a response body, a header value, a URL, a user name, or a message of the browser, of a
+ * parser or of the DevTools Protocol) as one line for an error message. It applies in this order:
+ * - every value of DIAGNOSTIC_SECRETS replaced by [redacted];
+ * - the leading and trailing white space removed;
+ * - every meta or input tag (MARKUP_TAG) that isCsrfTag accepts replaced by one whose content or value is [redacted];
+ * - the user information of every scheme://user:password@ URI replaced by [redacted];
+ * - the value of every key holding a word of CREDENTIAL_KEY_WORDS (j_password, _csrf, X-CSRF-TOKEN, JSESSIONID,
+ *   Cookie, Set-Cookie, Authorization, api_key and so on) replaced by [redacted], in the forms "key": value
+ *   (CREDENTIAL_QUOTED_PAIR), key=value (CREDENTIAL_ASSIGNMENT), key 'value' (CREDENTIAL_MENTION) and key: value
+ *   (CREDENTIAL_HEADER), in that order;
+ * - every run of Java stack frames replaced by [stack trace omitted];
+ * - every character of CONTROL_CHARACTERS written as a \uXXXX escape (escapeControlCharacters);
+ * - white space runs collapsed to one space, and the result trimmed;
+ * - a result longer than RESPONSE_EXCERPT_LENGTH characters cut to that length, then stripped of a trailing partial
+ *   \uXXXX escape or lone high surrogate.
+ * Returns '' for undefined, null and blank text. For example, 'HTTP 500\r\nSet-Cookie: JSESSIONID=1; Path=/' becomes
+ * 'HTTP 500\u000D\u000ASet-Cookie: [redacted]'.
+ */
+function diagnosticText(text) {
+    let result = String(text === undefined || text === null ? '' : text);
+
+    if (DIAGNOSTIC_SECRETS.length > 0) {
+        const secrets = DIAGNOSTIC_SECRETS.map((secret) => secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+
+        result = result.replace(new RegExp(secrets.join('|'), 'g'), '[redacted]');
+    }
+
+    result = result.trim()
+        .replace(MARKUP_TAG, (tag, tagName) => (isCsrfTag(tag, tagName)
+            ? `<${tagName} name="_csrf" ${tagName.toLowerCase() === 'meta' ? 'content' : 'value'}="[redacted]">` : tag))
+        .replace(URI_USER_INFO, '$1[redacted]@')
+        .replace(CREDENTIAL_QUOTED_PAIR, '$<quote>$<key>$<quote>$<separator>[redacted]')
+        .replace(CREDENTIAL_ASSIGNMENT, '$<key>$<separator>[redacted]')
+        .replace(CREDENTIAL_MENTION, '$<key>$<separator>[redacted]')
+        .replace(CREDENTIAL_HEADER, '$<key>$<separator>[redacted]')
+        .replace(JAVA_STACK_TRACE, '[stack trace omitted]');
+
+    result = escapeControlCharacters(result).replace(/\s+/g, ' ').trim();
+
+    if (result.length > RESPONSE_EXCERPT_LENGTH) {
+        result = result.slice(0, RESPONSE_EXCERPT_LENGTH).replace(/\\(?:u[0-9A-F]{0,3})?$|[\uD800-\uDBFF]$/, '')
+            .trimEnd();
+    }
+
+    return result;
+}
+
+/** Returns diagnosticText of a response body, or '(empty body)' when that is ''. */
 function responseExcerpt(text) {
-    const excerpt = String(text === undefined || text === null ? '' : text)
-        .replace(/<meta\b[^>]*>/gi, (tag) => (tagAttribute(tag, 'name') === '_csrf'
-            ? '<meta name="_csrf" content="[redacted]">' : tag))
-        .replace(/([?&]_csrf=)[^&"'\s>]*/gi, '$1[redacted]')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, RESPONSE_EXCERPT_LENGTH);
+    const excerpt = diagnosticText(text);
 
     return excerpt === '' ? '(empty body)' : excerpt;
 }
@@ -2639,7 +3824,7 @@ class BoardRequestRecorder {
         return `board request ${entry.requestId} (event ${event && event.name ? event.name : 'unknown'})`;
     }
 
-    /** Returns {requestId, event, status, redirects, finished, failed} of every entry. */
+    /** Returns {requestId, event, status, redirects, finished, failed} of every entry, failed through diagnosticText. */
     summary() {
         return this.entries.map((entry) => {
             const event = BoardRequestRecorder.eventOf(entry);
@@ -2650,7 +3835,7 @@ class BoardRequestRecorder {
                 status: entry.status,
                 redirects: entry.redirects.map((redirect) => redirect.status),
                 finished: entry.finished,
-                failed: entry.failed
+                failed: entry.failed === null ? null : diagnosticText(entry.failed)
             };
         });
     }
@@ -2659,20 +3844,21 @@ class BoardRequestRecorder {
      * Returns the parsed JSON response body of a finished request. Throws an error naming the request id, the event,
      * the HTTP status and an excerpt of the body (see responseExcerpt) when the request failed or was redirected (to the
      * login page or elsewhere), or its answer is not HTTP 200, is sessionExpired, is an error page or an HTML page, or
-     * is not JSON.
+     * is not JSON. The failure cause, the redirect target, the Location header, the MIME type and the DevTools and
+     * parser messages are quoted through diagnosticText.
      */
     async responseJson(entry) {
         const request = BoardRequestRecorder.describe(entry);
 
         if (entry.failed) {
-            throw new Error(`${request} failed: ${entry.failed}`);
+            throw new Error(`${request} failed: ${diagnosticText(entry.failed)}`);
         }
         if (entry.redirects.length > 0) {
             const redirect = entry.redirects[0];
             const target = redirect.location || redirect.url;
 
             throw new Error(`${request} was redirected (HTTP ${redirect.status}) to `
-                + `${/login/i.test(`${target} ${redirect.url}`) ? 'the login page ' : ''}${target}`);
+                + `${/login/i.test(`${target} ${redirect.url}`) ? 'the login page ' : ''}${diagnosticText(target)}`);
         }
 
         let text;
@@ -2683,13 +3869,13 @@ class BoardRequestRecorder {
             text = (result.base64Encoded ? Buffer.from(result.body, 'base64').toString('utf8') : result.body).trim();
         } catch (error) {
             throw new Error(`${request} answered HTTP ${entry.status === null ? '(status unknown)' : entry.status}, `
-                + `and its body is unavailable: ${error.message}`);
+                + `and its body is unavailable: ${diagnosticText(error.message)}`);
         }
 
         const answered = `${request} answered HTTP ${entry.status === null ? '(status unknown)' : entry.status}`;
 
         if (entry.status !== 200) {
-            throw new Error(`${answered}${entry.location ? ` with Location ${entry.location}` : ''}: `
+            throw new Error(`${answered}${entry.location ? ` with Location ${diagnosticText(entry.location)}` : ''}: `
                 + responseExcerpt(text));
         }
         if (text === 'sessionExpired') {
@@ -2699,14 +3885,14 @@ class BoardRequestRecorder {
             throw new Error(`${answered} with an error page: ${responseExcerpt(text)}`);
         }
         if (/^(?:<!DOCTYPE|<html)/i.test(text)) {
-            throw new Error(`${answered} with an HTML page (${entry.mimeType || 'no MIME type'}`
+            throw new Error(`${answered} with an HTML page (${diagnosticText(entry.mimeType) || 'no MIME type'}`
                 + `${/login/i.test(entry.url || '') ? ', the login page' : ''}): ${responseExcerpt(text)}`);
         }
 
         try {
             return JSON.parse(text);
         } catch (error) {
-            throw new Error(`${answered} with no JSON (${error.message}): ${responseExcerpt(text)}`);
+            throw new Error(`${answered} with no JSON (${diagnosticText(error.message)}): ${responseExcerpt(text)}`);
         }
     }
 }
@@ -2722,7 +3908,7 @@ async function waitForSingleEvent(recorder, name, timeout) {
 
         if (failed) {
             throw new FatalError(`${BoardRequestRecorder.describe(failed)} failed while waiting for the ${name} request: `
-                + failed.failed);
+                + diagnosticText(failed.failed));
         }
         if (recorder.hasPendingPostData()) {
             return false;
@@ -2787,7 +3973,9 @@ const LOGIN_STATE_EXPRESSION = `(() => {
  * Logs in through the login form with fresh cookies and waits up to 120 s for main.html. Fails at once, naming the
  * user and never the password, when the POST to /j_spring_security_check fails or answers a status other than 200,
  * when the form marks the inputs is-invalid (wrong login or password), shows an alert-danger message (blocked user or
- * another refusal), or the page moves to ?loginError=true (request error) or ?timeout=true (sessionExpired).
+ * another refusal), or the page moves to ?loginError=true (request error) or ?timeout=true (sessionExpired). The user,
+ * the navigation and request errors, the alert text, the page's path and query, and the last state of a timeout are
+ * quoted through diagnosticText.
  */
 async function browserLogin() {
     await DEVTOOLS.command('Network.clearBrowserCookies');
@@ -2796,7 +3984,7 @@ async function browserLogin() {
         { timeout: DEVTOOLS_NAVIGATE_TIMEOUT_MS });
 
     if (navigation.errorText) {
-        throw new Error(`cannot open the login page: ${navigation.errorText}`);
+        throw new Error(`cannot open the login page: ${diagnosticText(navigation.errorText)}`);
     }
 
     await waitFor('the login form', () => DEVTOOLS.evaluate('document.readyState === \'complete\' '
@@ -2834,13 +4022,14 @@ async function browserLogin() {
         })()`);
 
         let last = null;
+        const user = diagnosticText(ARGS.user);
 
         await waitFor('main.html after login', async () => {
             if (login.failed) {
-                throw new FatalError(`the login request of user ${ARGS.user} failed: ${login.failed}`);
+                throw new FatalError(`the login request of user ${user} failed: ${diagnosticText(login.failed)}`);
             }
             if (login.status !== null && login.status !== 200) {
-                throw new FatalError(`the login request of user ${ARGS.user} answered HTTP ${login.status}`);
+                throw new FatalError(`the login request of user ${user} answered HTTP ${login.status}`);
             }
 
             last = await DEVTOOLS.evaluate(LOGIN_STATE_EXPRESSION);
@@ -2852,22 +4041,26 @@ async function browserLogin() {
                 return true;
             }
             if (last.invalid) {
-                throw new FatalError(`wrong login or password for user ${ARGS.user}`);
+                throw new FatalError(`wrong login or password for user ${user}`);
             }
             if (last.alert !== null) {
-                throw new FatalError(`the login of user ${ARGS.user} was refused: ${last.alert}`);
+                throw new FatalError(`the login of user ${user} was refused: ${diagnosticText(last.alert)}`);
             }
             if (/[?&]loginError=true\b/.test(last.search)) {
-                throw new FatalError(`the login request of user ${ARGS.user} ended with an error: the page moved to `
-                    + `${last.pathname}${last.search}`);
+                throw new FatalError(`the login request of user ${user} ended with an error: the page moved to `
+                    + diagnosticText(`${last.pathname}${last.search}`));
             }
             if (/[?&]timeout=true\b/.test(last.search)) {
-                throw new FatalError(`the login of user ${ARGS.user} answered sessionExpired: the page moved to `
-                    + `${last.pathname}${last.search}`);
+                throw new FatalError(`the login of user ${user} answered sessionExpired: the page moved to `
+                    + diagnosticText(`${last.pathname}${last.search}`));
             }
 
             return false;
-        }, { timeout: 120000, interval: 250, detail: () => JSON.stringify({ loginStatus: login.status, page: last }) });
+        }, {
+            timeout: 120000,
+            interval: 250,
+            detail: () => diagnosticText(JSON.stringify({ loginStatus: login.status, page: last }))
+        });
     } finally {
         for (const unsubscribe of unsubscribers) {
             unsubscribe();
@@ -3112,7 +4305,8 @@ async function finishDrag(drag) {
             const failed = recorder.firstFailed();
 
             if (failed) {
-                throw new FatalError(`${BoardRequestRecorder.describe(failed)} failed after the drop: ${failed.failed}`);
+                throw new FatalError(`${BoardRequestRecorder.describe(failed)} failed after the drop: `
+                    + diagnosticText(failed.failed));
             }
 
             const blocked = await DEVTOOLS.evaluate(frameExpression(`
@@ -3181,17 +4375,18 @@ before(async () => {
     assert.ok(Array.isArray(found.content.rows) && Array.isArray(found.content.items));
 }, { timeout: CASE_TIMEOUT_MS });
 
-// Promise of the single run of releaseResources, or null before it starts.
-let RELEASE = null;
-
 /**
- * Stops Chrome, sends SIGKILL to every psql child still running and removes every temporary directory once Chrome is
- * stopped. Each step, and each child and directory within a step, runs on its own, whatever the earlier ones did.
- * Runs once: later calls return the promise of the first call. Resolves with the errors of the failed steps, empty
- * when every step succeeded; never rejects.
+ * Stops the isolation watch, then stops Chrome, sends SIGKILL to every psql child still running and removes every
+ * temporary directory once Chrome is stopped. Each step, and each child and directory within a step, runs on its own,
+ * whatever the earlier ones did. From its first call on, spawnPsql starts no psql process and makeTempDir creates no
+ * directory, so DevTools.launch starts no Chrome and HeldTransaction.open rejects. Runs once: later calls
+ * return the promise of the first call. Resolves with the errors of the failed steps, empty when every step
+ * succeeded; never rejects.
  */
 function releaseResources() {
     if (RELEASE === null) {
+        stopIsolationWatch();
+
         RELEASE = (async () => {
             const errors = [];
 
@@ -3226,11 +4421,29 @@ function releaseResources() {
     return RELEASE;
 }
 
+// Fails every case once the isolation watch has found an intrusion.
+beforeEach(() => {
+    if (ISOLATION_ERROR !== null) {
+        throw ISOLATION_ERROR;
+    }
+});
+
+// Stops the isolation watch, Chrome, psql and the temporary directories, then fails with every cleanup error and the
+// intrusion the isolation watch found, each when present.
 after(async () => {
     const errors = await releaseResources();
+    const isolationError = ISOLATION_ERROR;
+    const messages = [];
 
     if (errors.length > 0) {
-        throw new AggregateError(errors, `cleanup failed: ${errors.map((error) => error.message).join('; ')}`);
+        messages.push(`cleanup failed: ${errors.map((error) => error.message).join('; ')}`);
+    }
+    if (isolationError) {
+        messages.push(isolationError.message);
+    }
+
+    if (messages.length > 0) {
+        throw new AggregateError(isolationError ? errors.concat([isolationError]) : errors, messages.join('; '));
     }
 });
 
@@ -3711,6 +4924,8 @@ function socketValues(sockets) {
 
 /**
  * Verifies the acceptance target and sets ACCEPTANCE_TARGET. Only reads. Throws, before any request or write:
+ * - when psql reached the server over TCP on an address that is not a loopback address: host(inet_server_addr()),
+ *   without a leading ::ffff:, is neither null (a Unix-socket connection) nor accepted by isLoopbackAddress;
  * - when the database of --db-uri does not carry the comment ACCEPTANCE_DATABASE_MARKER;
  * - at once, when no process, or more than one process, listens on the --base-url port, when that process holds a
  *   connection to the server port that is not a loopback connection, when it holds a loopback connection to another
@@ -3722,11 +4937,16 @@ async function verifyAcceptanceTarget() {
     const target = await psqlJson(`
 SELECT json_build_object('database', current_database(),
                          'marker', shobj_description(d.oid, 'pg_database'),
-                         'port', current_setting('port')::integer)
+                         'port', current_setting('port')::integer,
+                         'serverAddress', host(inet_server_addr()))
 FROM pg_database d
 WHERE d.datname = current_database();
 `, { app: 'target' });
 
+    if (target.serverAddress !== null && !isLoopbackAddress(String(target.serverAddress).replace(/^::ffff:/i, ''))) {
+        throw new Error(`refusing to run: psql reached the PostgreSQL server at ${target.serverAddress}, not a loopback `
+            + 'server');
+    }
     if (target.marker !== ACCEPTANCE_DATABASE_MARKER) {
         throw new Error(`refusing to run: database ${JSON.stringify(target.database)} does not carry the comment `
             + ACCEPTANCE_DATABASE_MARKER);
@@ -3801,11 +5021,11 @@ LEFT JOIN pg_stat_activity s ON s.backend_type = 'client backend'
 }
 
 /**
- * Terminates the idle client backends of the acceptance database whose client address and port belong to a loopback
- * connection of the verified process, and waits until they have exited; each backend reports its pending table
- * statistics as it exits. The backends to terminate are selected into a materialized set first, and only the members
- * of that set are passed to pg_terminate_backend. Throws when verifyAcceptanceTarget has not succeeded, or when the
- * one process listening on the --base-url port is not the verified process.
+ * Selects into a materialized set the client backends of the acceptance database that are idle when observed and
+ * whose client address and port belong to a loopback connection of the verified process, then terminates every
+ * selected pid, including one whose backend has become active since it was selected, and waits until the terminated
+ * backends have exited; each reports its pending table statistics as it exits. Throws when verifyAcceptanceTarget has
+ * not succeeded, or when the one process listening on the --base-url port is not the verified process.
  */
 async function flushApplicationBackendStats() {
     if (ACCEPTANCE_TARGET === null) {

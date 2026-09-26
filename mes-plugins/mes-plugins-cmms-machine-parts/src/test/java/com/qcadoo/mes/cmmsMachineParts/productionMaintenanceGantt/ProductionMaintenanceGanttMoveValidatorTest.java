@@ -2059,8 +2059,10 @@ public class ProductionMaintenanceGanttMoveValidatorTest {
 
     /**
      * Records known criteria of {@code add} and known orders of {@code addOrder} and answers them with the builder itself.
-     * Answers {@code list()} with the entities satisfying every recorded criterion, sorted by the recorded orders. Fails on
-     * unknown criteria, unknown orders and every other builder method.
+     * Answers {@code list()} with the entities satisfying every recorded criterion, sorted by the recorded orders, and the
+     * methods declared by {@link Object} with Mockito defaults. Fails on unknown criteria, unknown orders and every other
+     * builder method, fluent or not, including {@code uniqueResult()}, {@code existsAliasForAssociation} and
+     * {@code getAliasForAssociation}.
      */
     private static final class DatabaseCriteriaBuilderAnswer implements Answer<Object> {
 
@@ -2086,6 +2088,9 @@ public class ProductionMaintenanceGanttMoveValidatorTest {
             Method method = invocation.getMethod();
             String methodName = method.getName();
 
+            if (Object.class.equals(method.getDeclaringClass())) {
+                return Mockito.RETURNS_DEFAULTS.answer(invocation);
+            }
             if ("add".equals(methodName)) {
                 SearchCriterion criterion = (SearchCriterion) invocation.getArguments()[0];
 
@@ -2111,11 +2116,8 @@ public class ProductionMaintenanceGanttMoveValidatorTest {
             if ("list".equals(methodName)) {
                 return mock(SearchResult.class, new SearchResultAnswer(select()));
             }
-            if (SearchCriteriaBuilder.class.equals(method.getReturnType())) {
-                throw new AssertionError("Unexpected builder method: " + methodName);
-            }
 
-            return Mockito.RETURNS_DEFAULTS.answer(invocation);
+            throw new AssertionError("Unexpected builder method: " + methodName);
         }
 
         private List<Entity> select() {

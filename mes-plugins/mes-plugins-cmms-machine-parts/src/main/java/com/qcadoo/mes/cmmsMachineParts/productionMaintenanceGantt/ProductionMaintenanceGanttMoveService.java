@@ -33,9 +33,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TimeZone;
 
-import org.apache.commons.lang3.StringEscapeUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.joda.time.DateTime;
+import org.joda.time.DateTimeZone;
 import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -65,10 +67,15 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * {@link #move(GanttChartMoveRequest)} runs in one transaction with serializable isolation and performs these steps in order,
  * throwing {@link MoveRejectedException} at the first failure:
  * <ol>
+ * <li>requires the year of the move request's start and the year of its end, read in the ISO calendar in the JVM default time
+ * zone, to lie within 1500 and 2500 inclusive, before any data definition is used; an instant whose local date in that zone
+ * cannot be computed lies outside;</li>
  * <li>loads the position named by the move request and requires it to belong to the production line schedule named under
- * {@link ProductionMaintenanceGanttChartItemResolver#CONTEXT_SCHEDULE_ID} in the component context;</li>
+ * {@link ProductionMaintenanceGanttChartItemResolver#CONTEXT_SCHEDULE_ID} in the component context; that schedule id text,
+ * trimmed, must have at most 19 characters and be a {@code long} number;</li>
  * <li>requires that schedule to be in the {@link ScheduleStateStringValues#DRAFT} state;</li>
- * <li>loads the one production line whose number equals the target row name; none or several reject;</li>
+ * <li>loads the one production line whose number equals the target row name; none or several reject, and a target row name
+ * that is null or longer than 255 characters matches none without a query;</li>
  * <li>runs {@link ProductionMaintenanceGanttMoveValidator#validate(Entity, Entity, GanttChartMoveRequest)} against the position
  * as stored;</li>
  * <li>requires a basic parameter to exist, as reported by
@@ -78,7 +85,8 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * <li>recomputes the positions after the move on the origin and destination rows through
  * {@link ProductionMaintenanceGanttRecomputeService#recompute(Entity, Entity, Entity, Date, Entity, Date)}.</li>
  * </ol>
- * The first three steps reject with {@link #OPTIMISTIC_LOCK_KEY}. A missing basic parameter rejects with
+ * The first step rejects with {@link #DATE_OUT_OF_RANGE_KEY} and the arguments {@code 1500} and {@code 2500}, and the next
+ * three steps reject with {@link #OPTIMISTIC_LOCK_KEY}. A missing basic parameter rejects with
  * {@link #SAVE_FAILED_KEY} before the position is changed or saved. An invalid save rejects with the saved entity's first global
  * error, else its first field error, else {@link #SAVE_FAILED_KEY}. A recompute failure rejects with
  * {@link #RECOMPUTE_FAILED_KEY}, except a concurrency conflict (see {@link #isConcurrencyConflict(Throwable)}), which is
@@ -86,29 +94,9 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * transaction back, leaving no change of the move persisted; a conflict detected by the database at commit propagates to the
  * caller as well.
  * <p>
- * Example, as called from a {@code moveItem} listener that runs outside any transaction, such as
- * {@link com.qcadoo.mes.cmmsMachineParts.listeners.ProductionMaintenanceGanttListeners}. The {@code try} block holds only the
- * {@code move} call, and {@code acceptMove} runs after it, outside the conflict classification:
- *
- * <pre>
- * try {
- *     productionMaintenanceGanttMoveService.move(moveRequest);
- * } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
- *     gantt.rejectMove(e.getMessageKey(), e.getArgs());
- *
- *     return;
- * } catch (RuntimeException e) {
- *     if (ProductionMaintenanceGanttMoveService.isConcurrencyConflict(e)) {
- *         gantt.rejectMove(ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY);
- *
- *         return;
- *     }
- *
- *     throw e;
- * }
- *
- * gantt.acceptMove();
- * </pre>
+ * Its caller, {@link com.qcadoo.mes.cmmsMachineParts.listeners.ProductionMaintenanceGanttListeners}, calls it outside any
+ * transaction; called that way, {@code move} returns after its transaction has committed, and the caller accepts the move
+ * only after it returns.
  */
 @Service
 public class ProductionMaintenanceGanttMoveService {
@@ -122,11 +110,35 @@ public class ProductionMaintenanceGanttMoveService {
     /** Message key of a move rejected because a following position could not be recomputed. */
     public static final String RECOMPUTE_FAILED_KEY = "cmmsMachineParts.productionMaintenanceGantt.move.error.recomputeFailed";
 
+    /**
+     * Message key of the rejection of a move whose start or end has a year outside 1500 to 2500 inclusive; its arguments are
+     * {@code "1500"} and {@code "2500"}.
+     */
+    public static final String DATE_OUT_OF_RANGE_KEY = "qcadooView.gantt.move.error.dateOutOfRange";
+
+    /** Earliest year, inclusive, of the start and the end of a move. */
+    private static final int MIN_DATE_YEAR = 1500;
+
+    /** Latest year, inclusive, of the start and the end of a move. */
+    private static final int MAX_DATE_YEAR = 2500;
+
     /** SQLSTATE reported by the database for a serialization failure. */
     private static final String SERIALIZATION_FAILURE_SQL_STATE = "40001";
 
     /** Largest number of production lines loaded by the lookup of the target row's production line. */
     private static final int TARGET_LINE_LOOKUP_LIMIT = 2;
+
+    /**
+     * Largest number of characters of the trimmed production line schedule id text of the component context that is parsed as
+     * a number, the number of digits of {@link Long#MAX_VALUE}.
+     */
+    private static final int SCHEDULE_ID_MAX_LENGTH = 19;
+
+    /**
+     * Largest number of characters of a target row name that is looked up as a production line number, the maximum length
+     * validated for {@link ProductionLineFields#NUMBER}.
+     */
+    private static final int PRODUCTION_LINE_NUMBER_MAX_LENGTH = 255;
 
     private static final Logger LOG = LoggerFactory.getLogger(ProductionMaintenanceGanttMoveService.class);
 
@@ -153,6 +165,13 @@ public class ProductionMaintenanceGanttMoveService {
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public void move(final GanttChartMoveRequest request) {
         Preconditions.checkArgument(request != null, "move request is required");
+
+        if (!isWithinDateYears(request.getDateFrom()) || !isWithinDateYears(request.getDateTo())) {
+            LOG.debug("Gantt move of production line schedule position {} rejected with {}", request.getItemId(),
+                    DATE_OUT_OF_RANGE_KEY);
+
+            throw new MoveRejectedException(DATE_OUT_OF_RANGE_KEY, String.valueOf(MIN_DATE_YEAR), String.valueOf(MAX_DATE_YEAR));
+        }
 
         DataDefinition positionDD = getPositionDD();
 
@@ -181,11 +200,11 @@ public class ProductionMaintenanceGanttMoveService {
         List<Entity> targetLines = findProductionLinesByNumber(request.getTargetRowName());
 
         if (targetLines.isEmpty()) {
-            throw staleBoardRejection("no production line for target row", request.getTargetRowName());
+            throw staleBoardRejection("no production line for target row", null);
         }
 
         if (targetLines.size() > 1) {
-            throw staleBoardRejection("several production lines for target row", request.getTargetRowName());
+            throw staleBoardRejection("several production lines for target row", null);
         }
 
         Entity targetLine = targetLines.get(0);
@@ -265,6 +284,26 @@ public class ProductionMaintenanceGanttMoveService {
     }
 
     /**
+     * Returns true when the year of the date, read in the ISO calendar in the JVM default time zone
+     * ({@link TimeZone#getDefault()}), lies within {@link #MIN_DATE_YEAR} and {@link #MAX_DATE_YEAR} inclusive. Returns false
+     * when the local date of the instant in that zone cannot be computed, as for {@code new Date(Long.MAX_VALUE)}.
+     * <p>
+     * Example: in the zone Europe/Warsaw, 1500-01-01 00:00:00.000 and 2500-12-31 23:59:59.999 give true, and one millisecond
+     * earlier or later respectively gives false.
+     */
+    private static boolean isWithinDateYears(final Date date) {
+        int year;
+
+        try {
+            year = new DateTime(date.getTime(), DateTimeZone.forTimeZone(TimeZone.getDefault())).getYear();
+        } catch (ArithmeticException e) {
+            return false;
+        }
+
+        return year >= MIN_DATE_YEAR && year <= MAX_DATE_YEAR;
+    }
+
+    /**
      * Returns true when the throwable is an {@link SQLException} whose SQLSTATE is {@code 40001}.
      */
     private static boolean isSerializationFailure(final Throwable throwable) {
@@ -338,35 +377,35 @@ public class ProductionMaintenanceGanttMoveService {
     }
 
     /**
-     * Returns an {@link #OPTIMISTIC_LOCK_KEY} rejection and logs the failed precondition at debug level, with its subject
-     * encoded by {@link #toLogValue(Object)}.
+     * Returns an {@link #OPTIMISTIC_LOCK_KEY} rejection and logs, at debug level, the fixed text of the failed precondition
+     * followed by the entity id when one is given. No text of the move request is logged.
+     * <p>
+     * Example: {@code ("schedule no longer in draft", 7L)} logs
+     * {@code Gantt move rejected with the optimistic lock message: schedule no longer in draft (id 7)}, and
+     * {@code ("no production line for target row", null)} logs
+     * {@code Gantt move rejected with the optimistic lock message: no production line for target row}.
+     *
+     * @param failedPrecondition
+     *            fixed text of the failed precondition
+     * @param entityId
+     *            id of the position or schedule the precondition concerns, may be null
+     * @return the rejection
      */
-    private MoveRejectedException staleBoardRejection(final String failedPrecondition, final Object subject) {
-        if (LOG.isDebugEnabled()) {
-            LOG.debug("Gantt move rejected with the optimistic lock message: {} ({})", failedPrecondition, toLogValue(subject));
+    private MoveRejectedException staleBoardRejection(final String failedPrecondition, final Long entityId) {
+        if (entityId == null) {
+            LOG.debug("Gantt move rejected with the optimistic lock message: {}", failedPrecondition);
+        } else {
+            LOG.debug("Gantt move rejected with the optimistic lock message: {} (id {})", failedPrecondition, entityId);
         }
 
         return new MoveRejectedException(OPTIMISTIC_LOCK_KEY);
     }
 
     /**
-     * Returns {@link String#valueOf(Object)} of the value with Java string escaping applied: carriage returns, line feeds, tabs
-     * and other control characters become escape sequences such as {@code \r}, {@code \n} and {@code \t}, characters outside
-     * printable ASCII become unicode escapes, and quotes and backslashes are escaped. A number keeps its digits and null gives
-     * {@code "null"}.
+     * Returns the production line schedule id held by the component context, or null when it is missing, when its trimmed text
+     * is longer than {@link #SCHEDULE_ID_MAX_LENGTH} characters, or when that text is not a {@code long} number.
      * <p>
-     * Example: the row name {@code "L2"} followed by a line feed and {@code "forged"} gives {@code L2\nforged} on one line.
-     *
-     * @param value
-     *            the value to log, may be null
-     * @return the encoded value, never null and free of line breaks
-     */
-    static String toLogValue(final Object value) {
-        return StringEscapeUtils.escapeJava(String.valueOf(value));
-    }
-
-    /**
-     * Returns the production line schedule id held by the component context, or null when it is missing or not a number.
+     * Example: {@code " 0000000000000000007 "} gives 7, and {@code "00000000000000000007"}, of 20 characters, gives null.
      */
     private Long getContextScheduleId(final JSONObject context) {
         if (context == null) {
@@ -379,19 +418,25 @@ public class ProductionMaintenanceGanttMoveService {
             return null;
         }
 
+        String trimmedScheduleId = scheduleId.trim();
+
+        if (trimmedScheduleId.length() > SCHEDULE_ID_MAX_LENGTH) {
+            return null;
+        }
+
         try {
-            return Long.valueOf(scheduleId.trim());
+            return Long.valueOf(trimmedScheduleId);
         } catch (NumberFormatException e) {
             return null;
         }
     }
 
     /**
-     * Returns at most {@link #TARGET_LINE_LOOKUP_LIMIT} production lines whose number equals the given number, or an empty
-     * list when the number is null.
+     * Returns at most {@link #TARGET_LINE_LOOKUP_LIMIT} production lines whose number equals the given number, or, without any
+     * query, an empty list when the number is null or longer than {@link #PRODUCTION_LINE_NUMBER_MAX_LENGTH} characters.
      */
     private List<Entity> findProductionLinesByNumber(final String number) {
-        if (number == null) {
+        if (number == null || number.length() > PRODUCTION_LINE_NUMBER_MAX_LENGTH) {
             return Collections.emptyList();
         }
 

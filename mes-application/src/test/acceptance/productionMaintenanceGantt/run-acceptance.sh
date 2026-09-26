@@ -3,7 +3,7 @@
 # ***************************************************************************
 # Copyright (c) 2010 Qcadoo Limited
 # Project: Qcadoo MES
-# Version: 1.4
+# Version: 1.5-SNAPSHOT
 #
 # This file is part of Qcadoo.
 #
@@ -39,28 +39,47 @@
 #                    path may hold only letters A-Z and a-z, digits and . _ + - /.
 #                    Default: the directory mktemp -t uses, which has to meet the same conditions.
 #
+# Worker: the script runs on a shared host as well as in a worker of its own. Processes outside the run can read the
+# --password argument and reach the DevTools endpoint of Chrome; when a worker isolation check finds such processes,
+# or cannot inspect some of the worker, the script prints one warning line to stderr and the run continues. In a
+# worker of its own, a private process list and a private network namespace that hold only this run and its
+# PostgreSQL server, such as a container of its own or unshare --pid --fork --mount-proc --net with the loopback
+# interface up, the checks print no warning. A traced process of the run stops the run. The script turns command
+# tracing off for itself; the worker isolation checks are described under "Worker isolation".
+#
 # Steps:
 #   1. Checks the arguments, the repository layout, the work root and the tools on PATH, chooses the base day of
-#      fixture.sql, creates the temporary work directory, checks the PostgreSQL server of conf/tomcat/db.properties
-#      answers, and guards the database with an advisory lock that a psql session on the maintenance database holds
-#      until the script exits.
+#      fixture.sql, creates the temporary work directory and reads the connection settings of
+#      conf/tomcat/db.properties and of the distribution's db.properties. Requires the host of dbJdbcUrl in
+#      conf/tomcat/db.properties to be localhost or a 127.0.0.0/8 address, unsets every exported variable whose name
+#      starts with PG, and writes the libpq password file pgpass of that server into the work directory with mode 600.
+#      Checks worker isolation, which prints a warning on co-tenancy and stops the run on an intrusion, and starts the
+#      isolation watch, which checks for intrusions every 500 ms until the script exits and stops the run on one.
+#      Then checks the PostgreSQL server answers, and guards the database with an advisory lock that a psql session on
+#      the maintenance database holds until the script exits. psql gets connection URIs without a password, and every
+#      psql session first raises an error unless its server address is a loopback address, its server port is the port
+#      of dbJdbcUrl and its database is the one the session is for.
 #   2. Checks the members of the distribution, unpacks it into the work directory, checks its db.properties, sets
 #      hotDeploy=false in its app.properties, applies --db-name, --http-port and --shutdown-port to the unpacked copy,
 #      and checks the HTTP and shutdown ports are free.
 #   3. Recreates the database marked with the comment in MARKER on the server of conf/tomcat/db.properties,
 #      then loads mes_db_en.sql and fixture.sql into it and checks the required plugins are enabled.
 #   4. Starts Tomcat and, once the login page answers, checks that the started Tomcat runs and holds every LISTEN socket
-#      on the HTTP port. Runs acceptance.test.js with the TAP reporter, repeats the listener check, and checks the TAP
-#      summary and every case line.
-#   5. Stops Tomcat on every exit. Removes the work directory once Tomcat has stopped; keeps it and prints its path
-#      while Tomcat still runs. The database is kept.
+#      on the HTTP port. Repeats the worker isolation check, runs acceptance.test.js with the TAP reporter, repeats the
+#      listener check, and checks the TAP summary and every case line.
+#   5. Stops the isolation watch and Tomcat on every exit. Removes the work directory once Tomcat has stopped; keeps it
+#      and prints its path while Tomcat still runs. The database is kept.
 #
 # Exit status: 0 for --help, and otherwise only when every acceptance case passed, Tomcat stopped and the work
-# directory was removed; 2 on a usage error; the runner's status when the runner failed; 130 on SIGINT; 143 on SIGTERM;
-# 1 on any other failure, including Tomcat still running after the stop, a work directory that cannot be removed,
-# an HTTP port listener that is not the started Tomcat or a started Tomcat that is no longer running, and a tee
-# failure. A failed stop or removal keeps a nonzero status unchanged.
+# directory was removed; 2 on a usage error; the runner's status when the runner failed; 130 on SIGINT; 143 on SIGTERM,
+# the signal the isolation watch sends on an intrusion; 1 on any other failure, including an intrusion found by a
+# worker isolation check, a worker isolation check that cannot run, a failed or timed-out psql command, any other
+# failed command, Tomcat still running after the stop, a work directory that cannot be removed, an HTTP port listener
+# that is not the started Tomcat or a started Tomcat that is no longer running, and a tee failure. A worker isolation
+# warning leaves the status unchanged. A failed stop or removal keeps a nonzero status unchanged.
 
+# Turns off command tracing (xtrace) for the whole run.
+set +x
 set -euo pipefail
 unset CDPATH
 
@@ -92,6 +111,7 @@ readonly STARTUP_POLL_SECONDS=2
 readonly STARTUP_REPORT_SECONDS=10
 readonly STOP_WAIT_SECONDS=30
 readonly KILL_WAIT_SECONDS=10
+readonly TOMCAT_CMDLINE_READS=10
 readonly LOG_TAIL_LINES=200
 readonly PSQL_CONNECT_TIMEOUT_SECONDS=30
 readonly PSQL_COMMAND_TIMEOUT_SECONDS=300
@@ -112,12 +132,16 @@ WORK_DIR=''
 TOMCAT_LOG=''
 TOMCAT_PID=''
 CATALINA_BASE=''
+# Nonzero exit status the cleanup trap keeps: 2 after a usage error, the runner's status after a failed runner, else 0.
+KEPT_STATUS=0
+ISOLATION_WATCH_PID=''
 
 # Reads the port attributes of conf/server.xml outside XML comments, or rewrites them.
 #   ports <server.xml>                           prints "<http port> <shutdown port>"; an absent value prints "-"
 #   rewrite <server.xml> <http> <shutdown>       sets the port of the first non-AJP Connector and of the Server element
 #   A port value in single or double quotes is printed as written, sign and leading zeros included; a value that is
-#   not an optionally signed decimal number makes it exit with status 1.
+#   not an optionally signed decimal number makes it exit with status 1, its message quoting the value and the
+#   element as JSON strings with DEL, the C1 controls, U+2028 and U+2029 also written as \uHHHH.
 # shellcheck disable=SC2016
 readonly SERVER_XML_JS='
 "use strict";
@@ -126,11 +150,13 @@ const [mode, file, httpPort, shutdownPort] = process.argv.slice(1);
 const parts = fs.readFileSync(file, "utf8").split(/(<!--[\s\S]*?-->)/);
 const PORT = /(\bport\s*=\s*)(["\x27])([^"\x27]*)\2/;
 const NUMBER = /^[+-]?[0-9]+$/;
+const printable = (text) => JSON.stringify(text).replace(/[\u007f-\u009f\u2028\u2029]/g,
+    (character) => "\\u" + character.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0"));
 const isAjp = (element) => /\bprotocol\s*=\s*["\x27][^"\x27]*ajp/i.test(element);
 const portOf = (element) => {
     const port = PORT.exec(element);
     if (port && !NUMBER.test(port[3])) {
-        process.stderr.write("port " + JSON.stringify(port[3]) + " of " + element + " is not a decimal number\n");
+        process.stderr.write("port " + printable(port[3]) + " of " + printable(element) + " is not a decimal number\n");
         process.exit(1);
     }
     return port;
@@ -177,7 +203,8 @@ if (mode === "rewrite") {
 #   Fails on a multi-disk archive and on any member that holds a control character or a backslash, is absolute, starts
 #   with a drive letter, has an empty, . or .. component, is encrypted, carries a Unicode path extra field naming another
 #   path, is a symbolic link or has a unix type other than regular file or directory, repeats another member's name, or
-#   is a file where another member needs a directory. Prints at most 20 problems.
+#   is a file where another member needs a directory. Prints at most 20 problems, each member name as a JSON string
+#   with DEL, the C1 controls, U+2028 and U+2029 also written as \uHHHH.
 # shellcheck disable=SC2016
 readonly ZIP_INSPECT_JS='
 "use strict";
@@ -199,6 +226,8 @@ const TYPE_MASK = 0o170000;
 const TYPE_FILE = 0o100000;
 const TYPE_DIRECTORY = 0o040000;
 const TYPE_SYMLINK = 0o120000;
+const printable = (text) => JSON.stringify(text).replace(/[\u007f-\u009f\u2028\u2029]/g,
+    (character) => "\\u" + character.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0"));
 const fail = (message) => {
     process.stderr.write(file + ": " + message + "\n");
     process.exit(1);
@@ -303,7 +332,7 @@ try {
     const directories = new Set();
     const files = [];
     for (const { flags, attributes, rawName, name, extra } of entries) {
-        const report = (problem) => problems.push("member " + JSON.stringify(name) + " " + problem);
+        const report = (problem) => problems.push("member " + printable(name) + " " + problem);
         const directory = name.endsWith("/");
         const path = directory ? name.slice(0, -1) : name;
         const components = path.split("/");
@@ -362,7 +391,7 @@ try {
     }
     for (const { name, path } of files) {
         if (directories.has(path)) {
-            problems.push("member " + JSON.stringify(name) + " is a file and the directory of another member");
+            problems.push("member " + printable(name) + " is a file and the directory of another member");
         }
     }
     if (problems.length > 0) {
@@ -658,14 +687,179 @@ if (foreign.length > 0) {
 process.stdout.write([...listeners.values()].join(", "));
 '
 
-# Prints a progress line.
-log() {
-    printf '%s: %s\n' "$PROGRAM" "$1"
+# Prints the last <lines> lines of a log file, each redacted, escaped and cut, one output line per log line.
+#   <log file> <lines>    standard input holds the literal secrets, each ended by a NUL byte
+#   Reads the last 1 MiB of the file plus as many bytes as the longest secret form, replaces with [redacted] in that
+#   text every literal secret of standard input and its JSON-escaped, percent-encoded and form-encoded forms, longest
+#   first, then drops the partial line at its start; prints a single notice line when that part holds no complete line.
+#   In each of the last <lines> lines, its trailing carriage return removed, it replaces with [redacted], in this order:
+#   the value of an Authorization, Proxy-Authorization, Cookie or Set-Cookie header up to the end of the line; the
+#   userinfo of a URI; and, where the name holds password, passwd, pwd, secret, token, csrf, session id, api key,
+#   authorization or cookie, the content of an XML element and the value of a pair in the forms k=v, k: v, "k":"v" and
+#   "k": "v" whose name does not end in .java. It then writes C0 controls and DEL as \xHH, C1 controls, U+2028 and
+#   U+2029 as \uHHHH, and cuts the line after 2000 characters with the number of characters cut. Exits with status 2 on
+#   bad arguments and 1 when the log file is not a readable regular file or standard input cannot be read.
+# shellcheck disable=SC2016
+readonly LOG_TAIL_JS='
+"use strict";
+const fs = require("fs");
+const [file, linesText] = process.argv.slice(1);
+const lineLimit = Number(linesText);
+const MAX_READ_BYTES = 1048576;
+const MAX_LINE_LENGTH = 2000;
+const REDACTED = "[redacted]";
+const HEADER = /\b((?:proxy-)?authorization|(?:set-)?cookie2?)(\s*[:=]\s*)[^\r\n]*/gi;
+const URI_USERINFO = /\b([A-Za-z][A-Za-z0-9+.\-]{0,31}:\/\/)[^\s\/?#]*@/g;
+const XML_ELEMENT = /(<[\w.:\-]{0,64}?(?:passw(?:or)?d|pwd|secret|token|csrf|session[_-]?id|api[ _-]?key|authorization|cookie)[\w.\-]{0,64}>)[^<]*/gi;
+const KEY_VALUE = /((?:passw(?:or)?d|pwd|secret|token|csrf|session[_-]?id|api[ _-]?key|authorization|cookie)[\w.\-]{0,64}(?<!\.java)["\x27]?)(\s*[=:]\s*)(?!\[redacted\])(?:"(?:[^"\\]|\\.)*"?|\x27(?:[^\x27\\]|\\.)*\x27?|[^\s,;&"\x27<>{}]+)/gi;
+if (!file || !Number.isInteger(lineLimit) || lineLimit < 1) {
+    process.stderr.write("expected the arguments <log file> <lines> with a positive integer <lines>\n");
+    process.exit(2);
+}
+const secretForms = (secret) => [
+    secret,
+    JSON.stringify(secret).slice(1, -1),
+    encodeURIComponent(secret),
+    new URLSearchParams({ secret }).toString().slice("secret=".length)
+];
+const readTail = (extra) => {
+    const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+    try {
+        const stats = fs.fstatSync(descriptor);
+        if (!stats.isFile()) {
+            throw new Error("not a regular file");
+        }
+        const start = stats.size > MAX_READ_BYTES ? Math.max(0, stats.size - MAX_READ_BYTES - 1 - extra) : 0;
+        const buffer = Buffer.alloc(stats.size - start);
+        let done = 0;
+        while (done < buffer.length) {
+            const count = fs.readSync(descriptor, buffer, done, buffer.length - done, start + done);
+            if (count === 0) {
+                break;
+            }
+            done += count;
+        }
+        return { text: buffer.subarray(0, done).toString("utf8"), partial: start > 0 };
+    } finally {
+        fs.closeSync(descriptor);
+    }
+};
+const literalPattern = (secrets) => secrets.length === 0 ? null
+    : new RegExp(secrets.map((secret) => secret.replace(/[\\^$.*+?()[\]{}|\/-]/g, "\\$&")).join("|"), "g");
+const redact = (line) => {
+    return line
+        .replace(HEADER, (match, name, separator) => name + separator + REDACTED)
+        .replace(URI_USERINFO, (match, scheme) => scheme + REDACTED + "@")
+        .replace(XML_ELEMENT, (match, element) => element + REDACTED)
+        .replace(KEY_VALUE, (match, name, separator) => name + separator + REDACTED);
+};
+const escapeCharacter = (character) => {
+    const code = character.codePointAt(0);
+    if (code < 0x20 || code === 0x7f) {
+        return "\\x" + code.toString(16).toUpperCase().padStart(2, "0");
+    }
+    if ((code >= 0x80 && code <= 0x9f) || code === 0x2028 || code === 0x2029) {
+        return "\\u" + code.toString(16).toUpperCase().padStart(4, "0");
+    }
+    return character;
+};
+const escapeAndCut = (text) => {
+    let result = "";
+    let consumed = 0;
+    for (const character of text) {
+        const piece = escapeCharacter(character);
+        if (result.length + piece.length > MAX_LINE_LENGTH) {
+            return result + " [" + (text.length - consumed) + " more characters cut]";
+        }
+        result += piece;
+        consumed += character.length;
+    }
+    return result;
+};
+try {
+    const secrets = [...new Set(fs.readFileSync(0, "utf8").split("\0").filter((secret) => secret !== "")
+        .flatMap(secretForms))].sort((first, second) => second.length - first.length);
+    const literals = literalPattern(secrets);
+    const tail = readTail(secrets.reduce((longest, secret) => Math.max(longest, Buffer.byteLength(secret)), 0));
+    const redacted = literals === null ? tail.text : tail.text.replace(literals, REDACTED);
+    const newline = tail.partial ? redacted.indexOf("\n") : -1;
+    if (tail.partial && newline < 0) {
+        process.stdout.write("[no complete line in the last " + MAX_READ_BYTES + " bytes of the log]\n");
+    } else {
+        const lines = (tail.partial ? redacted.slice(newline + 1) : redacted).split("\n");
+        if (lines[lines.length - 1] === "") {
+            lines.pop();
+        }
+        process.stdout.write(lines.slice(-lineLimit)
+            .map((line) => escapeAndCut(redact(line.replace(/\r$/, ""))) + "\n").join(""));
+    }
+} catch (error) {
+    process.stderr.write("cannot print the tail of " + file + ": " + error.message + "\n");
+    process.exit(1);
+}
+'
+
+# Prints the argument with the bytes of every C0 control (0x01-0x1F), DEL (0x7F), UTF-8-encoded C1 control
+# (0xC2 0x80-0x9F), U+2028 and U+2029 (0xE2 0x80 0xA8 and 0xA9) written as \xHH escapes; prints every other byte as is.
+escape_controls() {
+    local LC_ALL=C
+    local text="$1" escaped='' code next width index=0 length
+
+    length="${#text}"
+
+    while [ "$index" -lt "$length" ]; do
+        printf -v code '%d' "'${text:index:1}"
+        width=0
+
+        if [ "$code" -lt 32 ] || [ "$code" -eq 127 ]; then
+            width=1
+        elif [ "$code" -eq 194 ] && [ $((index + 1)) -lt "$length" ]; then
+            printf -v next '%d' "'${text:index+1:1}"
+
+            if [ "$next" -ge 128 ] && [ "$next" -le 159 ]; then
+                width=2
+            fi
+        elif [ "$code" -eq 226 ]; then
+            case "${text:index+1:2}" in
+                $'\x80\xa8' | $'\x80\xa9') width=3 ;;
+            esac
+        fi
+
+        if [ "$width" -eq 0 ]; then
+            escaped+="${text:index:1}"
+            index=$((index + 1))
+        fi
+
+        while [ "$width" -gt 0 ]; do
+            printf -v code '%d' "'${text:index:1}"
+            printf -v next '\\x%02X' "$code"
+            escaped+="$next"
+            index=$((index + 1))
+            width=$((width - 1))
+        done
+    done
+
+    printf '%s' "$escaped"
 }
 
-# Prints an error line and exits with status 1.
+# Succeeds when the argument holds a character that escape_controls escapes.
+holds_controls() {
+    [ "$(escape_controls "$1")" != "$1" ]
+}
+
+# Prints a progress line, its message passed through escape_controls.
+log() {
+    printf '%s: %s\n' "$PROGRAM" "$(escape_controls "$1")"
+}
+
+# Prints a warning line to stderr, its message passed through escape_controls.
+warn() {
+    printf '%s: warning: %s\n' "$PROGRAM" "$(escape_controls "$1")" >&2
+}
+
+# Prints an error line, its message passed through escape_controls, and exits with status 1.
 die() {
-    printf '%s: error: %s\n' "$PROGRAM" "$1" >&2
+    printf '%s: error: %s\n' "$PROGRAM" "$(escape_controls "$1")" >&2
     exit 1
 }
 
@@ -675,10 +869,11 @@ usage() {
         "$PROGRAM" >&"${1:-2}"
 }
 
-# Prints a usage error with the usage line and exits with status 2.
+# Prints a usage error, its message passed through escape_controls, with the usage line and exits with status 2.
 usage_error() {
-    printf '%s: %s\n' "$PROGRAM" "$1" >&2
+    printf '%s: %s\n' "$PROGRAM" "$(escape_controls "$1")" >&2
     usage 2
+    KEPT_STATUS=2
     exit 2
 }
 
@@ -695,7 +890,7 @@ trim() {
 absolute_path() {
     case "$1" in
         /*) printf '%s' "$1" ;;
-        *) printf '%s/%s' "$(pwd)" "$1" ;;
+        *) printf '%s/%s' "$PWD" "$1" ;;
     esac
 }
 
@@ -713,7 +908,9 @@ physical_dir() {
     printf '%s' "$resolved"
 }
 
-# Succeeds when the first path is the second path or lies below it.
+# Succeeds when the first path equals the second, or starts with the second, less one trailing '/', followed by '/'.
+# Compares the strings only and expects both to be normalized physical paths as physical_dir prints them; a path
+# with a . or .. component or a symbolic link can pass without lying below the second.
 is_within() {
     [ "$1" = "$2" ] || [[ "$1" == "${2%/}/"* ]]
 }
@@ -770,6 +967,14 @@ is_port() {
     [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$1))" -ge 1 ] && [ "$((10#$1))" -le 65535 ]
 }
 
+# Succeeds when the argument is a 127.0.0.0/8 dotted quad whose last three octets are decimal numbers from 0 to 255.
+is_loopback_ipv4() {
+    [[ "$1" =~ ^127\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] \
+        && [ "$((10#${BASH_REMATCH[1]}))" -le 255 ] \
+        && [ "$((10#${BASH_REMATCH[2]}))" -le 255 ] \
+        && [ "$((10#${BASH_REMATCH[3]}))" -le 255 ]
+}
+
 # Prints a server.xml port value as a decimal number without a + sign or leading zeros, keeping the - of a negative
 # value; prints any other value unchanged.
 normalize_port_value() {
@@ -793,7 +998,8 @@ normalize_port_value() {
     printf '%s%s' "$sign" "$value"
 }
 
-# Succeeds when the argument is a database name of letters, digits and underscores, at most 63 characters long.
+# Succeeds when the argument starts with a letter or underscore, continues with letters, digits and underscores only,
+# and is at most 63 characters long.
 is_db_name() {
     [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && [ "${#1}" -le 63 ]
 }
@@ -843,9 +1049,17 @@ set_property_value() {
     rm -f -- "$rewritten"
 }
 
-# Percent-encodes the argument for the userinfo part of a URI.
+# Percent-encodes the argument as one component of a URI with encodeURIComponent.
 url_encode() {
     node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' -- "$1"
+}
+
+# Prints the argument as a field of a libpq password file: every \ written as \\ and every : as \:. Runs no external
+# command.
+pgpass_field() {
+    local value="${1//\\/\\\\}"
+
+    printf '%s' "${value//:/\\:}"
 }
 
 # Succeeds when a TCP connection to the given port opens on 127.0.0.1 or on ::1.
@@ -875,33 +1089,66 @@ psql_with_deadline() {
     node -e "$PSQL_DEADLINE_JS" -- "$PROGRAM" "$seconds" "$PSQL_KILL_GRACE_SECONDS" psql -X -w -v ON_ERROR_STOP=1 "$@"
 }
 
-# Runs psql against the maintenance database `postgres`, unaligned and tuples only, within PSQL_COMMAND_TIMEOUT_SECONDS.
+# Prints a PL/pgSQL DO block that raises an exception naming the database, server address and server port the session
+# reached, unless its server address is a loopback address (127.0.0.0/8, ::1 or ::ffff:127.0.0.0/104; a Unix-socket
+# session has none), its server port is DB_PORT and its database is the given database.
+#   server_guard_sql <database>    <database> matches is_db_name
+server_guard_sql() {
+    local database="$1"
+
+    printf '%s' "DO \$guard\$
+BEGIN
+    IF inet_server_addr() IS NULL
+            OR NOT (inet_server_addr() <<= inet '127.0.0.0/8' OR inet_server_addr() = inet '::1'
+                OR inet_server_addr() <<= inet '::ffff:127.0.0.0/104')
+            OR inet_server_port() IS DISTINCT FROM $DB_PORT
+            OR current_database() <> '$database' THEN
+        RAISE EXCEPTION 'refusing to run: psql reached database % at % port %, not database $database at a loopback address on port $DB_PORT',
+            current_database(), coalesce(host(inet_server_addr()), 'a Unix socket'), coalesce(inet_server_port()::text, '-');
+    END IF;
+END
+\$guard\$"
+}
+
+# Runs psql quietly against the maintenance database `postgres`, unaligned and tuples only, within
+# PSQL_COMMAND_TIMEOUT_SECONDS: first the server guard ADMIN_GUARD_SQL, then the given arguments.
 psql_admin() {
-    psql_with_deadline "$PSQL_COMMAND_TIMEOUT_SECONDS" -At -d "$ADMIN_URI" "$@"
+    psql_with_deadline "$PSQL_COMMAND_TIMEOUT_SECONDS" -At -q -d "$ADMIN_URI" -c "$ADMIN_GUARD_SQL" "$@"
 }
 
-# Runs psql against the acceptance database, unaligned and tuples only, within PSQL_COMMAND_TIMEOUT_SECONDS.
+# Runs psql quietly against the acceptance database, unaligned and tuples only, within PSQL_COMMAND_TIMEOUT_SECONDS:
+# first the server guard DB_GUARD_SQL, then the given arguments.
 psql_db() {
-    psql_with_deadline "$PSQL_COMMAND_TIMEOUT_SECONDS" -At -d "$DB_URI" "$@"
+    psql_with_deadline "$PSQL_COMMAND_TIMEOUT_SECONDS" -At -q -d "$DB_URI" -c "$DB_GUARD_SQL" "$@"
 }
 
-# Succeeds while the started Tomcat process runs under the unpacked CATALINA_BASE.
+# Succeeds while the started Tomcat process runs under the unpacked CATALINA_BASE, or while TOMCAT_PID is still the
+# copy of this runner that bash forked to run catalina.sh, whose non-empty command line equals the runner's own. Any
+# other command line, such as the one of a process in the middle of an exec, is read again every 0.1 s, up to
+# TOMCAT_CMDLINE_READS times in all.
 tomcat_alive() {
-    local cmdline
+    local cmdline own_cmdline reads=0
 
     [ -n "$TOMCAT_PID" ] || return 1
-    kill -0 "$TOMCAT_PID" 2> /dev/null || return 1
+    own_cmdline="$(tr '\0' ' ' 2> /dev/null < "/proc/$$/cmdline")" || return 1
 
-    if [ -r "/proc/$TOMCAT_PID/cmdline" ]; then
+    while :; do
+        kill -0 "$TOMCAT_PID" 2> /dev/null || return 1
+        [ -r "/proc/$TOMCAT_PID/cmdline" ] || return 0
         cmdline="$(tr '\0' ' ' 2> /dev/null < "/proc/$TOMCAT_PID/cmdline")" || return 1
+        reads=$((reads + 1))
 
         case "$cmdline" in
             *"$CATALINA_BASE"*) return 0 ;;
-            *) return 1 ;;
         esac
-    fi
 
-    return 0
+        if [ -n "$cmdline" ] && [ "$cmdline" = "$own_cmdline" ]; then
+            return 0
+        fi
+
+        [ "$reads" -lt "$TOMCAT_CMDLINE_READS" ] || return 1
+        sleep 0.1
+    done
 }
 
 # Exits with status 1 unless the started Tomcat runs and holds every LISTEN socket on HTTP_PORT.
@@ -972,28 +1219,46 @@ stop_tomcat() {
     return 0
 }
 
-# Prints the Tomcat log tail on failure, stops Tomcat, and removes the work directory once Tomcat has stopped.
-# Keeps the work directory while Tomcat still runs. Exits with the original status, or with 1 in place of 0 when
-# Tomcat still runs or the work directory still exists.
+# Stops the isolation watch. On failure prints the last LOG_TAIL_LINES lines of the Tomcat log through LOG_TAIL_JS,
+# which reads the secrets of the run from its standard input, each ended by a NUL byte, or a one-line notice without
+# the tail when the filter fails. Then stops Tomcat, and removes the work directory once Tomcat has stopped. Keeps the
+# work directory while Tomcat still runs. Exits with the status given as its argument (130 or 143); without an
+# argument, with the exit status that ran it when that status is 0 or KEPT_STATUS, and with 1 for any other status.
+# Exits with 1 in place of 0 when Tomcat still runs or the work directory still exists.
 # shellcheck disable=SC2317
 cleanup() {
-    local status=$? cleanup_failed=0 remove_status
+    local status=$? cleanup_failed=0 remove_status log_tail filter_status
 
     if [ "$#" -gt 0 ]; then
         status="$1"
+    elif [ "$status" -ne 0 ] && [ "$status" -ne "$KEPT_STATUS" ]; then
+        status=1
     fi
 
     trap - EXIT INT TERM
     set +e
 
+    if [ -n "$ISOLATION_WATCH_PID" ]; then
+        stop_isolation_watch
+    fi
+
     if [ "$status" -ne 0 ] && [ -n "$TOMCAT_LOG" ] && [ -f "$TOMCAT_LOG" ]; then
-        printf '%s: last %s lines of %s:\n' "$PROGRAM" "$LOG_TAIL_LINES" "$TOMCAT_LOG" >&2
-        tail -n "$LOG_TAIL_LINES" "$TOMCAT_LOG" >&2
+        if log_tail="$(printf '%s\0' "${PASSWORD_ARG:-}" "${REPO_DB_PASSWORD:-}" "${PACKAGED_DB_PASSWORD:-}" \
+                "${DIST_DB_PASSWORD:-}" 2> /dev/null \
+                | node -e "$LOG_TAIL_JS" -- "$TOMCAT_LOG" "$LOG_TAIL_LINES" 2> /dev/null && printf '.')"; then
+            printf '%s: last %s lines of %s, credentials redacted and control characters escaped:\n' \
+                "$PROGRAM" "$LOG_TAIL_LINES" "$(escape_controls "$TOMCAT_LOG")" >&2
+            printf '%s' "${log_tail%.}" >&2
+        else
+            filter_status=$?
+            printf '%s: the Tomcat log tail is not printed: its redacting filter exited with status %s\n' \
+                "$PROGRAM" "$filter_status" >&2
+        fi
     fi
 
     if [ -n "$TOMCAT_PID" ] && ! stop_tomcat; then
         printf '%s: error: Tomcat (pid %s) is still running; kept work directory %s and Tomcat log %s\n' \
-            "$PROGRAM" "$TOMCAT_PID" "$WORK_DIR" "$TOMCAT_LOG" >&2
+            "$PROGRAM" "$TOMCAT_PID" "$(escape_controls "$WORK_DIR")" "$(escape_controls "$TOMCAT_LOG")" >&2
         cleanup_failed=1
     elif [ -n "$WORK_DIR" ] && { [ -e "$WORK_DIR" ] || [ -L "$WORK_DIR" ]; }; then
         rm -rf -- "$WORK_DIR"
@@ -1001,10 +1266,11 @@ cleanup() {
 
         if [ "$remove_status" -ne 0 ]; then
             printf '%s: error: cannot remove work directory %s: rm -rf exited with status %s\n' \
-                "$PROGRAM" "$WORK_DIR" "$remove_status" >&2
+                "$PROGRAM" "$(escape_controls "$WORK_DIR")" "$remove_status" >&2
             cleanup_failed=1
         elif [ -e "$WORK_DIR" ] || [ -L "$WORK_DIR" ]; then
-            printf '%s: error: work directory %s still exists after rm -rf\n' "$PROGRAM" "$WORK_DIR" >&2
+            printf '%s: error: work directory %s still exists after rm -rf\n' "$PROGRAM" \
+                "$(escape_controls "$WORK_DIR")" >&2
             cleanup_failed=1
         fi
     fi
@@ -1108,8 +1374,409 @@ if [ -n "$HTTP_PORT_ARG" ] && [ "$HTTP_PORT_ARG" = "$SHUTDOWN_PORT_ARG" ]; then
     usage_error "--http-port and --shutdown-port must differ, both are $HTTP_PORT_ARG"
 fi
 
-# Resolves the distribution against the caller's working directory.
+# Rejects a --dist value that holds a character escape_controls escapes.
+readonly DIST_CONTROLS_PROBLEM='holds a control character or a Unicode line or paragraph separator; pass a path without them'
+
+if holds_controls "$DIST_ARG"; then
+    usage_error "--dist $DIST_ARG $DIST_CONTROLS_PROBLEM"
+fi
+
+
+# Worker isolation
+#   ISOLATION_JS checks the worker of the run root, the script's pid, for intrusions and for co-tenancy:
+#     node -e "$ISOLATION_JS" -- check <root pid> <database port>   exits 0 without output when it finds neither;
+#                                                                    prints the intrusions and exits 1; prints the
+#                                                                    co-tenancy text and exits 3 when it finds
+#                                                                    co-tenancy only; prints the error and exits 4 when
+#                                                                    the check cannot run;
+#     node -e "$ISOLATION_JS" -- watch <root pid> <database port>   checks for intrusions only, every 500 ms while its
+#                                                                    parent is the root; on an intrusion it writes the
+#                                                                    error text to stderr, sends SIGTERM to the root and
+#                                                                    then to the root's other descendants, and exits 1.
+#   A process is admitted when it is the checker, one of its ancestors or a process admitted by an earlier check of the
+#   same checker that found nothing; the root or a member of the checker's process group when that id is not 0, or a
+#   descendant of one of these; pid 1; a kernel thread; or a server: a holder, or the non-root account, of a TCP socket
+#   listening on the database port, with its descendants. The run is the admitted processes but pid 1,
+#   kernel threads and servers; the watch admits only the run. An intrusion is a process of the run whose TracerPid is
+#   not 0. Co-tenancy is a process that is not admitted, a socket of /proc/net/tcp, tcp6, udp and udp6 whose inode is
+#   not 0 and that no admitted process holds, other than a socket of a server's non-root account or a TCP socket on
+#   the database port with the uid of its listener, a process that cannot be inspected, a /proc, /proc/self/mountinfo
+#   or /proc/net table that cannot be read or parsed, and, unless the checker runs as root, a /proc mounted with
+#   hidepid. The watch reads only /proc/<pid>/stat and status, never the descriptors of the processes or the /proc/net
+#   tables. A finding counts once an immediate second collection finds it again. The texts name at most 10 findings by
+#   pid, uid and port, never a command line, an environment or an argument value. The co-tenancy text also gives the
+#   number of findings and states that the run continues and that processes outside this run can read the --password
+#   argument and reach the DevTools endpoint of Chrome.
+# shellcheck disable=SC2016
+readonly ISOLATION_JS='
+"use strict";
+const fs = require("fs");
+const [mode, root, databasePort] = process.argv.slice(1);
+const WATCH_INTERVAL_MS = 500;
+const OFFENDER_LIMIT = 10;
+const PF_KTHREAD = 0x00200000;
+const EXPOSURE = "The run continues; processes outside this run can read the --password argument and reach the "
+    + "DevTools endpoint of Chrome";
+const trustedPorts = new Set([Number(databasePort)]);
+const remembered = new Set();
+
+function readProcesses(violations) {
+    const processes = new Map();
+    let names;
+    try {
+        names = fs.readdirSync("/proc");
+    } catch (error) {
+        violations.push("/proc cannot be listed");
+        return processes;
+    }
+    for (const pid of names.filter((name) => /^\d+$/.test(name))) {
+        let stat;
+        let status;
+        try {
+            stat = fs.readFileSync(`/proc/${pid}/stat`, "latin1");
+            status = fs.readFileSync(`/proc/${pid}/status`, "latin1");
+        } catch (error) {
+            if (error.code !== "ENOENT" && error.code !== "ESRCH") {
+                violations.push(`process ${pid} cannot be inspected`);
+            }
+            continue;
+        }
+        const nameEnd = stat.lastIndexOf(")");
+        const fields = stat.slice(nameEnd + 2).split(" ");
+        const lines = status.split("\n").map((line) => line.split(/[ \t]+/).filter((field) => field !== ""));
+        const uids = lines.find((line) => line[0] === "Uid:");
+        const tracer = lines.find((line) => line[0] === "TracerPid:");
+        if (nameEnd < 0 || fields.length < 20 || ![1, 2, 6, 19].every((index) => /^\d+$/.test(fields[index]))
+            || !uids || uids.length !== 5 || !uids.slice(1).every((uid) => /^\d+$/.test(uid))
+            || !tracer || tracer.length !== 2 || !/^\d+$/.test(tracer[1])) {
+            violations.push(`process ${pid} cannot be inspected`);
+            continue;
+        }
+        processes.set(pid, { ppid: fields[1], pgid: fields[2], start: fields[19],
+            kernel: (Number(fields[6]) & PF_KTHREAD) !== 0, euid: uids[2], tracer: tracer[1] });
+    }
+    return processes;
+}
+
+function descendantsOf(roots, processes) {
+    const children = new Map();
+    for (const [pid, info] of processes) {
+        if (!children.has(info.ppid)) {
+            children.set(info.ppid, []);
+        }
+        children.get(info.ppid).push(pid);
+    }
+    const members = new Set();
+    const pending = roots.filter((pid) => processes.has(pid));
+    while (pending.length > 0) {
+        const pid = pending.pop();
+        if (!members.has(pid)) {
+            members.add(pid);
+            pending.push(...(children.get(pid) || []));
+        }
+    }
+    return members;
+}
+
+function socketInodes(pid) {
+    const inodes = new Set();
+    let entries;
+    try {
+        entries = fs.readdirSync(`/proc/${pid}/fd`);
+    } catch (error) {
+        return inodes;
+    }
+    for (const entry of entries) {
+        let link;
+        try {
+            link = fs.readlinkSync(`/proc/${pid}/fd/${entry}`);
+        } catch (error) {
+            continue;
+        }
+        const match = /^socket:\[(\d+)\]$/.exec(link);
+        if (match) {
+            inodes.add(match[1]);
+        }
+    }
+    return inodes;
+}
+
+function socketTable() {
+    const entries = [];
+    for (const protocol of ["tcp", "tcp6", "udp", "udp6"]) {
+        const table = `/proc/net/${protocol}`;
+        let text;
+        try {
+            text = fs.readFileSync(table, "latin1");
+        } catch (error) {
+            if (error.code === "ENOENT") {
+                continue;
+            }
+            throw new Error(`${table} cannot be read (${error.code})`);
+        }
+        for (const line of text.split("\n").slice(1)) {
+            const fields = line.split(/[ \t]+/).filter((field) => field !== "");
+            if (fields.length === 0) {
+                continue;
+            }
+            const local = /^[0-9A-F]+:([0-9A-F]{4})$/i.exec(fields[1] || "");
+            if (!local || !/^[0-9A-F]+:[0-9A-F]{4}$/i.test(fields[2] || "") || !/^[0-9A-F]{2}$/i.test(fields[3] || "")
+                || !/^\d+$/.test(fields[7] || "") || !/^\d+$/.test(fields[9] || "")) {
+                throw new Error(`${table} holds a line that is not a socket entry`);
+            }
+            entries.push({ protocol, state: fields[3].toUpperCase(), localPort: parseInt(local[1], 16),
+                uid: fields[7], inode: fields[9] });
+        }
+    }
+    return entries;
+}
+
+function collect(full) {
+    const effectiveUid = String(process.geteuid());
+    const coTenancy = [];
+    const intrusion = [];
+    if (full) {
+        let mountinfo = "";
+        try {
+            mountinfo = fs.readFileSync("/proc/self/mountinfo", "utf8");
+        } catch (error) {
+            mountinfo = "";
+        }
+        if (mountinfo === "") {
+            coTenancy.push("/proc/self/mountinfo cannot be read, so the process list cannot be checked");
+        } else if (effectiveUid !== "0") {
+            for (const line of mountinfo.split("\n")) {
+                const fields = line.split(" ");
+                if (fields[4] !== "/proc") {
+                    continue;
+                }
+                for (const option of `${fields[5]},${fields[fields.length - 1]}`.split(",")) {
+                    const value = option.startsWith("hidepid=") ? option.slice("hidepid=".length) : null;
+                    if (value !== null && value !== "0" && value !== "off") {
+                        coTenancy.push(`/proc is mounted with hidepid=${value}, so other accounts processes cannot be listed`);
+                    }
+                }
+            }
+        }
+    }
+    const processes = readProcesses(coTenancy);
+    const self = String(process.pid);
+    const chain = [];
+    for (let current = self; processes.has(current) && !chain.includes(current); current = processes.get(current).ppid) {
+        chain.push(current);
+    }
+    const group = processes.has(self) ? processes.get(self).pgid : "0";
+    const key = (pid) => `${pid}:${processes.get(pid).start}`;
+    const roots = [root];
+    for (const [pid, info] of processes) {
+        if (group !== "0" && info.pgid === group) {
+            roots.push(pid);
+        }
+    }
+    const run = descendantsOf(roots, processes);
+    for (const pid of processes.keys()) {
+        if (chain.includes(pid) || remembered.has(key(pid))) {
+            run.add(pid);
+        }
+    }
+    for (const pid of run) {
+        if (processes.get(pid).tracer !== "0") {
+            intrusion.push(`process ${pid} is traced by process ${processes.get(pid).tracer}`);
+        }
+    }
+    if (!full) {
+        return { coTenancy, intrusion, admitted: new Set([...run].map(key)) };
+    }
+    let table = [];
+    try {
+        table = socketTable();
+    } catch (error) {
+        coTenancy.push(error.message);
+    }
+    const isTcp = (entry) => entry.protocol === "tcp" || entry.protocol === "tcp6";
+    const listening = table.filter((entry) => isTcp(entry) && entry.state === "0A" && trustedPorts.has(entry.localPort));
+    const listeningInodes = new Set(listening.map((entry) => entry.inode));
+    const serverAccounts = new Set(listening.map((entry) => entry.uid).filter((uid) => uid !== "0" && uid !== effectiveUid));
+    const holders = new Map();
+    const serverRoots = [];
+    for (const [pid, info] of processes) {
+        for (const inode of socketInodes(pid)) {
+            if (!holders.has(inode)) {
+                holders.set(inode, []);
+            }
+            holders.get(inode).push(pid);
+            if (listeningInodes.has(inode)) {
+                serverRoots.push(pid);
+            }
+        }
+        if (serverAccounts.has(info.euid)) {
+            serverRoots.push(pid);
+        }
+    }
+    const servers = descendantsOf(serverRoots, processes);
+    const isAdmitted = (pid) => run.has(pid) || servers.has(pid) || pid === "1" || processes.get(pid).kernel;
+    const admitted = new Set();
+    for (const [pid, info] of processes) {
+        if (isAdmitted(pid)) {
+            admitted.add(key(pid));
+        } else {
+            coTenancy.push(`process ${pid} (uid ${info.euid}) is not part of this run`);
+        }
+    }
+    for (const entry of table) {
+        if (entry.inode === "0" || serverAccounts.has(entry.uid) || (holders.get(entry.inode) || []).some(isAdmitted)) {
+            continue;
+        }
+        if (isTcp(entry) && trustedPorts.has(entry.localPort)
+            && listening.some((server) => server.localPort === entry.localPort && server.uid === entry.uid)) {
+            continue;
+        }
+        coTenancy.push(`a ${entry.protocol} socket on local port ${entry.localPort} (uid ${entry.uid}) belongs to no `
+            + "process of this run");
+    }
+    return { coTenancy, intrusion, admitted };
+}
+
+function isolation(full) {
+    const first = collect(full);
+    let coTenancy = full ? [...new Set(first.coTenancy)] : [];
+    let intrusion = [...new Set(first.intrusion)];
+    if (coTenancy.length > 0 || intrusion.length > 0) {
+        const second = collect(full);
+        const coTenancyAgain = new Set(second.coTenancy);
+        const intrusionAgain = new Set(second.intrusion);
+        coTenancy = coTenancy.filter((finding) => coTenancyAgain.has(finding));
+        intrusion = intrusion.filter((finding) => intrusionAgain.has(finding));
+    }
+    if (coTenancy.length === 0 && intrusion.length === 0) {
+        first.admitted.forEach((admittedKey) => remembered.add(admittedKey));
+    }
+    return { coTenancy, intrusion };
+}
+
+function report(findings) {
+    const more = findings.length > OFFENDER_LIMIT ? `; and ${findings.length - OFFENDER_LIMIT} more` : "";
+    return `${findings.slice(0, OFFENDER_LIMIT).join("; ")}${more}`;
+}
+
+function coTenancyReport(findings) {
+    const count = `${findings.length} finding${findings.length === 1 ? "" : "s"}`;
+    return `the worker is not private (${count}): ${report(findings)}. ${EXPOSURE}`;
+}
+
+function stopRun() {
+    const pids = [root];
+    try {
+        const processes = readProcesses([]);
+        for (const pid of descendantsOf([root], processes)) {
+            if (pid !== root && pid !== String(process.pid)) {
+                pids.push(pid);
+            }
+        }
+    } catch (error) {
+        process.stderr.write(`run-acceptance.sh: error: cannot list the processes of the run: ${error.message}\n`);
+    }
+    for (const pid of pids) {
+        try {
+            process.kill(Number(pid), "SIGTERM");
+        } catch (error) {
+            if (error.code !== "ESRCH") {
+                process.stderr.write(`run-acceptance.sh: error: cannot send SIGTERM to process ${pid}: ${error.code}\n`);
+            }
+        }
+    }
+}
+
+if (!/^\d+$/.test(root || "") || !/^\d+$/.test(databasePort || "") || (mode !== "check" && mode !== "watch")) {
+    process.stderr.write("usage: node -e \"$ISOLATION_JS\" -- check|watch <root pid> <database port>\n");
+    process.exit(2);
+}
+
+if (mode === "check") {
+    let findings;
+    try {
+        findings = isolation(true);
+    } catch (error) {
+        process.stdout.write(error.message);
+        process.exit(4);
+    }
+    if (findings.intrusion.length > 0) {
+        process.stdout.write(report(findings.intrusion));
+        process.exit(1);
+    }
+    if (findings.coTenancy.length > 0) {
+        process.stdout.write(coTenancyReport(findings.coTenancy));
+        process.exit(3);
+    }
+} else {
+    const timer = setInterval(() => {
+        if (String(process.ppid) !== root) {
+            clearInterval(timer);
+            return;
+        }
+        let intrusion;
+        try {
+            intrusion = isolation(false).intrusion;
+        } catch (error) {
+            intrusion = [error.message];
+        }
+        if (intrusion.length > 0) {
+            clearInterval(timer);
+            process.stderr.write("run-acceptance.sh: error: stopping the run: worker isolation check failed while it "
+                + `ran: ${report(intrusion)}\n`);
+            process.exitCode = 1;
+            stopRun();
+        }
+    }, WATCH_INTERVAL_MS);
+}
+'
+
+# Runs node -e "$ISOLATION_JS" -- check for the script's pid and DB_PORT; the argument names the step the check
+# precedes. Exits with status 1, naming the step and the intrusions, when the check finds an intrusion (status 1 with
+# a text), and naming the status and any text when the check cannot run (any other status than 0 and 3, or 3 without
+# a text). Prints the co-tenancy text through warn, as one line on stderr, when the check finds co-tenancy only
+# (status 3), and logs the passed check when it finds neither (status 0).
+check_worker_isolation() {
+    local step="$1" isolation_report='' isolation_status=0
+
+    isolation_report="$(node -e "$ISOLATION_JS" -- check "$$" "$DB_PORT")" || isolation_status=$?
+
+    if [ "$isolation_status" -eq 1 ] && [ -n "$isolation_report" ]; then
+        die "worker isolation check failed $step: $isolation_report"
+    elif [ "$isolation_status" -eq 3 ] && [ -n "$isolation_report" ]; then
+        warn "worker isolation $step: $isolation_report"
+    elif [ "$isolation_status" -ne 0 ]; then
+        die "the worker isolation check $step could not run: node exited with status $isolation_status${isolation_report:+: $isolation_report}"
+    else
+        log "worker isolation $step: every process and socket belongs to this run or to the database server on port $DB_PORT"
+    fi
+}
+
+# Starts node -e "$ISOLATION_JS" -- watch for the script's pid and DB_PORT in the background, which checks for
+# intrusions until the script exits, and records its pid in ISOLATION_WATCH_PID.
+start_isolation_watch() {
+    node -e "$ISOLATION_JS" -- watch "$$" "$DB_PORT" < /dev/null &
+    ISOLATION_WATCH_PID=$!
+    log "worker isolation watch started (pid $ISOLATION_WATCH_PID)"
+}
+
+# Sends SIGTERM to the isolation watch when it runs and reaps it; clears ISOLATION_WATCH_PID.
+# shellcheck disable=SC2317
+stop_isolation_watch() {
+    if [ -n "$ISOLATION_WATCH_PID" ]; then
+        kill -TERM "$ISOLATION_WATCH_PID" 2> /dev/null
+        wait "$ISOLATION_WATCH_PID" 2> /dev/null
+        ISOLATION_WATCH_PID=''
+    fi
+}
+
+# Resolves the distribution against the caller's working directory, rejects an absolute path that holds a character
+# escape_controls escapes, and normalizes its directory.
 DIST="$(absolute_path "$DIST_ARG")"
+
+if holds_controls "$DIST"; then
+    usage_error "--dist $DIST_ARG resolves to $DIST, which $DIST_CONTROLS_PROBLEM"
+fi
 
 if [ -d "$(dirname "$DIST")" ]; then
     DIST="$(cd "$(dirname "$DIST")" && pwd)/$(basename "$DIST")"
@@ -1172,7 +1839,8 @@ fi
 # Preflight
 # ---------------------------------------------------------------------------------------------------------------
 
-# Rewrites every relative or empty PATH entry as an absolute path below the current working directory.
+# Rewrites every relative PATH entry as the physical current working directory, '/' and the entry, and every empty
+# entry as that directory; entries are not normalized, so one holding .. can name a directory outside that directory.
 caller_dir=''
 canonical_path=''
 path_separator=''
@@ -1332,17 +2000,52 @@ else
 fi
 
 is_port "$DB_PORT" || die "dbJdbcUrl $REPO_DB_URL has port $DB_PORT outside 1 to 65535"
+DB_PORT="$((10#$DB_PORT))"
+
+# Requires the database host to be localhost or a 127.0.0.0/8 address.
+if [ "$DB_HOST" != 'localhost' ] && ! is_loopback_ipv4 "$DB_HOST"; then
+    die "dbJdbcUrl $REPO_DB_URL names host $DB_HOST; the acceptance database has to be on localhost or 127.0.0.0/8"
+fi
 
 DB_NAME="${DB_NAME_ARG:-$REPO_DB_NAME}"
 
 is_db_name "$DB_NAME" || die "database name '$DB_NAME' does not match ^[A-Za-z_][A-Za-z0-9_]*\$ or is longer than 63 characters"
 
-# Builds the psql connection URIs.
+# Unsets every exported variable whose name starts with PG; psql then takes its connection parameters only from DB_URI
+# and ADMIN_URI.
+while IFS= read -r exported_name; do
+    case "$exported_name" in
+        PG*) unset "$exported_name" || die "cannot unset the exported variable $exported_name" ;;
+    esac
+done < <(compgen -e)
+
+# Writes the libpq password file PASSFILE, mode 600, with the one line <host>:<port>:*:<user>:<password> of
+# conf/tomcat/db.properties, using only shell builtins.
+PASSFILE="$WORK_DIR/pgpass"
+
+(
+    umask 077
+    set -C
+    printf '%s:%s:*:%s:%s\n' "$(pgpass_field "$DB_HOST")" "$DB_PORT" "$(pgpass_field "$REPO_DB_USER")" \
+        "$(pgpass_field "$REPO_DB_PASSWORD")" > "$PASSFILE"
+) || die "cannot write the password file $PASSFILE"
+
+if [ ! -f "$PASSFILE" ] || [ -L "$PASSFILE" ] || [ "$(stat -c %a -- "$PASSFILE")" != '600' ]; then
+    die "the password file $PASSFILE is not a regular file with mode 600"
+fi
+
+# Builds the psql connection URIs, without a password and with the password file PASSFILE, and the server guards of
+# their databases.
 ENCODED_DB_USER="$(url_encode "$REPO_DB_USER")"
-ENCODED_DB_PASSWORD="$(url_encode "$REPO_DB_PASSWORD")"
-PSQL_URI_OPTIONS="connect_timeout=$PSQL_CONNECT_TIMEOUT_SECONDS"
-DB_URI="postgresql://$ENCODED_DB_USER:$ENCODED_DB_PASSWORD@$DB_HOST:$DB_PORT/$DB_NAME?$PSQL_URI_OPTIONS"
-ADMIN_URI="postgresql://$ENCODED_DB_USER:$ENCODED_DB_PASSWORD@$DB_HOST:$DB_PORT/postgres?$PSQL_URI_OPTIONS"
+PSQL_URI_OPTIONS="connect_timeout=$PSQL_CONNECT_TIMEOUT_SECONDS&passfile=$(url_encode "$PASSFILE")"
+DB_URI="postgresql://$ENCODED_DB_USER@$DB_HOST:$DB_PORT/$DB_NAME?$PSQL_URI_OPTIONS"
+ADMIN_URI="postgresql://$ENCODED_DB_USER@$DB_HOST:$DB_PORT/postgres?$PSQL_URI_OPTIONS"
+DB_GUARD_SQL="$(server_guard_sql "$DB_NAME")"
+ADMIN_GUARD_SQL="$(server_guard_sql postgres)"
+
+# Checks worker isolation, then watches for intrusions until the script exits.
+check_worker_isolation 'before the database and Tomcat steps'
+start_isolation_watch
 
 # Checks the PostgreSQL server answers.
 log "checking PostgreSQL at $DB_HOST:$DB_PORT as $REPO_DB_USER"
@@ -1360,6 +2063,7 @@ log "taking the run guard of database $DB_NAME"
 
 coproc RUN_GUARD {
     exec setsid --wait psql -X -w -q -At -v ON_ERROR_STOP=1 -d "$RUN_GUARD_URI" \
+        -c "$ADMIN_GUARD_SQL" \
         -c 'SET idle_session_timeout = 0' \
         -c "SELECT pg_try_advisory_lock(hashtextextended('$RUN_GUARD_KEY', 0))" \
         -f - 2>&1
@@ -1582,7 +2286,8 @@ fi
 
 # Recreates the marked acceptance database.
 existing_database="$(psql_admin -c "SELECT 'present:' || coalesce(shobj_description(oid, 'pg_database'), '')
-    FROM pg_catalog.pg_database WHERE datname = '$DB_NAME'")"
+    FROM pg_catalog.pg_database WHERE datname = '$DB_NAME'")" \
+    || die "reading the comment of database $DB_NAME failed: psql exited with status $?"
 
 if [ -n "$existing_database" ]; then
     existing_comment="${existing_database#present:}"
@@ -1592,35 +2297,41 @@ if [ -n "$existing_database" ]; then
     fi
 
     log "dropping acceptance database $DB_NAME"
-    psql_admin -q -c "DROP DATABASE \"$DB_NAME\" WITH (FORCE)"
+    psql_admin -q -c "DROP DATABASE \"$DB_NAME\" WITH (FORCE)" \
+        || die "dropping database $DB_NAME failed: psql exited with status $?"
 fi
 
 log "creating acceptance database $DB_NAME"
 psql_admin -q -c "CREATE DATABASE \"$DB_NAME\" ENCODING 'UTF8' TEMPLATE template0" \
-    -c "COMMENT ON DATABASE \"$DB_NAME\" IS '$MARKER'"
+    -c "COMMENT ON DATABASE \"$DB_NAME\" IS '$MARKER'" \
+    || die "creating database $DB_NAME with the comment $MARKER failed: psql exited with status $?"
 
 # Loads the seed.
 log "loading $SEED_SQL into $DB_NAME"
-psql_with_deadline "$PSQL_SEED_TIMEOUT_SECONDS" -q -d "$DB_URI" -f "$SEED_SQL" > "$WORK_DIR/seed.log"
+psql_with_deadline "$PSQL_SEED_TIMEOUT_SECONDS" -q -d "$DB_URI" -c "$DB_GUARD_SQL" -f "$SEED_SQL" > "$WORK_DIR/seed.log" \
+    || die "loading $SEED_SQL into $DB_NAME failed: psql exited with status $?"
 log 'seed loaded'
 
 # Loads the fixture.
 FIXTURE_LOG="$WORK_DIR/fixture.log"
 
 log "loading $FIXTURE_SQL into $DB_NAME"
-psql_with_deadline "$PSQL_FIXTURE_TIMEOUT_SECONDS" -v base_day="$BASE_DAY" -d "$DB_URI" -f "$FIXTURE_SQL" 2>&1 \
-    | tee "$FIXTURE_LOG"
+psql_with_deadline "$PSQL_FIXTURE_TIMEOUT_SECONDS" -v base_day="$BASE_DAY" -d "$DB_URI" -c "$DB_GUARD_SQL" \
+    -f "$FIXTURE_SQL" 2>&1 | tee "$FIXTURE_LOG" \
+    || die "loading $FIXTURE_SQL into $DB_NAME failed: psql exited with status ${PIPESTATUS[0]}, tee with status ${PIPESTATUS[1]}"
 log 'fixture loaded'
 
 # Checks the plugins the suite needs are enabled.
 enabled_plugins="$(psql_db -c "SELECT count(*) FROM public.qcadooplugin_plugin WHERE state = 'ENABLED'
-    AND identifier IN ('productionScheduling','lineChangeoverNormsForOrders','cmmsMachineParts')")"
+    AND identifier IN ('productionScheduling','lineChangeoverNormsForOrders','cmmsMachineParts')")" \
+    || die "counting the enabled plugins of database $DB_NAME failed: psql exited with status $?"
 
 if [ "$enabled_plugins" != "${#REQUIRED_PLUGINS[@]}" ]; then
     missing_plugins="$(psql_db -c "SELECT string_agg(required.identifier, ', ' ORDER BY required.identifier)
         FROM (VALUES ('productionScheduling'), ('lineChangeoverNormsForOrders'), ('cmmsMachineParts')) AS required (identifier)
         WHERE NOT EXISTS (SELECT 1 FROM public.qcadooplugin_plugin plugin
-            WHERE plugin.identifier = required.identifier AND plugin.state = 'ENABLED')")"
+            WHERE plugin.identifier = required.identifier AND plugin.state = 'ENABLED')")" \
+        || die "listing the plugins not enabled in database $DB_NAME failed: psql exited with status $?"
     die "plugins not enabled in database $DB_NAME: $missing_plugins"
 fi
 
@@ -1683,6 +2394,9 @@ verify_tomcat_listener "after $BASE_URL/login.html answered"
 
 TAP_LOG="$WORK_DIR/acceptance.tap"
 
+# Repeats the worker isolation check right before acceptance.test.js starts.
+check_worker_isolation 'before acceptance.test.js starts'
+
 log "running acceptance.test.js against $BASE_URL with base day $BASE_DAY"
 cd "$SCRIPT_DIR"
 
@@ -1697,6 +2411,7 @@ TEE_STATUS="${pipe_status[1]}"
 
 if [ "$RUNNER_STATUS" -ne 0 ]; then
     printf '%s: error: acceptance.test.js exited with status %s\n' "$PROGRAM" "$RUNNER_STATUS" >&2
+    KEPT_STATUS="$RUNNER_STATUS"
     exit "$RUNNER_STATUS"
 fi
 

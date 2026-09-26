@@ -182,9 +182,10 @@ public class ProductionMaintenanceGanttListenersTest {
 
     /**
      * Runs against a real {@link GanttChartComponentState} whose resolver fails on the refresh after the move service
-     * returned: the listener throws the resolver's {@link IllegalStateException} unchanged, calls the move service exactly
-     * once with no further interaction and resolves exactly twice (the built-in handler and one refresh); rendering the
-     * component then throws an {@link IllegalStateException} naming position 11, and the view receives no message.
+     * returned: the listener throws the resolver's {@link IllegalStateException} unchanged and calls the move service exactly
+     * once with no further interaction. The resolver is invoked exactly twice: once by the component's built-in moveItem
+     * handler and once by the refresh that {@link GanttChartComponentState#acceptMove()} runs. Rendering the component then
+     * throws an {@link IllegalStateException} naming position 11, and the view receives no message.
      */
     @Test
     public final void shouldPropagateRefreshFailureAfterMoveWithoutRetry() throws Exception {

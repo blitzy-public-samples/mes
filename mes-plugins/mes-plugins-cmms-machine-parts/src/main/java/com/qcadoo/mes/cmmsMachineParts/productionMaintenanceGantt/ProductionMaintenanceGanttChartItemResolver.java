@@ -49,6 +49,7 @@ import com.qcadoo.mes.basic.constants.BasicConstants;
 import com.qcadoo.mes.basic.constants.ProductFields;
 import com.qcadoo.mes.cmmsMachineParts.constants.CmmsMachinePartsConstants;
 import com.qcadoo.mes.cmmsMachineParts.constants.PlannedEventFields;
+import com.qcadoo.mes.cmmsMachineParts.constants.PlannedEventType;
 import com.qcadoo.mes.cmmsMachineParts.states.constants.PlannedEventState;
 import com.qcadoo.mes.orders.constants.OrderFields;
 import com.qcadoo.mes.orders.constants.OrdersConstants;
@@ -84,20 +85,8 @@ import com.qcadoo.view.api.components.ganttChart.GanttChartScale;
  * to the Gantt component's collision detection.
  * <p>
  * Every read is one HQL query through {@link DataDefinition#find(String)}, without a row count and without loading whole
- * entities. Besides the columns the board shows, the queries select ids: the schedule id with its state, the production
- * line id with each seeded line number, the position id that becomes a draft position's entity id, and the production line
- * and division ids that associate planned events with rows and resolve their production lines:
- * <ol>
- * <li>the id and state of the schedule;</li>
- * <li>the ids and numbers of the production lines seeding the rows;</li>
- * <li>the positions of the schedule overlapping the scale, joined with their production line, order and product;</li>
- * <li>the planned events overlapping the scale that are placed on at least one production line, each with the ids and
- * numbers of its own production line and of its workstation's production line, and its division id;</li>
- * <li>only when some of those events have neither production line, the ids and numbers of the production lines of their
- * divisions, with the division ids, in one query for all of them.</li>
- * </ol>
- * {@link #findShutdownEventNumbers(Entity, Date, Date)} reads planned events the same way, restricted to events that
- * require a shutdown and can be placed on one given production line.
+ * entities; each query constant documents its projection. Besides the columns the board shows, the queries select the
+ * schedule id and state, the position ids, and the production line and division ids.
  * <p>
  * The schedule is read from the component context, for example a view opened with
  * {@code context={"gantt.productionLineScheduleId":"12"}} passes {@code {"productionLineScheduleId":"12"}} here. A missing,
@@ -137,12 +126,13 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
     public static final String ITEM_REQUIRES_SHUTDOWN_KEY = "cmmsMachineParts.productionMaintenanceGantt.item.requiresShutdown";
 
     /**
-     * State label of a planned event without a state.
+     * Type label of a planned event without a type, and state label of a planned event without a state.
      */
     public static final String ITEM_STATE_UNSPECIFIED_KEY = "cmmsMachineParts.productionMaintenanceGantt.item.stateUnspecified";
 
     /**
-     * State label of a planned event whose state is none of the declared states.
+     * Type label of a planned event whose type is none of the declared types, and state label of a planned event whose state
+     * is none of the declared states.
      */
     public static final String ITEM_STATE_UNKNOWN_KEY = "cmmsMachineParts.productionMaintenanceGantt.item.stateUnknown";
 
@@ -439,13 +429,16 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
 
     /**
      * Returns a text of the value that holds no line break or other control character and is at most
-     * {@value #LOG_VALUE_MAX_LENGTH} characters of the value long, followed by the value's length when it was cut. The text
-     * is enclosed in quotes; backslashes and quotes of the value are escaped with a backslash, and control characters and
-     * the Unicode line and paragraph separators are written as a backslash, the letter {@code u} and the four lower-case
-     * hexadecimal digits of the character.
+     * {@value #LOG_VALUE_MAX_LENGTH} characters of the value long, followed by the value's length when it was cut. A value
+     * longer than {@value #LOG_VALUE_MAX_LENGTH} characters is cut after its first {@value #LOG_VALUE_MAX_LENGTH}
+     * characters, or after its first {@value #LOG_VALUE_MAX_LENGTH} characters but one when the last of them is a high
+     * surrogate; a cut text never ends in a high surrogate. The text is enclosed in quotes; backslashes and quotes of the
+     * value are escaped with a backslash, and control characters and the Unicode line and paragraph separators are written
+     * as a backslash, the letter {@code u} and the four lower-case hexadecimal digits of the character.
      * <p>
      * For example a value made of {@code x}, a line feed and {@code WARN forged} is written on one line, with the line feed
-     * written as a backslash followed by {@code u000a}.
+     * written as a backslash followed by {@code u000a}. A value of 63 {@code a} followed by the two characters of the
+     * surrogate pair of U+1F600 is written as the 63 {@code a} in quotes followed by {@code ... (65 characters)}.
      *
      * @param value
      *            the value to write into a log message, may be null
@@ -457,6 +450,11 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
         }
 
         int length = Math.min(value.length(), LOG_VALUE_MAX_LENGTH);
+
+        if (length < value.length() && Character.isHighSurrogate(value.charAt(length - 1))) {
+            length--;
+        }
+
         StringBuilder logValue = new StringBuilder(length + 2).append('"');
 
         for (int index = 0; index < length; index++) {
@@ -696,13 +694,46 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
 
     private GanttChartItemTooltipBuilder getPlannedEventTooltip(final Entity event, final String label,
             final boolean requiresShutdown, final Locale locale) {
-        String typeLabel = escape(translate(PLANNED_EVENT_TYPE_VALUE_PREFIX + event.getStringField(L_EVENT_TYPE), locale));
+        String typeLabel = typeLabel(event.getStringField(L_EVENT_TYPE), locale);
         String stateLabel = stateLabel(event.getStringField(L_EVENT_STATE), locale);
         String requiresShutdownLabel = translate(requiresShutdown ? TRUE_KEY : FALSE_KEY, locale);
 
         return new GanttChartItemTooltipBuilder().withHeader(label)
                 .addLineToContent(translate(ITEM_PLANNED_EVENT_KEY, locale, typeLabel, stateLabel))
                 .addLineToContent(translate(ITEM_REQUIRES_SHUTDOWN_KEY, locale, requiresShutdownLabel));
+    }
+
+    /**
+     * Returns the HTML-escaped type label of a planned event: the translation of {@link #ITEM_STATE_UNSPECIFIED_KEY} when
+     * the type is null or blank; the translation of the type's value key when the type is the string value of one of the
+     * {@link PlannedEventType} constants; otherwise the translation of {@link #ITEM_STATE_UNKNOWN_KEY}. A message code is
+     * built only from the string value of a declared type, never from the given type.
+     * <p>
+     * For example {@code 02repairs} gives the translation of {@code cmmsMachineParts.plannedEvent.type.value.02repairs},
+     * and {@code 09imported} gives the translation of {@link #ITEM_STATE_UNKNOWN_KEY}.
+     *
+     * @param type
+     *            the persisted type of the planned event, may be null
+     * @param locale
+     *            the locale of the translation
+     * @return the escaped type label
+     */
+    private String typeLabel(final String type, final Locale locale) {
+        String messageCode = ITEM_STATE_UNKNOWN_KEY;
+
+        if (StringUtils.isBlank(type)) {
+            messageCode = ITEM_STATE_UNSPECIFIED_KEY;
+        } else {
+            for (PlannedEventType declaredType : PlannedEventType.values()) {
+                if (declaredType.getStringValue().equals(type)) {
+                    messageCode = PLANNED_EVENT_TYPE_VALUE_PREFIX + declaredType.getStringValue();
+
+                    break;
+                }
+            }
+        }
+
+        return escape(translate(messageCode, locale));
     }
 
     /**
@@ -795,7 +826,9 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
     }
 
     /**
-     * Id and number of a production line an event is placed on.
+     * Id and optional number of a production line an event is placed on; the number is null when only the id is known.
+     * {@link #findShutdownEventNumbers(Entity, Date, Date)} uses an id-only reference of the given production line as the
+     * division production line.
      */
     private static final class LineReference {
 

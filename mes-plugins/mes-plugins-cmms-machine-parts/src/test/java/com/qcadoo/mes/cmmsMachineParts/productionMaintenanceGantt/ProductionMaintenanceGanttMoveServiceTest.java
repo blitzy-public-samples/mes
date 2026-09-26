@@ -61,10 +61,18 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TimeZone;
 
+import org.apache.commons.lang3.StringUtils;
+import org.apache.log4j.AppenderSkeleton;
+import org.apache.log4j.Level;
+import org.apache.log4j.Logger;
+import org.apache.log4j.spi.LoggingEvent;
 import org.joda.time.DateTime;
+import org.joda.time.DateTimeZone;
 import org.json.JSONException;
 import org.json.JSONObject;
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.mockito.InOrder;
@@ -115,31 +123,41 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * Unit tests of {@link ProductionMaintenanceGanttMoveService}.
  * <p>
  * The service runs against a spy of a real {@link ProductionMaintenanceGanttMoveValidator} whose collaborators are
- * mocks stubbed so that every check passes: the order's technology allows both production lines, no planned event
- * requires a shutdown, the nearest working date of the target line is the slot start itself, and the stored position
- * equals the item as rendered. The basic parameter data definition counts one parameter, and {@link ParameterService}
- * returns a parameter whose {@code canChangeProdLineForAcceptedOrders} is false. The production line data definition
- * answers {@code find()} with a builder that records its criteria, orders and maximum result count, and selects the fixture
- * entities satisfying every recorded criterion. Unknown criteria, unknown orders and unknown builder methods fail the test.
+ * mocks answering as follows: the order's technology allows production lines L1 and L2, no planned event requires a
+ * shutdown, the nearest working date of the target line is the date asked for, and the stored position equals the item as
+ * rendered. With these answers every check passes. The basic parameter data definition counts one parameter, and
+ * {@link ParameterService} returns a parameter whose {@code canChangeProdLineForAcceptedOrders} is false. The production line
+ * data definition answers {@code find()} with a builder that records its criteria, orders and maximum result count, and
+ * selects the fixture entities satisfying every recorded criterion. Unknown criteria, unknown orders and unknown builder
+ * methods fail the test.
  * The planned event data definition answers {@code find(String)} of
  * {@link ProductionMaintenanceGanttChartItemResolver#SHUTDOWN_EVENTS_QUERY} with projection rows of the fixture planned
  * events the query selects, and fails on {@code find()}, on any other query and on a missing or unexpected parameter.
  * <p>
- * Tests that depart from this passing setup change it in four ways:
+ * Tests depart from this passing setup in ways that include these:
  * <ul>
  * <li>routing, shutdown-window and working-hours tests change the answer of the collaborator of their own check: the
  * candidate production lines of the order's technology, the planned events, or the nearest working date;</li>
- * <li>stale-position, schedule-state, schedule-membership, context, unknown-position, target-row and item-id tests change a
- * field of the stored position or schedule, the position returned for the item's id, or an input of the move request;</li>
+ * <li>stale-position, schedule-state, schedule-membership, context, schedule-id, unknown-position, target-row, item-id and
+ * date-range tests change a field of the stored position or schedule, the position returned for the item's id, or an input
+ * of the move request, such as a forged target row, a target row of 255 or 256 characters, a schedule id text of 19 or 20
+ * characters, a start or end in the years 1499, 1500, 2500, 2501 or 3000, or an end of {@code new Date(Long.MAX_VALUE)};</li>
+ * <li>duplicate target-line tests add a second production line numbered L2 to the fixture production lines;</li>
  * <li>basic parameter tests make the basic parameter data definition count no parameter, or return no basic parameter data
  * definition;</li>
  * <li>invalid-save tests make the save of the position return null or an invalid entity, and recompute tests make the
- * recompute service throw.</li>
+ * recompute service throw;</li>
+ * <li>fixture builder tests call the production line data definition's builder directly, with unmodelled builder methods or
+ * with an inactive production line added;</li>
+ * <li>the remaining tests call {@code move} with a null request, read the annotation of {@code move} or the message key
+ * constants, or call {@link ProductionMaintenanceGanttMoveService#isConcurrencyConflict(Throwable)} or the
+ * {@link MoveRejectedException} constructor directly.</li>
  * </ul>
- * The recompute service is a mock, so the production line schedule executor services behind it are not reached. A move
- * rejected before the save is asserted to leave the position unchanged and unsaved and the recompute service without any
- * interaction; a move rejected by an invalid save is asserted to leave the position without a fast save and the recompute
- * service without any interaction.
+ * The recompute service is mocked; these tests do not run PS/PPS executors. A move rejected before the save is asserted to
+ * leave the position unchanged and unsaved and the recompute service without any interaction; a move rejected by an invalid
+ * save is asserted to leave the position without a fast save and the recompute service without any interaction. The log4j
+ * logger of the move service is set to the debug level, without additivity, with an appender recording its events, and is
+ * restored after each test.
  * <p>
  * Fixture: draft schedule 7; production lines L1 (id 1, origin), L2 (id 2, target) and L3 (id 3); position 11 of order ORD-1 on
  * L1 from 08:00 to 10:00; move request onto row L2 from 10:00 to 12:00, rendered as row L1, name ORD-1, 08:00 to 10:00.
@@ -163,6 +181,12 @@ public class ProductionMaintenanceGanttMoveServiceTest {
     private static final String OTHER_LINE_NUMBER = "L3";
 
     private static final String UNKNOWN_LINE_NUMBER = "L9";
+
+    private static final String FORGED_LINE_NUMBER = "L9\r\n2026-10-01 12:00:00 INFO forged entry\tsecret-token";
+
+    private static final String LONGEST_LINE_NUMBER = StringUtils.repeat('L', 255);
+
+    private static final String TOO_LONG_LINE_NUMBER = StringUtils.repeat('L', 256);
 
     private static final String POSITION_START = "2026-10-01 08:00:00";
 
@@ -215,6 +239,14 @@ public class ProductionMaintenanceGanttMoveServiceTest {
     private final List<FixtureQuery> productionLineQueries = new ArrayList<FixtureQuery>();
 
     private final List<String> plannedEventQueries = new ArrayList<String>();
+
+    private final RecordingAppender logAppender = new RecordingAppender();
+
+    private Logger moveServiceLogger;
+
+    private Level previousLogLevel;
+
+    private boolean previousLogAdditivity;
 
     @Before
     public void init() {
@@ -299,6 +331,21 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         setField(moveService, "dataDefinitionService", dataDefinitionService);
         setField(moveService, "productionMaintenanceGanttMoveValidator", validatorSpy);
         setField(moveService, "productionMaintenanceGanttRecomputeService", recomputeService);
+
+        moveServiceLogger = Logger.getLogger(ProductionMaintenanceGanttMoveService.class);
+        previousLogLevel = moveServiceLogger.getLevel();
+        previousLogAdditivity = moveServiceLogger.getAdditivity();
+
+        moveServiceLogger.setLevel(Level.DEBUG);
+        moveServiceLogger.setAdditivity(false);
+        moveServiceLogger.addAppender(logAppender);
+    }
+
+    @After
+    public void restoreMoveServiceLogger() {
+        moveServiceLogger.removeAppender(logAppender);
+        moveServiceLogger.setLevel(previousLogLevel);
+        moveServiceLogger.setAdditivity(previousLogAdditivity);
     }
 
     @Test
@@ -644,6 +691,38 @@ public class ProductionMaintenanceGanttMoveServiceTest {
     }
 
     @Test
+    public final void shouldRejectScheduleIdTextOfTwentyDigitsEqualToScheduleId() {
+        // given
+        GanttChartMoveRequest request = moveRequest(TARGET_LINE_NUMBER,
+                context(ProductionMaintenanceGanttChartItemResolver.CONTEXT_SCHEDULE_ID, "00000000000000000007"));
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY);
+        verify(positionDD).get(POSITION_ID);
+        verifyZeroInteractions(productionLineDD);
+        assertValidatorNeverCalled();
+        assertNothingPersisted();
+    }
+
+    @Test
+    public final void shouldAcceptScheduleIdTextOfNineteenDigitsBetweenSpaces() {
+        // given
+        GanttChartMoveRequest request = moveRequest(TARGET_LINE_NUMBER,
+                context(ProductionMaintenanceGanttChartItemResolver.CONTEXT_SCHEDULE_ID, "  0000000000000000007  "));
+
+        // when
+        moveService.move(request);
+
+        // then
+        verify(validatorSpy).validate(position, lineL2, request);
+        verify(positionDD).save(position);
+        verify(recomputeService).recompute(schedule, savedPosition, lineL1, positionStart, lineL2, slotFrom);
+    }
+
+    @Test
     public final void shouldRejectUnknownPosition() {
         // given
         given(positionDD.get(POSITION_ID)).willReturn(null);
@@ -710,6 +789,103 @@ public class ProductionMaintenanceGanttMoveServiceTest {
     }
 
     @Test
+    public final void shouldRejectStartInYear3000BeforeUsingAnyDataDefinition() {
+        // given
+        GanttChartMoveRequest request = moveRequest(wallClock(3000, 1, 1, 10, 30, 0, 0), wallClock(3000, 1, 1, 12, 30, 0, 0));
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.DATE_OUT_OF_RANGE_KEY, "1500", "2500");
+        assertNoDataDefinitionUsed();
+        assertNothingPersisted();
+        assertEquals(Collections.singletonList("Gantt move of production line schedule position 11 rejected with "
+                + ProductionMaintenanceGanttMoveService.DATE_OUT_OF_RANGE_KEY), loggedMessages(Level.DEBUG));
+    }
+
+    @Test
+    public final void shouldRejectEndInYear2501OfStartInYear2500() {
+        // given
+        GanttChartMoveRequest request = moveRequest(wallClock(2500, 12, 31, 23, 0, 0, 0), wallClock(2501, 1, 1, 1, 0, 0, 0));
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.DATE_OUT_OF_RANGE_KEY, "1500", "2500");
+        assertNoDataDefinitionUsed();
+        assertNothingPersisted();
+    }
+
+    @Test
+    public final void shouldRejectStartOneMillisecondBeforeYear1500() {
+        // given
+        GanttChartMoveRequest request = moveRequest(wallClock(1499, 12, 31, 23, 59, 59, 999),
+                wallClock(1500, 1, 1, 2, 0, 0, 0));
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.DATE_OUT_OF_RANGE_KEY, "1500", "2500");
+        assertNoDataDefinitionUsed();
+        assertNothingPersisted();
+    }
+
+    @Test
+    public final void shouldRejectEndWhoseLocalDateCannotBeComputed() {
+        // given
+        GanttChartMoveRequest request = moveRequest(slotFrom, new Date(Long.MAX_VALUE));
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.DATE_OUT_OF_RANGE_KEY, "1500", "2500");
+        assertNoDataDefinitionUsed();
+        assertNothingPersisted();
+    }
+
+    @Test
+    public final void shouldMoveStartingAtFirstInstantOfYear1500() {
+        // given
+        Date dateFrom = wallClock(1500, 1, 1, 0, 0, 0, 0);
+        Date dateTo = wallClock(1500, 1, 1, 2, 0, 0, 0);
+
+        GanttChartMoveRequest request = moveRequest(dateFrom, dateTo);
+
+        // when
+        moveService.move(request);
+
+        // then
+        verify(validatorSpy).checkShutdownWindow(lineL2, dateFrom, dateTo);
+        verify(position).setField(ProductionLineSchedulePositionFields.START_TIME, dateFrom);
+        verify(position).setField(ProductionLineSchedulePositionFields.END_TIME, dateTo);
+        verify(positionDD).save(position);
+        verify(recomputeService).recompute(schedule, savedPosition, lineL1, positionStart, lineL2, dateFrom);
+    }
+
+    @Test
+    public final void shouldMoveEndingAtLastInstantOfYear2500() {
+        // given
+        Date dateFrom = wallClock(2500, 12, 31, 22, 0, 0, 0);
+        Date dateTo = wallClock(2500, 12, 31, 23, 59, 59, 999);
+
+        GanttChartMoveRequest request = moveRequest(dateFrom, dateTo);
+
+        // when
+        moveService.move(request);
+
+        // then
+        verify(validatorSpy).checkShutdownWindow(lineL2, dateFrom, dateTo);
+        verify(position).setField(ProductionLineSchedulePositionFields.START_TIME, dateFrom);
+        verify(position).setField(ProductionLineSchedulePositionFields.END_TIME, dateTo);
+        verify(positionDD).save(position);
+        verify(recomputeService).recompute(schedule, savedPosition, lineL1, positionStart, lineL2, dateFrom);
+    }
+
+    @Test
     public final void shouldFailOnNullRequest() {
         // given
         GanttChartMoveRequest request = null;
@@ -751,18 +927,21 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         String expectedOptimisticLockKey = "qcadooView.validate.global.optimisticLock";
         String expectedSaveFailedKey = "cmmsMachineParts.productionMaintenanceGantt.move.error.saveFailed";
         String expectedRecomputeFailedKey = "cmmsMachineParts.productionMaintenanceGantt.move.error.recomputeFailed";
+        String expectedDateOutOfRangeKey = "qcadooView.gantt.move.error.dateOutOfRange";
 
         // when
         String optimisticLockKey = ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY;
         String validatorOptimisticLockKey = ProductionMaintenanceGanttMoveValidator.OPTIMISTIC_LOCK_KEY;
         String saveFailedKey = ProductionMaintenanceGanttMoveService.SAVE_FAILED_KEY;
         String recomputeFailedKey = ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY;
+        String dateOutOfRangeKey = ProductionMaintenanceGanttMoveService.DATE_OUT_OF_RANGE_KEY;
 
         // then
         assertEquals(expectedOptimisticLockKey, optimisticLockKey);
         assertEquals(validatorOptimisticLockKey, optimisticLockKey);
         assertEquals(expectedSaveFailedKey, saveFailedKey);
         assertEquals(expectedRecomputeFailedKey, recomputeFailedKey);
+        assertEquals(expectedDateOutOfRangeKey, dateOutOfRangeKey);
     }
 
 
@@ -1222,35 +1401,111 @@ public class ProductionMaintenanceGanttMoveServiceTest {
     }
 
     @Test
-    public final void shouldEscapeLineBreaksAndControlCharactersOfLogValue() {
+    public final void shouldLogOnlyReasonOfStaleBoardRejectionForForgedTargetRow() {
         // given
-        String forgedRowName = "L2\r\n2026-10-01 12:00:00 INFO forged entry\t\u0007";
+        GanttChartMoveRequest request = moveRequest(FORGED_LINE_NUMBER, scheduleContext());
 
         // when
-        String logValue = ProductionMaintenanceGanttMoveService.toLogValue(forgedRowName);
+        MoveRejectedException rejection = rejectionOf(request);
 
         // then
-        assertFalse(logValue.contains("\r"));
-        assertFalse(logValue.contains("\n"));
-        assertFalse(logValue.contains("\t"));
-        assertTrue(logValue.contains("\\r\\n"));
-        assertEquals("L2\\r\\n2026-10-01 12:00:00 INFO forged entry\\t\\u0007", logValue);
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY);
+        assertEquals(1, productionLineQueries.size());
+        assertEquals(Collections.singletonList(SearchRestrictions.eq(ProductionLineFields.NUMBER, FORGED_LINE_NUMBER)),
+                productionLineQueries.get(0).getCriteria());
+        assertEquals(Collections.singletonList("Gantt move rejected with the optimistic lock message: "
+                + "no production line for target row"), loggedMessages(Level.DEBUG));
+        assertValidatorNeverCalled();
+        assertNothingPersisted();
     }
 
     @Test
-    public final void shouldKeepIdentifiersAndNullReadableInLogValue() {
+    public final void shouldLogOnlyReasonOfStaleBoardRejectionForTargetRowOfSeveralProductionLines() {
         // given
-        Long positionId = POSITION_ID;
+        productionLines.add(productionLine(4L, TARGET_LINE_NUMBER));
+
+        GanttChartMoveRequest request = moveRequest();
 
         // when
-        String positionIdLogValue = ProductionMaintenanceGanttMoveService.toLogValue(positionId);
-        String rowNameLogValue = ProductionMaintenanceGanttMoveService.toLogValue(TARGET_LINE_NUMBER);
-        String nullLogValue = ProductionMaintenanceGanttMoveService.toLogValue(null);
+        MoveRejectedException rejection = rejectionOf(request);
 
         // then
-        assertEquals("11", positionIdLogValue);
-        assertEquals(TARGET_LINE_NUMBER, rowNameLogValue);
-        assertEquals("null", nullLogValue);
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY);
+        assertEquals(Collections.singletonList("Gantt move rejected with the optimistic lock message: "
+                + "several production lines for target row"), loggedMessages(Level.DEBUG));
+        assertNothingPersisted();
+    }
+
+    @Test
+    public final void shouldLogReasonAndIdOfStaleBoardRejection() {
+        // given
+        given(positionDD.get(POSITION_ID)).willReturn(null);
+
+        GanttChartMoveRequest unknownPositionRequest = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(unknownPositionRequest);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY);
+        assertEquals(Collections.singletonList("Gantt move rejected with the optimistic lock message: "
+                + "position not found (id 11)"), loggedMessages(Level.DEBUG));
+        assertNothingPersisted();
+    }
+
+    @Test
+    public final void shouldLogReasonWithoutIdOfStaleBoardRejectionForItemWithoutEntityId() {
+        // given
+        given(item.getEntityId()).willReturn(null);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY);
+        assertEquals(Collections.singletonList("Gantt move rejected with the optimistic lock message: position not found"),
+                loggedMessages(Level.DEBUG));
+        assertNothingPersisted();
+    }
+
+    @Test
+    public final void shouldRejectTargetRowLongerThan255CharactersWithoutProductionLineQuery() {
+        // given
+        GanttChartMoveRequest request = moveRequest(TOO_LONG_LINE_NUMBER, scheduleContext());
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY);
+        assertEquals(256, TOO_LONG_LINE_NUMBER.length());
+        verifyZeroInteractions(productionLineDD);
+        assertTrue(productionLineQueries.isEmpty());
+        assertEquals(Collections.singletonList("Gantt move rejected with the optimistic lock message: "
+                + "no production line for target row"), loggedMessages(Level.DEBUG));
+        assertValidatorNeverCalled();
+        assertNothingPersisted();
+    }
+
+    @Test
+    public final void shouldLookUpTargetRowOf255Characters() {
+        // given
+        GanttChartMoveRequest request = moveRequest(LONGEST_LINE_NUMBER, scheduleContext());
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY);
+        assertEquals(255, LONGEST_LINE_NUMBER.length());
+        assertEquals(1, productionLineQueries.size());
+        assertEquals(Collections.singletonList(SearchRestrictions.eq(ProductionLineFields.NUMBER, LONGEST_LINE_NUMBER)),
+                productionLineQueries.get(0).getCriteria());
+        assertEquals(Integer.valueOf(2), productionLineQueries.get(0).getMaxResults());
+        assertValidatorNeverCalled();
+        assertNothingPersisted();
     }
 
     @Test
@@ -1335,6 +1590,31 @@ public class ProductionMaintenanceGanttMoveServiceTest {
     }
 
     /**
+     * Returns the rendered messages of the events logged by the move service, failing on an event of another level than the
+     * given one.
+     */
+    private List<String> loggedMessages(final Level level) {
+        List<String> messages = new ArrayList<String>();
+
+        for (LoggingEvent event : logAppender.events) {
+            assertEquals(level, event.getLevel());
+
+            messages.add(event.getRenderedMessage());
+        }
+
+        return messages;
+    }
+
+    /**
+     * Asserts that the data definition service, every data definition, the validator and the recompute service had no
+     * interaction.
+     */
+    private void assertNoDataDefinitionUsed() {
+        verifyZeroInteractions(dataDefinitionService, positionDD, productionLineDD, plannedEventDD, parameterDD, validatorSpy,
+                recomputeService);
+    }
+
+    /**
      * Asserts that the routing, shutdown window, working hours and concurrent edit checks ran in this order on the stored
      * position and the target line L2, and that the move service then checked the basic parameter once.
      */
@@ -1389,6 +1669,15 @@ public class ProductionMaintenanceGanttMoveServiceTest {
                 slotFrom, slotTo, context);
     }
 
+    /**
+     * Returns the move request onto row L2 of the schedule context, rendered as row L1, name ORD-1, 08:00 to 10:00, with the
+     * given start and end.
+     */
+    private GanttChartMoveRequest moveRequest(final Date dateFrom, final Date dateTo) {
+        return new GanttChartMoveRequest(item, TARGET_LINE_NUMBER, ORIGIN_LINE_NUMBER, ORDER_NUMBER, POSITION_START,
+                POSITION_END, dateFrom, dateTo, scheduleContext());
+    }
+
     private static JSONObject scheduleContext() {
         return context(ProductionMaintenanceGanttChartItemResolver.CONTEXT_SCHEDULE_ID, String.valueOf(SCHEDULE_ID));
     }
@@ -1407,6 +1696,15 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         } catch (ParseException e) {
             throw new IllegalArgumentException(value, e);
         }
+    }
+
+    /**
+     * Returns the instant of the wall-clock date in the ISO calendar in the JVM default time zone.
+     */
+    private static Date wallClock(final int year, final int month, final int day, final int hour, final int minute,
+            final int second, final int millis) {
+        return new DateTime(year, month, day, hour, minute, second, millis, DateTimeZone.forTimeZone(TimeZone.getDefault()))
+                .toDate();
     }
 
     private static Entity productionLine(final Long id, final String number) {
@@ -1457,7 +1755,8 @@ public class ProductionMaintenanceGanttMoveServiceTest {
                 ProductionLineFields.PRODUCTION));
         conditions.put(SearchRestrictions.eq(ProductionLineFields.ACTIVE, true), new ActiveCondition());
 
-        for (String number : Arrays.asList(ORIGIN_LINE_NUMBER, TARGET_LINE_NUMBER, OTHER_LINE_NUMBER, UNKNOWN_LINE_NUMBER)) {
+        for (String number : Arrays.asList(ORIGIN_LINE_NUMBER, TARGET_LINE_NUMBER, OTHER_LINE_NUMBER, UNKNOWN_LINE_NUMBER,
+                FORGED_LINE_NUMBER, LONGEST_LINE_NUMBER)) {
             conditions.put(SearchRestrictions.eq(ProductionLineFields.NUMBER, number), new StringFieldCondition(
                     ProductionLineFields.NUMBER, number));
         }
@@ -1480,6 +1779,30 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         return parameters;
     }
 
+
+    /**
+     * Records every logging event it receives.
+     */
+    private static final class RecordingAppender extends AppenderSkeleton {
+
+        private final List<LoggingEvent> events = new ArrayList<LoggingEvent>();
+
+        @Override
+        protected void append(final LoggingEvent event) {
+            events.add(event);
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+        }
+
+        @Override
+        public boolean requiresLayout() {
+            return false;
+        }
+
+    }
 
     /**
      * Condition an entity satisfies for one database criterion.
