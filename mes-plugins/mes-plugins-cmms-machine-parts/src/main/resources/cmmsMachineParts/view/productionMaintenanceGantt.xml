@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+
+    ***************************************************************************
+    Copyright (c) 2010 Qcadoo Limited
+    Project: Qcadoo MES
+    Version: 1.4
+
+    This file is part of Qcadoo.
+
+    Qcadoo is free software; you can redistribute it and/or modify
+    it under the terms of the GNU Affero General Public License as published
+    by the Free Software Foundation; either version 3 of the License,
+    or (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty
+    of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+    See the GNU Affero General Public License for more details.
+
+    You should have received a copy of the GNU Affero General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+    ***************************************************************************
+
+-->
+<view defaultAuthorizationRole="ROLE_PRODUCTION_LINE_SCHEDULES" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://schema.qcadoo.org/view"
+	xsi:schemaLocation="http://schema.qcadoo.org/view http://schema.qcadoo.org/view.xsd"
+	name="productionMaintenanceGantt" modelPlugin="orders" modelName="productionLineSchedule">
+
+	<component type="window" name="window" reference="window">
+		<ribbon>
+			<template name="standardFormTemplate" includeItems="navigation.back" />
+		</ribbon>
+		<!-- main tab: title, gantt and legend; translation key prefix cmmsMachineParts.productionMaintenanceGantt.window.mainTab., key suffixes title.label, gantt.header.label and legend.label -->
+		<component type="gridLayout" name="gridLayout" columns="1"
+			rows="9" hasBorders="true">
+			<layoutElement column="1" row="1">
+				<component type="input" name="title" reference="title"
+					hasLabel="false" defaultEnabled="false" >
+					<option type="textRepresentationOnDisabled" value="true" />
+					<script>
+						<![CDATA[
+							var boardTitleText = $("#" + this.elementSearchName + "_text");
+
+							boardTitleText.attr("role", "heading").attr("aria-level", "1");
+
+							// Marks the window content body, which holds the title, the gantt and the legend but not the
+							// ribbon, as the main landmark named by the heading.
+							boardTitleText.closest(".windowContainerContentBody").attr("role", "main").attr("aria-labelledby", boardTitleText.attr("id"));
+						]]>
+					</script>
+				</component>
+			</layoutElement>
+			<layoutElement column="1" row="2" height="7">
+				<component type="ganttChart" name="gantt" reference="gantt">
+					<option type="resolver"
+						value="com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt.ProductionMaintenanceGanttChartItemResolver" />
+					<option type="defaultZoomLevel" value="H1" />
+					<option type="allowDateSelection" value="true" />
+					<option type="allowItemMove" value="true" />
+					<listener event="moveItem"
+						class="com.qcadoo.mes.cmmsMachineParts.listeners.ProductionMaintenanceGanttListeners"
+						method="moveItem" />
+				</component>
+			</layoutElement>
+			<layoutElement column="1" row="9">
+				<component type="label" name="legend">
+					<option type="labelStyle" value="text" />
+				</component>
+			</layoutElement>
+		</component>
+		<option type="fixedHeight" value="true" />
+		<option type="header" value="false" />
+	</component>
+	<hooks>
+		<beforeRender
+			class="com.qcadoo.mes.cmmsMachineParts.listeners.ProductionMaintenanceGanttListeners"
+			method="fillTitle" />
+	</hooks>
+
+</view>

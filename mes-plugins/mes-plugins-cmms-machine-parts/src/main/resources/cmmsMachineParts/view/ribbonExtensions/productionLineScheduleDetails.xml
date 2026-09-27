@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+
+    ***************************************************************************
+    Copyright (c) 2010 Qcadoo Limited
+    Project: Qcadoo MES
+    Version: 1.4
+
+    This file is part of Qcadoo.
+
+    Qcadoo is free software; you can redistribute it and/or modify
+    it under the terms of the GNU Affero General Public License as published
+    by the Free Software Foundation; either version 3 of the License,
+    or (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty
+    of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+    See the GNU Affero General Public License for more details.
+
+    You should have received a copy of the GNU Affero General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+    ***************************************************************************
+
+-->
+<ribbonExtension xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://schema.qcadoo.org/modules/ribbonExtension"
+                 xsi:schemaLocation="http://schema.qcadoo.org/modules/ribbonExtension http://schema.qcadoo.org/modules/ribbonExtension.xsd"
+                 plugin="orders"
+                 view="productionLineScheduleDetails">
+
+    <group name="productionMaintenanceGantt" defaultAuthorizationRole="ROLE_PRODUCTION_LINE_SCHEDULES">
+        <bigButton name="showProductionMaintenanceGantt" icon="calendarIcon24.png" state="disabled"
+                   action="#{form}.fireEvent(showProductionMaintenanceGantt);">
+            <script>
+                <![CDATA[
+                    var showProductionMaintenanceGanttItem = #{window}.getRibbonItem("productionMaintenanceGantt.showProductionMaintenanceGantt");
+                    var showProductionMaintenanceGanttAnchor = showProductionMaintenanceGanttItem.element.find("a");
+
+                    // Sets aria-disabled and the tab stop of the button's anchor from the item's enabled state:
+                    // enabled - aria-disabled="false" and no tabindex; disabled - aria-disabled="true" and tabindex="-1".
+                    function updateShowProductionMaintenanceGanttAccessibility() {
+                        if (showProductionMaintenanceGanttItem.isEnabled()) {
+                            showProductionMaintenanceGanttAnchor.attr("aria-disabled", "false").removeAttr("tabindex");
+                        } else {
+                            showProductionMaintenanceGanttAnchor.attr("aria-disabled", "true").attr("tabindex", "-1");
+                        }
+                    }
+
+                    updateShowProductionMaintenanceGanttAccessibility();
+
+                    // Re-applies the anchor attributes after every change of the item's class attribute,
+                    // whichever ribbon call enables or disables the item.
+                    new MutationObserver(updateShowProductionMaintenanceGanttAccessibility).observe(showProductionMaintenanceGanttItem.element[0], {
+                        attributes: true,
+                        attributeFilter: ["class"]
+                    });
+
+                    // Handles a click on the item in the capture phase, before the ribbon's own click handler runs:
+                    // disabled item - cancels the anchor's default navigation;
+                    // enabled item - asks window.canClose() and, when it returns false (unsaved changes, confirm
+                    // declined), cancels the anchor's default navigation and stops the click, so neither the ribbon's
+                    // handler nor the button's action runs and the form keeps its values.
+                    showProductionMaintenanceGanttItem.element[0].addEventListener("click", function(event) {
+                        if (!showProductionMaintenanceGanttItem.isEnabled()) {
+                            event.preventDefault();
+                        } else if (!window.canClose()) {
+                            event.preventDefault();
+                            event.stopImmediatePropagation();
+                        }
+                    }, true);
+
+                    #{form}.addOnChangeListener({
+                        onSetValue: function(value) {
+                            var showProductionMaintenanceGantt = #{window}.getRibbonItem("productionMaintenanceGantt.showProductionMaintenanceGantt");
+                            var isSaved = (#{form}.getValue().content && #{form}.getValue().content.entityId);
+
+                            if (isSaved) {
+                                showProductionMaintenanceGantt.enable();
+                            } else {
+                                showProductionMaintenanceGantt.disable();
+                            }
+                        }
+                    });
+                ]]>
+            </script>
+        </bigButton>
+    </group>
+
+</ribbonExtension>
