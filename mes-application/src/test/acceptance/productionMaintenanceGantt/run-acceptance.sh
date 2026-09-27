@@ -105,6 +105,7 @@ readonly EXPECTED_CASES=(
     'http:concurrentMoves'
     'http:rollbackAfterPsSideEffect'
     'browser:ganttButtonUnsavedChangesGuard'
+    'http:rejectMoveWithUnreadableHeader'
 )
 readonly MIN_NODE_MAJOR=22
 readonly DEFAULT_DB_HOST='localhost'

@@ -82,7 +82,8 @@
  * http: cases post view events with Node's fetch. browser: cases drive the board in headless Chrome through the
  * DevTools Protocol with real mouse input. Database state is read, and concurrent transactions are run, with psql.
  * Every case works on its own draft schedule PMG-<caseName> of fixture.sql, except
- * browser:ganttButtonUnsavedChangesGuard, which reads PMG-rowMapping and writes nothing.
+ * browser:ganttButtonUnsavedChangesGuard and http:rejectMoveWithUnreadableHeader, which read PMG-rowMapping and write
+ * nothing.
  */
 
 'use strict';
@@ -6106,3 +6107,111 @@ test('browser:ganttButtonUnsavedChangesGuard', { timeout: CASE_TIMEOUT_MS }, asy
         dialogs.stop();
     }
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// moveItem with a gantt content the server cannot read
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * Posts a view event body to the board with the headers postEvent sends and returns the answer as it arrived:
+ * {status, contentType, text}, where contentType is '' when the answer has no Content-Type header. Neither checks nor
+ * parses the answer.
+ */
+async function postEventRaw(session, body) {
+    const response = await session.request(BOARD_PATH, {
+        method: 'POST',
+        headers: Object.assign({
+            'Content-Type': 'application/json; charset=utf-8',
+            'X-Requested-With': 'XMLHttpRequest'
+        }, session.csrfHeaders()),
+        body: JSON.stringify(body)
+    });
+
+    return { status: response.status, contentType: response.headers.get('content-type') || '', text: response.text };
+}
+
+test('http:rejectMoveWithUnreadableHeader', { timeout: CASE_TIMEOUT_MS }, async () => {
+    // Reads schedule PMG-rowMapping and persists nothing.
+    const fixture = fx('rowMapping');
+    const a5 = fixture.roles.A5;
+    const session = await httpLogin();
+    const board = await initialize(session, fixture.scheduleId);
+    const item = itemById(board.content, a5.positionId);
+    // A5 (PMG-T-A-ONLY) -> PMG-B at D1 12:00: a drop the framework checks pass and the routing check rejects.
+    const args = moveArgs(item, 'PMG-B', at(1, '12:00'));
+    const expectedInvalidRequest = message('qcadooView.gantt.move.error.invalidRequest');
+    const baseline = await checksums(fixture.scheduleId);
+
+    // Control: with the rendered header the same arguments reach the move listener, which rejects them for routing.
+    const control = findGanttContent(await session.postEvent(buildBody('moveItem', fixture.scheduleId,
+        board.headerParameters, args)));
+
+    assert.ok(control && control.content.moveResult, 'the control answer has a moveResult');
+    assert.deepStrictEqual({
+        accepted: control.content.moveResult.accepted,
+        itemId: control.content.moveResult.itemId,
+        message: norm(control.content.moveResult.message)
+    }, { accepted: false, itemId: a5.positionId, message: norm(EXPECTED.routing) },
+    'with the rendered header the drop reaches the routing check');
+
+    // Each forged gantt content edits the content of the body buildBody makes from the rendered header.
+    const forgedContents = [
+        ['scale X', (content) => {
+            content.headerParameters.scale = 'X';
+        }],
+        ['header without dateTo', (content) => {
+            delete content.headerParameters.dateTo;
+        }],
+        ['content without headerParameters', (content) => {
+            delete content.headerParameters;
+        }],
+        ['scale null', (content) => {
+            content.headerParameters.scale = null;
+        }],
+        ['selectedEntityId abc', (content) => {
+            content.selectedEntityId = 'abc';
+        }]
+    ];
+
+    for (const [shape, forge] of forgedContents) {
+        const body = buildBody('moveItem', fixture.scheduleId, board.headerParameters, args);
+
+        forge(ganttNode(body.components, GANTT_PATH).content);
+
+        const answer = await postEventRaw(session, body);
+        const excerpt = responseExcerpt(answer.text);
+
+        assert.equal(answer.status, 200, `${shape}: the answer is HTTP 200: ${excerpt}`);
+        assert.ok(/application\/json/i.test(answer.contentType),
+            `${shape}: the answer is JSON, not ${diagnosticText(answer.contentType)}: ${excerpt}`);
+        assert.ok(!answer.text.includes('Exception'), `${shape}: the answer names no exception: ${excerpt}`);
+        assert.ok(!answer.text.includes('.java:'), `${shape}: the answer holds no Java stack frame: ${excerpt}`);
+        assert.ok(!/<meta\b[^>]*_csrf/i.test(answer.text), `${shape}: the answer holds no _csrf meta tag`);
+
+        const found = findGanttContent(JSON.parse(answer.text));
+
+        assert.ok(found, `${shape}: the answer has a gantt content`);
+        assert.equal(found.path, GANTT_PATH, `${shape}: the answer renders the gantt at the captured path`);
+        assert.deepStrictEqual(Object.keys(found.content), ['moveResult'],
+            `${shape}: the gantt content is only a moveResult`);
+        assert.deepStrictEqual({
+            accepted: found.content.moveResult.accepted,
+            itemId: found.content.moveResult.itemId,
+            message: norm(found.content.moveResult.message)
+        }, { accepted: false, itemId: null, message: norm(expectedInvalidRequest) },
+        `${shape}: the move is rejected as an invalid request without an item id`);
+    }
+
+    assert.deepStrictEqual(await checksums(fixture.scheduleId), baseline, 'no persisted change');
+
+    // A normal initialize still renders the board, with A5 where it was rendered before the forged requests.
+    const after = await initialize(session, fixture.scheduleId);
+    const itemAfter = itemById(after.content, a5.positionId);
+
+    assert.deepStrictEqual(after.content.rows, board.content.rows, 'the rows are unchanged');
+    assert.deepStrictEqual(
+        { row: itemAfter.row, dateFrom: itemAfter.info.dateFrom, dateTo: itemAfter.info.dateTo },
+        { row: item.row, dateFrom: item.info.dateFrom, dateTo: item.info.dateTo },
+        'the A5 item is rendered where it was before the forged requests');
+});
+
