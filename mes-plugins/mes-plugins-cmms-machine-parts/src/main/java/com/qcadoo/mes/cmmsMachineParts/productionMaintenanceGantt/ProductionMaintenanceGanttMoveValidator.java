@@ -58,7 +58,8 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * <ol>
  * <li>{@link #checkRouting(Entity, Entity)} - the order's technology allows the target production line;</li>
  * <li>{@link #checkShutdownWindow(Entity, Date, Date)} - no planned event requiring a shutdown of the target production line
- * overlaps the target slot;</li>
+ * overlaps the target slot; an event with only one of its start and finish dates is open-ended on the side of the missing
+ * date, and an event with neither date overlaps no slot;</li>
  * <li>{@link #checkWorkingHours(Entity, Date)} - the target slot starts in the working time of the target production line;</li>
  * <li>{@link #checkConcurrentEdit(Entity, GanttChartMoveRequest)} - the stored position still matches the item as rendered on
  * the board.</li>
@@ -202,11 +203,14 @@ public class ProductionMaintenanceGanttMoveValidator {
     /**
      * Checks that no planned event requiring a shutdown of the target production line overlaps the slot.
      * <p>
-     * An event overlaps the slot when its start date is before {@code dateTo} and its finish date is after {@code dateFrom}.
-     * Events of every state are considered. An event concerns the target production line when the rule of
+     * An event with a start date, a finish date or both overlaps the slot when its start date is null or before
+     * {@code dateTo} and its finish date is null or after {@code dateFrom}, so an event without a finish date is open-ended
+     * after its start and an event without a start date is open-ended before its finish. An event with neither date
+     * overlaps no slot. Events of every state are considered.
+     * An event concerns the target production line when the rule of
      * {@link ProductionMaintenanceGanttChartItemResolver#resolveEventLines(Entity)} places it on that line. The events are
-     * read by {@link ProductionMaintenanceGanttChartItemResolver#findShutdownEventNumbers(Entity, Date, Date)}, in ascending
-     * start date order.
+     * read by {@link ProductionMaintenanceGanttChartItemResolver#findShutdownEventNumbers(Entity, Date, Date)}: events
+     * without a start date first, then in ascending start date order, then in ascending id order.
      *
      * @param targetLine
      *            the production line of the target row

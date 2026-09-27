@@ -77,6 +77,7 @@ import org.apache.log4j.spi.LoggingEvent;
 import org.hibernate.HibernateException;
 import org.hibernate.SessionFactory;
 import org.hibernate.classic.Session;
+import org.hibernate.exception.GenericJDBCException;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -1828,6 +1829,53 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
     }
 
     @Test
+    public final void shouldPropagateDeadlockOfSessionFlushUnchangedWithoutFurtherExecutorCall() {
+        // given: m moves from A 09:00 to B 11:00-12:00; A holds a2 10:00 and a3 12:00; B holds b2 13:00; flushing the session
+        // fails with the exception Hibernate raises for a detected deadlock, SQLSTATE 40P01
+        GenericJDBCException flushFailure = new GenericJDBCException(
+                "could not update: [com.qcadoo.model.beans.orders.OrdersProductionLineSchedulePosition#90]", new SQLException(
+                        "ERROR: deadlock detected", "40P01"));
+
+        willThrow(flushFailure).given(session).flush();
+
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity a2 = position(12L, lineA, order(52L), "10:00", "11:00");
+        Entity a3 = position(13L, lineA, order(53L), "12:00", "13:00");
+        Entity b2 = position(22L, lineB, order(54L), "13:00", "14:00");
+
+        // when
+        try {
+            recompute(moved, lineA, "09:00", lineB, "11:00");
+
+            fail("GenericJDBCException expected");
+        } catch (RuntimeException e) {
+            // then: the flush failure itself leaves the recompute, and no warning is logged
+            assertSame(flushFailure, e);
+        }
+
+        // then: the failure is a concurrency conflict
+        assertTrue(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(flushFailure));
+        assertWarnings();
+
+        // then: a2 was created and saved and the session flushed once, never cleared; neither a3 nor b2 was created
+        assertEquals(Arrays.asList(PROJECTION_EVENT, CREATE_EVENT, SAVE_EVENT), eventsAfterLastRead());
+        verify(psExecutor, times(1)).createProductionLinePositionNewData(
+                Matchers.<Map<Long, ProductionLinePositionNewData>> any(), any(Entity.class), any(Date.class),
+                any(Entity.class), any(Entity.class), any(Entity.class));
+        verifyEachSavedOnce(a2);
+        verify(sessionFactory, times(1)).getCurrentSession();
+        verify(session, times(1)).flush();
+        verify(session, never()).clear();
+        verifyNoMoreInteractions(sessionFactory, session);
+        verifyZeroInteractions(ppsExecutor);
+
+        assertUntouched(a3);
+        assertUntouched(b2);
+        assertUntouched(moved);
+        assertEquals(1, steps.size());
+    }
+
+    @Test
     public final void shouldNameCandidateWithoutOrderAfterCandidatesWithOrders() {
         // given: m moves from A 09:00 to B 11:00-12:00; A holds a2 11:00; B holds b2 13:00 and b3 14:00 without an order
         Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
@@ -2125,6 +2173,36 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
         } catch (RuntimeException e) {
             // then
             assertSame(serializationFailure, e);
+        }
+
+        // then: no warning is logged, and the failed save is followed by neither a flush nor a clear
+        assertWarnings();
+        verify(psExecutor, times(1)).savePosition(same(b2), any(ProductionLinePositionNewData.class));
+        verifyZeroInteractions(ppsExecutor, sessionFactory, session);
+    }
+
+    @Test
+    public final void shouldPropagateDeadlockOfSaveUnchanged() {
+        // given: m moves from A 09:00 to B 11:00-12:00; B holds b2 13:00, whose save fails with the exception Hibernate raises
+        // for a detected deadlock, SQLSTATE 40P01
+        GenericJDBCException deadlock = new GenericJDBCException(
+                "could not update: [com.qcadoo.model.beans.orders.OrdersProductionLineSchedulePosition#22]", new SQLException(
+                        "ERROR: deadlock detected", "40P01"));
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity b2 = position(22L, lineB, order(53L), "13:00", "14:00");
+
+        willThrow(deadlock).given(psExecutor).savePosition(same(b2), any(ProductionLinePositionNewData.class));
+
+        // when
+        try {
+            recompute(moved, lineA, "09:00", lineB, "11:00");
+
+            fail("GenericJDBCException expected");
+        } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
+            fail("Expected the deadlock to propagate unchanged, not as the rejection " + e.getMessageKey());
+        } catch (RuntimeException e) {
+            // then
+            assertSame(deadlock, e);
         }
 
         // then: no warning is logged, and the failed save is followed by neither a flush nor a clear

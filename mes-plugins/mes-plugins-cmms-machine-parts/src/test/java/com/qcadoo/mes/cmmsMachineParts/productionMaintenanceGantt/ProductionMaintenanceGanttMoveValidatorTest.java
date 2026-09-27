@@ -118,12 +118,13 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * The planned event data definition answers {@code find(String)} of
  * {@link ProductionMaintenanceGanttChartItemResolver#SHUTDOWN_EVENTS_QUERY} with a builder that records the query and its
  * bound parameters. Its {@code list()} returns a projection row, holding only the aliases the query selects, of every
- * fixture planned event the query selects: overlapping {@code [dateFrom, dateTo)}, with the bound requires-shutdown flag,
- * and whose own production line, workstation production line or division production lines include the bound production
- * line, in ascending start date and id order. Any other query, a missing or unexpected parameter, and {@code find()} fail
- * the test. The validator uses a real {@link ProductionMaintenanceGanttChartItemResolver}, wired with the mocked data
- * definition service, for shutdown events and position labels. The basic parameter data definition holds one
- * parameter, and the fixture order is pending, has a technology and has no production line.
+ * fixture planned event the query selects: with a start date, a finish date or both, overlapping {@code [dateFrom, dateTo)}
+ * with a missing date open-ended on its side, with the bound requires-shutdown flag, and whose own production line,
+ * workstation production line or division production lines include the bound production line, with events without a
+ * start date first, then in ascending start date and id order. Any other query, a missing or unexpected parameter, and
+ * {@code find()} fail the test. The validator uses a real {@link ProductionMaintenanceGanttChartItemResolver}, wired with
+ * the mocked data definition service, for shutdown events and position labels. The basic parameter data definition holds
+ * one parameter, and the fixture order is pending, has a technology and has no production line.
  */
 public class ProductionMaintenanceGanttMoveValidatorTest {
 
@@ -682,11 +683,14 @@ public class ProductionMaintenanceGanttMoveValidatorTest {
         assertEquals(query, plannedEventQueries.get(0).getQueryString());
         assertTrue(query.contains(" from #cmmsMachineParts_plannedEvent ev left join ev.productionLine evLine"
                 + " left join ev.workstation ws left join ws.productionLine wsLine left join ev.division dv "));
-        assertTrue(query.contains(" where ev.startDate < :dateTo and ev.finishDate > :dateFrom"
+        assertTrue(query.contains(" where (ev.startDate is not null or ev.finishDate is not null)"
+                + " and (ev.startDate is null or ev.startDate < :dateTo)"
+                + " and (ev.finishDate is null or ev.finishDate > :dateFrom)"
                 + " and ev.requiresShutdown = :requiresShutdown and (evLine.id = :productionLineId"
                 + " or wsLine.id = :productionLineId or dv.id in (select lineDivision.id from #basic_division lineDivision"
                 + " join lineDivision.productionLines divisionLine where divisionLine.id = :productionLineId))"));
-        assertTrue(query.endsWith(" order by ev.startDate asc, ev.id asc"));
+        assertTrue(query.endsWith(" order by case when ev.startDate is null then 0 else 1 end asc, ev.startDate asc,"
+                + " ev.id asc"));
 
         for (String alias : SHUTDOWN_EVENT_ALIASES) {
             assertTrue(alias, query.contains(" as " + alias + ",") || query.contains(" as " + alias + " from "));
@@ -1063,6 +1067,100 @@ public class ProductionMaintenanceGanttMoveValidatorTest {
 
         // then
         assertRejection(rejection, ProductionMaintenanceGanttMoveValidator.SHUTDOWN_WINDOW_KEY, "EV-FIRST");
+    }
+
+    @Test
+    public final void shouldRejectSlotOverlappingShutdownEventWithoutFinishDate() {
+        // given
+        plannedEvents.add(plannedEvent("EV-NO-FINISH", PlannedEventStateStringValues.IN_REALIZATION, true,
+                "2026-10-01 07:00:00", null, lineL2, null, null));
+
+        // when
+        Optional<MoveRejection> rejection = validator.checkShutdownWindow(lineL2, slotFrom, slotTo);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveValidator.SHUTDOWN_WINDOW_KEY, "EV-NO-FINISH");
+        assertEquals(Collections.singletonList("EV-NO-FINISH"), eventNumbersOf(plannedEventQueries.get(0).getRows()));
+    }
+
+    @Test
+    public final void shouldRejectSlotOverlappingShutdownEventWithoutStartDate() {
+        // given
+        plannedEvents.add(plannedEvent("EV-NO-START", PlannedEventStateStringValues.PLANNED, true, null,
+                "2026-10-01 14:00:00", null, workstation(lineL2), null));
+
+        // when
+        Optional<MoveRejection> rejection = validator.checkShutdownWindow(lineL2, slotFrom, slotTo);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveValidator.SHUTDOWN_WINDOW_KEY, "EV-NO-START");
+        assertEquals(Collections.singletonList("EV-NO-START"), eventNumbersOf(plannedEventQueries.get(0).getRows()));
+    }
+
+    @Test
+    public final void shouldAcceptSlotBeforeStartOfShutdownEventWithoutFinishDate() {
+        // given
+        plannedEvents.add(plannedEvent("EV-NO-FINISH-AT-END", PlannedEventStateStringValues.PLANNED, true, SLOT_TO, null,
+                lineL2, null, null));
+        plannedEvents.add(plannedEvent("EV-NO-FINISH-LATER", PlannedEventStateStringValues.PLANNED, true,
+                "2026-10-01 15:00:00", null, null, null, division(lineL2)));
+
+        // when
+        Optional<MoveRejection> rejection = validator.checkShutdownWindow(lineL2, slotFrom, slotTo);
+
+        // then
+        assertFalse(rejection.isPresent());
+        assertTrue(plannedEventQueries.get(0).getRows().isEmpty());
+    }
+
+    @Test
+    public final void shouldAcceptSlotAtOrAfterFinishOfShutdownEventWithoutStartDate() {
+        // given
+        plannedEvents.add(plannedEvent("EV-NO-START-AT-START", PlannedEventStateStringValues.PLANNED, true, null, SLOT_FROM,
+                lineL2, null, null));
+        plannedEvents.add(plannedEvent("EV-NO-START-EARLIER", PlannedEventStateStringValues.PLANNED, true, null,
+                "2026-10-01 08:00:00", null, workstation(lineL2), null));
+
+        // when
+        Optional<MoveRejection> rejection = validator.checkShutdownWindow(lineL2, slotFrom, slotTo);
+
+        // then
+        assertFalse(rejection.isPresent());
+        assertTrue(plannedEventQueries.get(0).getRows().isEmpty());
+    }
+
+    @Test
+    public final void shouldAcceptShutdownEventWithoutStartAndFinishDate() {
+        // given
+        plannedEvents.add(plannedEvent("EV-NO-DATES", PlannedEventStateStringValues.NEW, true, null, null, lineL2, null,
+                division(lineL2)));
+
+        // when
+        Optional<MoveRejection> rejection = validator.checkShutdownWindow(lineL2, slotFrom, slotTo);
+
+        // then
+        assertFalse(rejection.isPresent());
+        assertEquals(1, plannedEventQueries.size());
+        assertTrue(plannedEventQueries.get(0).getRows().isEmpty());
+    }
+
+    @Test
+    public final void shouldNameShutdownEventWithoutStartDateBeforeDatedOverlappingEvent() {
+        // given
+        plannedEvents.add(plannedEvent("EV-DATED", PlannedEventStateStringValues.PLANNED, true, "2026-10-01 09:00:00",
+                "2026-10-01 13:00:00", lineL2, null, null));
+        plannedEvents.add(plannedEvent("EV-NO-FINISH", PlannedEventStateStringValues.PLANNED, true, "2026-10-01 08:00:00",
+                null, lineL2, null, null));
+        plannedEvents.add(plannedEvent("EV-NO-START", PlannedEventStateStringValues.PLANNED, true, null,
+                "2026-10-01 11:00:00", lineL2, null, null));
+
+        // when
+        Optional<MoveRejection> rejection = validator.checkShutdownWindow(lineL2, slotFrom, slotTo);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveValidator.SHUTDOWN_WINDOW_KEY, "EV-NO-START");
+        assertEquals(Arrays.asList("EV-NO-START", "EV-NO-FINISH", "EV-DATED"),
+                eventNumbersOf(plannedEventQueries.get(0).getRows()));
     }
 
     @Test
@@ -1506,6 +1604,19 @@ public class ProductionMaintenanceGanttMoveValidatorTest {
         assertArrayEquals(args, rejection.get().getArgs());
     }
 
+    /**
+     * Returns the event numbers of the given shutdown events query rows, in row order.
+     */
+    private static List<String> eventNumbersOf(final List<Entity> rows) {
+        List<String> eventNumbers = new ArrayList<String>();
+
+        for (Entity row : rows) {
+            eventNumbers.add(row.getStringField(EVENT_NUMBER_ALIAS));
+        }
+
+        return eventNumbers;
+    }
+
     private GanttChartMoveRequest moveRequest(final String originalRowName, final String originalName,
             final String originalDateFrom, final String originalDateTo) {
         return new GanttChartMoveRequest(item, "L2", originalRowName, originalName, originalDateFrom, originalDateTo, slotFrom,
@@ -1533,7 +1644,14 @@ public class ProductionMaintenanceGanttMoveValidatorTest {
         return previous;
     }
 
+    /**
+     * Returns the date of the given {@link DateUtils#L_DATE_TIME_FORMAT} text, or null when the text is null.
+     */
     private static Date date(final String value) {
+        if (value == null) {
+            return null;
+        }
+
         try {
             return new SimpleDateFormat(DateUtils.L_DATE_TIME_FORMAT).parse(value);
         } catch (ParseException e) {
@@ -1600,6 +1718,10 @@ public class ProductionMaintenanceGanttMoveValidatorTest {
         return schedulePosition;
     }
 
+    /**
+     * Returns a planned event with the next event id; a null start or finish date text gives the event a null start or
+     * finish date.
+     */
     private Entity plannedEvent(final String number, final String state, final boolean requiresShutdown,
             final String startDate, final String finishDate, final Entity productionLine, final Entity workstation,
             final Entity division) {
@@ -1703,17 +1825,27 @@ public class ProductionMaintenanceGanttMoveValidatorTest {
     }
 
     /**
-     * Orders planned events ascending by their non-null start date, then by their non-null id.
+     * Orders planned events without a start date first, then ascending by start date, then by their non-null id.
      */
     private static final class StartDateAndIdComparator implements Comparator<Entity> {
 
         @Override
         public int compare(final Entity first, final Entity second) {
-            int result = first.getDateField(PlannedEventFields.START_DATE).compareTo(
-                    second.getDateField(PlannedEventFields.START_DATE));
+            Date firstStartDate = first.getDateField(PlannedEventFields.START_DATE);
+            Date secondStartDate = second.getDateField(PlannedEventFields.START_DATE);
 
-            if (result != 0) {
-                return result;
+            if (firstStartDate == null && secondStartDate != null) {
+                return -1;
+            }
+            if (firstStartDate != null && secondStartDate == null) {
+                return 1;
+            }
+            if (firstStartDate != null) {
+                int result = firstStartDate.compareTo(secondStartDate);
+
+                if (result != 0) {
+                    return result;
+                }
             }
 
             return first.getId().compareTo(second.getId());
@@ -1792,10 +1924,11 @@ public class ProductionMaintenanceGanttMoveValidatorTest {
     /**
      * Records each parameter of {@link #shutdownEventsQueryParameters()} bound once with its own setter, and answers the
      * setter with the builder itself. Answers {@code list()}, once every parameter is bound, with a projection row of each
-     * planned event that starts before {@code dateTo}, finishes after {@code dateFrom} and has the bound requires-shutdown
-     * flag, and whose own production line or workstation production line has the bound id or whose division holds a
-     * production line with that id, in ascending start date and id order. Fails on an unknown or repeated parameter, a
-     * parameter bound with another setter, a missing parameter and every other builder method.
+     * planned event that has a start date, a finish date or both, whose start date is null or before {@code dateTo},
+     * whose finish date is null or after {@code dateFrom}, that has the bound requires-shutdown flag, and whose own
+     * production line or workstation production line has the bound id or whose division holds a production line with that
+     * id, with events without a start date first, then in ascending start date and id order. Fails on an unknown or
+     * repeated parameter, a parameter bound with another setter, a missing parameter and every other builder method.
      */
     private static final class ShutdownEventsQueryBuilderAnswer implements Answer<Object> {
 
@@ -1878,11 +2011,16 @@ public class ProductionMaintenanceGanttMoveValidatorTest {
             return rows;
         }
 
+        /**
+         * Returns whether the planned event has a start date, a finish date or both, its start date is null or before
+         * {@code dateTo}, and its finish date is null or after {@code dateFrom}.
+         */
         private static boolean overlaps(final Entity plannedEvent, final Date dateFrom, final Date dateTo) {
             Date startDate = plannedEvent.getDateField(PlannedEventFields.START_DATE);
             Date finishDate = plannedEvent.getDateField(PlannedEventFields.FINISH_DATE);
 
-            return startDate != null && finishDate != null && startDate.before(dateTo) && finishDate.after(dateFrom);
+            return (startDate != null || finishDate != null) && (startDate == null || startDate.before(dateTo))
+                    && (finishDate == null || finishDate.after(dateFrom));
         }
 
         private static boolean concernsLine(final Entity plannedEvent, final Long productionLineId) {

@@ -56,6 +56,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
+import org.hibernate.exception.GenericJDBCException;
 import org.joda.time.DateTime;
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -70,6 +71,7 @@ import org.mockito.MockitoAnnotations;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
 import org.springframework.dao.ConcurrencyFailureException;
+import org.springframework.dao.DeadlockLoserDataAccessException;
 
 import com.qcadoo.localization.api.TranslationService;
 import com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt.ProductionMaintenanceGanttChartItemResolver;
@@ -100,8 +102,10 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * real. Fixture: the component holds a move request for position 11 of schedule 5, rendered on row LINE-1 as ORD-1 from
  * 2026-03-02 08:00:00 to 10:00:00 and dropped on row LINE-2 from 2026-03-02 09:00 to 11:00. Each test covers one outcome of the
  * move service: it returns, it throws a move rejection, it throws a serialization failure in the cause chain, it throws a
- * serialization failure that is the cause of an SQL exception's next exception, it throws a concurrency failure, or it throws
- * any other exception; one further test covers a component without a move request.
+ * serialization failure that is the cause of an SQL exception's next exception, it throws a Hibernate exception caused by a
+ * deadlock (SQLSTATE 40P01) or a lock timeout (SQLSTATE 55P03), it throws a concurrency failure or a deadlock-loser failure,
+ * it throws a Hibernate exception caused by the class-40 SQLSTATE 40002, or it throws any other exception; one further test
+ * covers a component without a move request.
  * <p>
  * Two tests run the listener against a real, move-enabled {@link GanttChartComponentState} whose moveItem event dropped
  * ORD-1 onto LINE-2, with the move service mocked: one renders the refreshed board with the accepted move result, and one
@@ -403,6 +407,83 @@ public class ProductionMaintenanceGanttListenersTest {
         verify(productionMaintenanceGanttMoveService, times(1)).move(moveRequest);
         verify(gantt, times(1)).rejectMove(L_OPTIMISTIC_LOCK);
         verify(gantt, times(1)).rejectMove(anyString(), Matchers.<String> anyVararg());
+        verify(gantt, never()).acceptMove();
+    }
+
+    @Test
+    public final void shouldRejectWithLockMessageOnDeadlock() {
+        // given: the move fails with the exception Hibernate raises for SQLSTATE 40P01 inside the move transaction
+        GenericJDBCException deadlock = new GenericJDBCException(
+                "could not update: [com.qcadoo.model.beans.orders.OrdersProductionLineSchedulePosition#90]", new SQLException(
+                        "ERROR: deadlock detected", "40P01"));
+
+        doThrow(deadlock).when(productionMaintenanceGanttMoveService).move(moveRequest);
+
+        // when
+        productionMaintenanceGanttListeners.moveItem(view, gantt, new String[0]);
+
+        // then
+        verify(productionMaintenanceGanttMoveService, times(1)).move(moveRequest);
+        verify(gantt, times(1)).rejectMove(L_OPTIMISTIC_LOCK);
+        verify(gantt, times(1)).rejectMove(anyString(), Matchers.<String> anyVararg());
+        verify(gantt, never()).acceptMove();
+    }
+
+    @Test
+    public final void shouldRejectWithLockMessageOnLockNotAvailable() {
+        // given: the move fails with the exception Hibernate raises for SQLSTATE 55P03 inside the move transaction
+        GenericJDBCException lockNotAvailable = new GenericJDBCException(
+                "could not update: [com.qcadoo.model.beans.orders.OrdersProductionLineSchedulePosition#90]", new SQLException(
+                        "ERROR: canceling statement due to lock timeout", "55P03"));
+
+        doThrow(lockNotAvailable).when(productionMaintenanceGanttMoveService).move(moveRequest);
+
+        // when
+        productionMaintenanceGanttListeners.moveItem(view, gantt, new String[0]);
+
+        // then
+        verify(productionMaintenanceGanttMoveService, times(1)).move(moveRequest);
+        verify(gantt, times(1)).rejectMove(L_OPTIMISTIC_LOCK);
+        verify(gantt, times(1)).rejectMove(anyString(), Matchers.<String> anyVararg());
+        verify(gantt, never()).acceptMove();
+    }
+
+    @Test
+    public final void shouldRejectWithLockMessageOnDeadlockLoserFailureAtCommit() {
+        // given: the commit fails with the exception Spring translates SQLSTATE 40P01 to
+        doThrow(new DeadlockLoserDataAccessException("could not commit", new SQLException("ERROR: deadlock detected",
+                "40P01"))).when(productionMaintenanceGanttMoveService).move(moveRequest);
+
+        // when
+        productionMaintenanceGanttListeners.moveItem(view, gantt, new String[0]);
+
+        // then
+        verify(productionMaintenanceGanttMoveService, times(1)).move(moveRequest);
+        verify(gantt, times(1)).rejectMove(L_OPTIMISTIC_LOCK);
+        verify(gantt, times(1)).rejectMove(anyString(), Matchers.<String> anyVararg());
+        verify(gantt, never()).acceptMove();
+    }
+
+    @Test
+    public final void shouldPropagateOtherTransactionRollbackFailureWithoutRejecting() {
+        // given: the move fails with SQLSTATE 40002, a class-40 state that is no concurrency conflict
+        GenericJDBCException failure = new GenericJDBCException("could not update: [x]", new SQLException(
+                "ERROR: integrity constraint violation", "40002"));
+
+        doThrow(failure).when(productionMaintenanceGanttMoveService).move(moveRequest);
+
+        // when
+        try {
+            productionMaintenanceGanttListeners.moveItem(view, gantt, new String[0]);
+
+            fail("GenericJDBCException expected");
+        } catch (GenericJDBCException e) {
+            // then
+            assertSame(failure, e);
+        }
+
+        verify(productionMaintenanceGanttMoveService, times(1)).move(moveRequest);
+        verify(gantt, never()).rejectMove(anyString(), Matchers.<String> anyVararg());
         verify(gantt, never()).acceptMove();
     }
 

@@ -83,7 +83,10 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartScaleImpl;
  * <li>positions of the production line schedule named in the component context, on the row of their production line, with
  * the position id as entity id while the schedule is in the draft state and no entity id otherwise;</li>
  * <li>planned events of every state overlapping the scale, on the row of every production line the rule of
- * {@link #resolveEventLines(Entity)} gives them, always without an entity id and with a full-width colour strip.</li>
+ * {@link #resolveEventLines(Entity)} gives them, always without an entity id and with a full-width colour strip. An event
+ * with only one of its start and finish dates is open-ended on the side of the missing date: its item runs from the start
+ * of the item window, or to the end of the item window, on that side, and its tooltip holds a line naming the missing
+ * date. An event with neither date is not placed.</li>
  * </ul>
  * User-entered display strings are HTML-escaped before they become item labels or tooltip lines. Overlapping items are left
  * to the Gantt component's collision detection.
@@ -135,6 +138,16 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
      * Second tooltip line of a planned event: {0} yes/no label of the requires-shutdown flag.
      */
     public static final String ITEM_REQUIRES_SHUTDOWN_KEY = "cmmsMachineParts.productionMaintenanceGantt.item.requiresShutdown";
+
+    /**
+     * Third tooltip line of a planned event without a start date; it takes no argument.
+     */
+    public static final String ITEM_NO_START_DATE_KEY = "cmmsMachineParts.productionMaintenanceGantt.item.noStartDate";
+
+    /**
+     * Third tooltip line of a planned event without a finish date; it takes no argument.
+     */
+    public static final String ITEM_NO_FINISH_DATE_KEY = "cmmsMachineParts.productionMaintenanceGantt.item.noFinishDate";
 
     /**
      * Type label of a planned event without a type, and state label of a planned event without a state.
@@ -267,8 +280,10 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
             + ProductionLineSchedulePositionFields.START_TIME + " asc, p.id asc";
 
     /**
-     * Planned events of every state overlapping {@code [dateFrom, dateTo)}, with the id and number of their own production
-     * line and of their workstation's production line, and their division id.
+     * Planned events of every state that have a start date, a finish date or both and overlap {@code [dateFrom, dateTo)},
+     * with the id and number of their own production line and of their workstation's production line, and their division
+     * id. An event overlaps when its start date is null or before {@code dateTo} and its finish date is null or after
+     * {@code dateFrom}; an event with both dates null is not selected.
      */
     private static final String EVENTS_SELECT = "select ev." + PlannedEventFields.NUMBER + " as " + L_EVENT_NUMBER + ", ev."
             + PlannedEventFields.TYPE + " as " + L_EVENT_TYPE + ", ev." + PlannedEventFields.STATE + " as " + L_EVENT_STATE
@@ -279,10 +294,17 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
             + " as " + L_WORKSTATION_LINE_NUMBER + ", dv.id as " + L_DIVISION_ID
             + " from #cmmsMachineParts_plannedEvent ev left join ev." + PlannedEventFields.PRODUCTION_LINE
             + " evLine left join ev." + PlannedEventFields.WORKSTATION + " ws left join ws." + WorkstationFieldsPL.PRODUCTION_LINE
-            + " wsLine left join ev." + PlannedEventFields.DIVISION + " dv where ev." + PlannedEventFields.START_DATE + " < :"
-            + L_DATE_TO + " and ev." + PlannedEventFields.FINISH_DATE + " > :" + L_DATE_FROM;
+            + " wsLine left join ev." + PlannedEventFields.DIVISION + " dv where (ev." + PlannedEventFields.START_DATE
+            + " is not null or ev." + PlannedEventFields.FINISH_DATE + " is not null) and (ev." + PlannedEventFields.START_DATE
+            + " is null or ev." + PlannedEventFields.START_DATE + " < :" + L_DATE_TO + ") and (ev."
+            + PlannedEventFields.FINISH_DATE + " is null or ev." + PlannedEventFields.FINISH_DATE + " > :" + L_DATE_FROM + ")";
 
-    private static final String EVENTS_ORDER = " order by ev." + PlannedEventFields.START_DATE + " asc, ev.id asc";
+    /**
+     * Order of the planned events of {@link #EVENTS_SELECT}: events without a start date first, then ascending start date,
+     * then ascending id.
+     */
+    private static final String EVENTS_ORDER = " order by case when ev." + PlannedEventFields.START_DATE
+            + " is null then 0 else 1 end asc, ev." + PlannedEventFields.START_DATE + " asc, ev.id asc";
 
     /**
      * {@link #EVENTS_SELECT} restricted to events that have a production line, a workstation with a production line, or a
@@ -326,6 +348,11 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
      * the start of the first day to 23:59:59 of the last day. Otherwise, and when the fit leaves the scale unchanged, the
      * items are those overlapping {@code [scale.getDateFrom(), scale.getDateTo())}. A context naming no existing schedule
      * leaves the scale unchanged.
+     * <p>
+     * That range is the item window. A planned event overlaps it by the rule of {@link #EVENTS_SELECT}. The item of an
+     * event without a start date starts at the start of the item window, and the item of an event without a finish date
+     * ends at the end of the item window; each such item's tooltip ends with the {@link #ITEM_NO_START_DATE_KEY} or
+     * {@link #ITEM_NO_FINISH_DATE_KEY} line. An event with neither date yields no item.
      *
      * @param scale
      *            the scale whose date range bounds the items and which creates them
@@ -409,7 +436,16 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
     /**
      * Returns the numbers of the planned events of every state that require a shutdown, overlap the half-open interval
      * {@code [dateFrom, dateTo)} and are placed on the given production line by the rule of
-     * {@link #resolveEventLines(Entity)}, in ascending start date order.
+     * {@link #resolveEventLines(Entity)}: events without a start date first, then in ascending start date order, then in
+     * ascending id order.
+     * <p>
+     * An event with both dates overlaps when its start date is before {@code dateTo} and its finish date is after
+     * {@code dateFrom}. An event without a finish date is open-ended after its start and overlaps when its start date is
+     * before {@code dateTo}; an event without a start date is open-ended before its finish and overlaps when its finish
+     * date is after {@code dateFrom}. An event with neither date overlaps no interval. The board applies the same rule.
+     * <p>
+     * For example, over {@code [2026-10-08 08:00, 2026-10-08 10:00)} an event starting 2026-10-08 07:00 without a finish
+     * date overlaps, and an event without a start date finishing 2026-10-08 08:00 does not.
      * <p>
      * The events are read in one query restricted to shutdown events overlapping the interval whose own production line,
      * workstation production line or division production lines include the given line. An event that has neither its own
@@ -693,7 +729,10 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
             String color = requiresShutdown ? SHUTDOWN_COLOR : MAINTENANCE_COLOR;
             Date startDate = event.getDateField(L_START_DATE);
             Date finishDate = event.getDateField(L_FINISH_DATE);
-            GanttChartItemTooltipBuilder tooltipBuilder = getPlannedEventTooltip(event, label, requiresShutdown, locale);
+            Date itemDateFrom = startDate == null ? window.getDateFrom() : startDate;
+            Date itemDateTo = finishDate == null ? window.getDateTo() : finishDate;
+            GanttChartItemTooltipBuilder tooltipBuilder = getPlannedEventTooltip(event, label, requiresShutdown, startDate,
+                    finishDate, locale);
 
             for (LineReference productionLine : placedEvent.getProductionLines()) {
                 String rowName = productionLine.getNumber();
@@ -702,8 +741,8 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
                     continue;
                 }
 
-                GanttChartItem item = scale.createGanttChartItem(rowName, label, tooltipBuilder.build(), null, startDate,
-                        finishDate);
+                GanttChartItem item = scale.createGanttChartItem(rowName, label, tooltipBuilder.build(), null, itemDateFrom,
+                        itemDateTo);
 
                 if (item != null) {
                     item.addBackgroundStrip(GanttChartItemStripFactory.create(color, STRIP_SIZE));
@@ -834,15 +873,31 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
         return false;
     }
 
+    /**
+     * Returns the tooltip of a planned event's items: the label as header, the {@link #ITEM_PLANNED_EVENT_KEY} line of its
+     * type and state labels and the {@link #ITEM_REQUIRES_SHUTDOWN_KEY} line, followed by the
+     * {@link #ITEM_NO_START_DATE_KEY} line when the start date is null and by the {@link #ITEM_NO_FINISH_DATE_KEY} line when
+     * the finish date is null.
+     */
     private GanttChartItemTooltipBuilder getPlannedEventTooltip(final Entity event, final String label,
-            final boolean requiresShutdown, final Locale locale) {
+            final boolean requiresShutdown, final Date startDate, final Date finishDate, final Locale locale) {
         String typeLabel = typeLabel(event.getStringField(L_EVENT_TYPE), locale);
         String stateLabel = stateLabel(event.getStringField(L_EVENT_STATE), locale);
         String requiresShutdownLabel = translate(requiresShutdown ? TRUE_KEY : FALSE_KEY, locale);
 
-        return new GanttChartItemTooltipBuilder().withHeader(label)
+        GanttChartItemTooltipBuilder tooltipBuilder = new GanttChartItemTooltipBuilder().withHeader(label)
                 .addLineToContent(translate(ITEM_PLANNED_EVENT_KEY, locale, typeLabel, stateLabel))
                 .addLineToContent(translate(ITEM_REQUIRES_SHUTDOWN_KEY, locale, requiresShutdownLabel));
+
+        if (startDate == null) {
+            tooltipBuilder.addLineToContent(translate(ITEM_NO_START_DATE_KEY, locale));
+        }
+
+        if (finishDate == null) {
+            tooltipBuilder.addLineToContent(translate(ITEM_NO_FINISH_DATE_KEY, locale));
+        }
+
+        return tooltipBuilder;
     }
 
     /**
@@ -995,7 +1050,8 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
 
     /**
      * Date range whose overlapping positions and planned events become board items: from {@code dateFrom} to
-     * {@code dateTo}.
+     * {@code dateTo}. Its bounds are also the item bounds of a planned event on the side of its missing start or finish
+     * date.
      */
     private static final class ItemWindow {
 

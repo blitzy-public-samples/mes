@@ -49,11 +49,17 @@
  * runs as root, /proc mounted with hidepid: the check writes one warning line to stderr with the number of findings
  * and at most 10 of them, and the run continues. Processes outside the run can read the --password argument and
  * reach Chrome's DevTools endpoint. In a worker of its own, a private process list and a private network namespace
- * holding only this run, the application and its database server, the checks write no warning. A finding counts once
- * an immediate second check finds it again. From the first check until the after hook, the runner checks every 500 ms
- * for intrusions only: a traced process of the run, and, once Chrome runs, any connection to Chrome's DevTools port
- * other than its own. An intrusion found while the run runs stops Chrome, fails every later case and the after hook,
- * and sets the exit status to 1.
+ * holding only this run, the application and its database server, the checks write no warning. A finding other than a
+ * DevTools one counts once an immediate second check finds it again. From the first check until the after hook, the
+ * runner checks every 500 ms for intrusions and, once Chrome runs, for DevTools findings only. A DevTools finding is an
+ * entry of /proc/net/tcp or tcp6, in any state but LISTEN, with an end at Chrome's DevTools listening address and
+ * neither end at one of the runner's own connections to it; an entry without a socket that is there when the DevTools
+ * check starts is not reported. It is an intrusion when every check finds it ESTABLISHED with a socket for at least
+ * DEVTOOLS_SESSION_GRACE_MS (1000 ms) from the check that first finds it. It is co-tenancy when it has no socket, such
+ * as TIME_WAIT, is in a state other than ESTABLISHED or leaves ESTABLISHED before then; a DevTools table that cannot be
+ * read or parsed is co-tenancy too. Each DevTools co-tenancy finding is written once, in one warning line per check
+ * that finds new ones. An intrusion found while the run runs stops Chrome, fails every later case and the after hook,
+ * and sets the exit status to 1. Co-tenancy never stops the run or fails a case.
  *
  * Arguments, checked before any case is registered:
  *   --base-url  a loopback http or https origin (localhost, 127.0.0.0/8 or [::1]) without user name, password, path,
@@ -474,9 +480,13 @@ const ISOLATION_OFFENDER_LIMIT = 10;
 const ISOLATION_EXPOSURE = 'The run continues; processes outside this run can read the --password argument and '
     + 'reach the DevTools endpoint of Chrome';
 
-// Interval of the isolation watch, which checks for intrusions from the first isolation check until the after hook,
-// in milliseconds.
+// Interval of the isolation watch, which checks for intrusions and DevTools co-tenancy from the first isolation check
+// until the after hook, in milliseconds.
 const ISOLATION_WATCH_INTERVAL_MS = 500;
+
+// Milliseconds a foreign connection to the DevTools port must stay ESTABLISHED with a socket, from the check that first
+// finds it, before a later check that finds it again counts it as an intrusion.
+const DEVTOOLS_SESSION_GRACE_MS = 2 * ISOLATION_WATCH_INTERVAL_MS;
 
 // Command line of the runner in /proc/<pid>/cmdline once process.title is set.
 const PROCESS_TITLE = 'node acceptance.test.js';
@@ -969,27 +979,42 @@ let ISOLATION_TIMER = null;
 let ISOLATION_DEVTOOLS = null;
 
 /**
- * Collects the intrusions of workerIsolation(TRUSTED_PORTS, false) and the violations of
- * ISOLATION_DEVTOOLS.devToolsPortViolations(), which are intrusions too, and hands them to failIsolation when there
- * are any. An error while collecting counts as an intrusion. Does nothing once ISOLATION_ERROR is set.
+ * Collects the DevTools findings { coTenancy, intrusion } of ISOLATION_DEVTOOLS.devToolsPortViolations(), none while
+ * ISOLATION_DEVTOOLS is null, and the intrusions of workerIsolation(TRUSTED_PORTS, false). Writes the DevTools
+ * co-tenancy findings, when there are any, as one warning line to stderr, through escapeControlCharacters, naming the
+ * number of findings, the findings as isolationReport gives them and ISOLATION_EXPOSURE, and hands the intrusions of
+ * both, each once, to failIsolation when there are any. An error thrown while collecting counts as an intrusion. Does
+ * nothing once ISOLATION_ERROR is set.
+ *
+ * Example: after a foreign process has opened and closed one connection to the DevTools port, a check writes
+ * "acceptance.test.js: warning: worker isolation check while Chrome runs: the worker is not private (1 finding): a tcp
+ * connection from port 50930 to the DevTools port 35247 (TIME_WAIT). The run continues; ..." and the run continues.
  */
 function checkIsolation() {
     if (ISOLATION_ERROR !== null) {
         return;
     }
 
+    let coTenancy = [];
     let intrusion;
 
     try {
-        intrusion = workerIsolation(TRUSTED_PORTS, false).intrusion;
+        const devTools = ISOLATION_DEVTOOLS !== null ? ISOLATION_DEVTOOLS.devToolsPortViolations()
+            : { coTenancy: [], intrusion: [] };
 
-        if (ISOLATION_DEVTOOLS !== null) {
-            intrusion = [...new Set(intrusion.concat(ISOLATION_DEVTOOLS.devToolsPortViolations()))];
-        }
+        coTenancy = devTools.coTenancy;
+        intrusion = [...new Set(workerIsolation(TRUSTED_PORTS, false).intrusion.concat(devTools.intrusion))];
     } catch (error) {
         intrusion = [error.message];
     }
 
+    if (coTenancy.length > 0) {
+        const count = `${coTenancy.length} finding${coTenancy.length === 1 ? '' : 's'}`;
+        const warning = `acceptance.test.js: warning: worker isolation check while Chrome runs: the worker is not `
+            + `private (${count}): ${isolationReport(coTenancy)}. ${ISOLATION_EXPOSURE}`;
+
+        process.stderr.write(`${escapeControlCharacters(warning)}\n`);
+    }
     if (intrusion.length > 0) {
         failIsolation(intrusion);
     }
@@ -1018,8 +1043,8 @@ function failIsolation(intrusion) {
 }
 
 /**
- * Runs checkIsolation, which checks for intrusions only, every ISOLATION_WATCH_INTERVAL_MS until stopIsolationWatch or
- * failIsolation.
+ * Runs checkIsolation, which checks for intrusions and DevTools co-tenancy only, every ISOLATION_WATCH_INTERVAL_MS
+ * until stopIsolationWatch or failIsolation.
  */
 function startIsolationWatch() {
     ISOLATION_TIMER = setInterval(checkIsolation, ISOLATION_WATCH_INTERVAL_MS);
@@ -1102,9 +1127,14 @@ const DEVTOOLS_NAVIGATE_TIMEOUT_MS = 60000;
 // Wait for Chrome to exit after SIGTERM, and again after SIGKILL.
 const CHROME_EXIT_WAIT_MS = 5000;
 
-// Exit status after SIGINT and SIGTERM, and the deadline of the cleanup that runs before it.
-const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 };
+// Exit status after SIGHUP, SIGINT and SIGTERM, 128 + the signal number, and the deadline of the cleanup that runs
+// before it.
+const SIGNAL_EXIT_CODES = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
 const SIGNAL_CLEANUP_TIMEOUT_MS = 15000;
+
+// Exit status, 128 + the number of SIGPIPE, after a write to stdout or stderr fails with EPIPE, as it does once the
+// reader of the pipe has closed it.
+const CLOSED_PIPE_EXIT_CODE = 128 + os.constants.signals.SIGPIPE;
 
 // Hosts a DevTools endpoint may name.
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
@@ -3234,7 +3264,9 @@ class DevTools {
     /**
      * Starts checking the DevTools port `port` of the running Chrome: notes its listening sockets, the runner's own
      * connections to them (the entries of /proc/net/tcp and tcp6 whose inode is a socket of this process) and the
-     * entries without a socket (inode 0), such as TIME_WAIT entries, already at a listening address, sets
+     * entries without a socket (inode 0), such as TIME_WAIT entries, already at a listening address, records them in
+     * this.devToolsWatch with an empty sessions Map, from the key of each foreign ESTABLISHED entry with a socket to
+     * { since, connection }, and an empty warned Set of the co-tenancy findings already reported, sets
      * ISOLATION_DEVTOOLS to this client and runs checkIsolation at once. Throws when the tables show no listening socket
      * of the port or no connection of the runner to it.
      */
@@ -3260,37 +3292,99 @@ class DevTools {
             listening,
             foreign,
             key,
-            earlier: new Set(table.filter((entry) => foreign(entry) && entry.inode === '0').map(key))
+            earlier: new Set(table.filter((entry) => foreign(entry) && entry.inode === '0').map(key)),
+            sessions: new Map(),
+            warned: new Set()
         };
         ISOLATION_DEVTOOLS = this;
         checkIsolation();
     }
 
     /**
-     * Returns, while watchDevToolsPort checks a port, 'a <protocol> connection from port <peer> to the DevTools port
-     * <port> (<state>)' for every entry of /proc/net/tcp and tcp6, in any state but LISTEN, one end of which is a
+     * Returns the DevTools findings { coTenancy, intrusion } while watchDevToolsPort checks a port, and two empty lists
+     * otherwise. A foreign entry is an entry of /proc/net/tcp and tcp6, in any state but LISTEN, one end of which is a
      * listening address of the port and neither end of which is one of the runner's own connections, other than the
-     * entries without a socket noted by watchDevToolsPort; an empty list otherwise.
+     * entries without a socket noted by watchDevToolsPort; <connection> below is 'a <protocol> connection from port
+     * <peer> to the DevTools port <port>'. The time of a check is performance.now() when it starts.
+     *   - A foreign entry in ESTABLISHED state with a socket (inode other than 0) is added to watch.sessions with the
+     *     time of the check that first finds it. intrusion holds '<connection> (ESTABLISHED) that stayed open for at
+     *     least DEVTOOLS_SESSION_GRACE_MS ms' for each one this check finds at least DEVTOOLS_SESSION_GRACE_MS after
+     *     that time.
+     *   - coTenancy holds '<connection> (<state>)' for every other foreign entry, with or without a socket, and
+     *     '<connection> (ESTABLISHED) that closed within <elapsed> ms' for every entry of watch.sessions this check
+     *     does not find ESTABLISHED with a socket, elapsed being the milliseconds since the check that first found it,
+     *     rounded up; that entry is removed from watch.sessions.
+     *   - coTenancy holds the message of socketTable when those tables cannot be read or parsed; intrusion is then
+     *     empty and watch.sessions is unchanged.
+     * coTenancy leaves out the findings of watch.warned, holds each finding once, and every finding it holds is added
+     * to watch.warned.
+     *
+     * Example: a foreign client that connects at 0 ms and is found by the checks at 200, 700 and 1200 ms gives the
+     * intrusion 'a tcp connection from port 50930 to the DevTools port 35247 (ESTABLISHED) that stayed open for at
+     * least 1000 ms' at 1200 ms; one that has closed by 700 ms gives at 700 ms the co-tenancy findings
+     * '... (ESTABLISHED) that closed within 500 ms' and, for its socketless remnant, '... (TIME_WAIT)', each once.
      */
     devToolsPortViolations() {
         const watch = this.devToolsWatch;
+        const findings = { coTenancy: [], intrusion: [] };
 
         if (!watch) {
-            return [];
+            return findings;
         }
 
-        const violations = [];
+        const warn = (finding) => {
+            if (!watch.warned.has(finding)) {
+                watch.warned.add(finding);
+                findings.coTenancy.push(finding);
+            }
+        };
+        const now = performance.now();
+        let table;
 
-        for (const entry of socketTable(['tcp', 'tcp6'])) {
-            if (watch.foreign(entry) && !watch.earlier.has(watch.key(entry))) {
-                const peerPort = watch.listening.has(entry.local) ? entry.remotePort : entry.localPort;
+        try {
+            table = socketTable(['tcp', 'tcp6']);
+        } catch (error) {
+            warn(error.message);
 
-                violations.push(`a ${entry.protocol} connection from port ${peerPort} to the DevTools port `
-                    + `${watch.port} (${TCP_STATE_NAMES[entry.state] || entry.state})`);
+            return findings;
+        }
+
+        const established = new Set();
+
+        for (const entry of table) {
+            const entryKey = watch.key(entry);
+
+            if (!watch.foreign(entry) || watch.earlier.has(entryKey)) {
+                continue;
+            }
+
+            const peerPort = watch.listening.has(entry.local) ? entry.remotePort : entry.localPort;
+            const connection = `a ${entry.protocol} connection from port ${peerPort} to the DevTools port `
+                + `${watch.port}`;
+
+            if (entry.state !== '01' || entry.inode === '0') {
+                warn(`${connection} (${TCP_STATE_NAMES[entry.state] || entry.state})`);
+                continue;
+            }
+
+            established.add(entryKey);
+
+            if (!watch.sessions.has(entryKey)) {
+                watch.sessions.set(entryKey, { since: now, connection });
+            } else if (now - watch.sessions.get(entryKey).since >= DEVTOOLS_SESSION_GRACE_MS) {
+                findings.intrusion.push(`${connection} (ESTABLISHED) that stayed open for at least `
+                    + `${DEVTOOLS_SESSION_GRACE_MS} ms`);
             }
         }
 
-        return violations;
+        for (const [entryKey, session] of watch.sessions) {
+            if (!established.has(entryKey)) {
+                watch.sessions.delete(entryKey);
+                warn(`${session.connection} (ESTABLISHED) that closed within ${Math.ceil(now - session.since)} ms`);
+            }
+        }
+
+        return findings;
     }
 
     /**
@@ -4524,46 +4618,91 @@ after(async () => {
     }
 });
 
-// Name of the first termination signal received, or null.
+// What ended the run: the name of the first termination signal received, or 'EPIPE on stdout' or 'EPIPE on stderr'
+// after a write to that stream failed with EPIPE; null while nothing has.
 let TERMINATION_SIGNAL = null;
 
+// Names of the standard streams, 'stdout' and 'stderr', a write to which has failed; nothing more is written to them.
+const BROKEN_STDIO = new Set();
+
+// Writes text to stderr, unless a write to stderr has failed.
+function writeStderr(text) {
+    if (!BROKEN_STDIO.has('stderr')) {
+        process.stderr.write(text);
+    }
+}
+
 /**
- * Handles SIGINT and SIGTERM: writes the signal to stderr, runs releaseResources, writes each cleanup error to stderr
- * and exits with SIGNAL_EXIT_CODES[signal]. Exits with that status after SIGNAL_CLEANUP_TIMEOUT_MS when the cleanup
- * has not finished. A later signal is written to stderr while the cleanup of the first one runs.
+ * Ends the run: records cause in TERMINATION_SIGNAL, writes reason to stderr, runs releaseResources, writes each
+ * cleanup error to stderr and exits with exitCode. Exits with that status after SIGNAL_CLEANUP_TIMEOUT_MS when the
+ * cleanup has not finished. A later call while that cleanup runs writes its reason to stderr and changes nothing.
+ * Every write goes through writeStderr.
+ *
+ * Example: terminate('SIGINT', 'SIGINT received', 130) writes "acceptance.test.js: SIGINT received; stopping Chrome
+ * and psql and removing temporary directories, then exiting with 130"; a SIGTERM during that cleanup writes
+ * "acceptance.test.js: SIGTERM received while cleaning up after SIGINT".
  */
-function onTerminationSignal(signal) {
+function terminate(cause, reason, exitCode) {
     if (TERMINATION_SIGNAL !== null) {
-        process.stderr.write(`acceptance.test.js: ${signal} received while cleaning up after ${TERMINATION_SIGNAL}\n`);
+        writeStderr(`acceptance.test.js: ${reason} while cleaning up after ${TERMINATION_SIGNAL}\n`);
         return;
     }
 
-    TERMINATION_SIGNAL = signal;
+    TERMINATION_SIGNAL = cause;
 
-    const exitCode = SIGNAL_EXIT_CODES[signal];
-
-    process.stderr.write(`acceptance.test.js: ${signal} received; stopping Chrome and psql and removing temporary `
-        + `directories, then exiting with ${exitCode}\n`);
+    writeStderr(`acceptance.test.js: ${reason}; stopping Chrome and psql and removing temporary directories, then `
+        + `exiting with ${exitCode}\n`);
 
     const deadline = setTimeout(() => {
-        process.stderr.write(`acceptance.test.js: cleanup did not finish within ${SIGNAL_CLEANUP_TIMEOUT_MS} ms\n`);
+        writeStderr(`acceptance.test.js: cleanup did not finish within ${SIGNAL_CLEANUP_TIMEOUT_MS} ms\n`);
         process.exit(exitCode);
     }, SIGNAL_CLEANUP_TIMEOUT_MS);
 
     releaseResources().then((errors) => {
         for (const error of errors) {
-            process.stderr.write(`acceptance.test.js: cleanup failed: ${error.message}\n`);
+            writeStderr(`acceptance.test.js: cleanup failed: ${error.message}\n`);
         }
     }, (error) => {
-        process.stderr.write(`acceptance.test.js: cleanup failed: ${error.message}\n`);
+        writeStderr(`acceptance.test.js: cleanup failed: ${error.message}\n`);
     }).finally(() => {
         clearTimeout(deadline);
         process.exit(exitCode);
     });
 }
 
-process.on('SIGINT', onTerminationSignal);
-process.on('SIGTERM', onTerminationSignal);
+// Ends the run with terminate on SIGHUP, SIGINT or SIGTERM, with the exit status SIGNAL_EXIT_CODES[signal].
+function onTerminationSignal(signal) {
+    terminate(signal, `${signal} received`, SIGNAL_EXIT_CODES[signal]);
+}
+
+/**
+ * Handles the first write error of stdout or stderr, name being 'stdout' or 'stderr': adds name to BROKEN_STDIO, then
+ * ends the run with terminate and CLOSED_PIPE_EXIT_CODE when the error is EPIPE, as it is once the reader of the pipe,
+ * such as the tee of run-acceptance.sh, has closed it, and otherwise writes the error code through writeStderr. Later
+ * errors of the same stream are ignored.
+ */
+function onStdioError(name, error) {
+    if (BROKEN_STDIO.has(name)) {
+        return;
+    }
+
+    BROKEN_STDIO.add(name);
+
+    const code = error && error.code ? error.code : String(error);
+
+    if (code === 'EPIPE') {
+        terminate(`EPIPE on ${name}`, `the reader of ${name} closed its pipe (EPIPE)`, CLOSED_PIPE_EXIT_CODE);
+        return;
+    }
+
+    writeStderr(`acceptance.test.js: a write to ${name} failed (${code}); nothing more is written to it\n`);
+}
+
+for (const signal of Object.keys(SIGNAL_EXIT_CODES)) {
+    process.on(signal, onTerminationSignal);
+}
+process.stdout.on('error', (error) => onStdioError('stdout', error));
+process.stderr.on('error', (error) => onStdioError('stderr', error));
 
 // ---------------------------------------------------------------------------------------------------------------
 // Shared case flows

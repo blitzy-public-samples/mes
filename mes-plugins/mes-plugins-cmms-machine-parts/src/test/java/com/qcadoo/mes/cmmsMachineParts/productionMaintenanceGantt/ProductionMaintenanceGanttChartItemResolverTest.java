@@ -623,6 +623,149 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
     }
 
     @Test
+    public final void shouldPlaceEventWithoutFinishDateFromItsStartToEndOfItemWindow() {
+        // given
+        stubInitializeScale();
+
+        positions.add(position(251L, lineL1, order("ORD-OPEN", product("P-OPEN", "Open-ended")), "2026-10-06 06:00:00",
+                "2026-10-06 13:30:00"));
+        plannedEvents.add(plannedEvent("EV-NO-FINISH", PlannedEventStateStringValues.IN_REALIZATION, true,
+                "2026-10-08 07:00:00", null, lineL2, null, null));
+        plannedEvents.add(plannedEvent("EV-NO-FINISH-EARLY", PlannedEventStateStringValues.PLANNED, false,
+                "2026-10-01 06:00:00", null, null, workstation(lineL3), null));
+        plannedEvents.add(plannedEvent("EV-NO-FINISH-AFTER", PlannedEventStateStringValues.PLANNED, true,
+                "2026-10-28 00:00:00", null, lineL2, null, null));
+
+        // when
+        Map<String, List<GanttChartItem>> items = resolver.resolve(scale, context, locale);
+
+        // then
+        Date windowTo = date("2026-10-27 23:59:59");
+
+        assertEquals(Collections.singletonList("EV-NO-FINISH"), itemNames(items.get("L2")));
+        assertEquals(Collections.singletonList("EV-NO-FINISH-EARLY"), itemNames(items.get("L3")));
+        assertTrue(recordedItemsLabelled("EV-NO-FINISH-AFTER").isEmpty());
+
+        RecordedItem openItem = recordedItemLabelled("EV-NO-FINISH");
+
+        assertEquals("L2", openItem.rowName);
+        assertNull(openItem.entityId);
+        assertEquals(date("2026-10-08 07:00:00"), openItem.dateFrom);
+        assertEquals(windowTo, openItem.dateTo);
+        assertEquals("EV-NO-FINISH", openItem.tooltip.getHeader().get());
+        assertEquals(Arrays.asList(
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY, EVENT_TYPE_PREFIX + EVENT_TYPE,
+                        EVENT_STATE_PREFIX + PlannedEventStateStringValues.IN_REALIZATION),
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, TRUE_KEY),
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_NO_FINISH_DATE_KEY)), openItem.tooltip.getContent());
+        assertEquals(ProductionMaintenanceGanttChartItemResolver.SHUTDOWN_COLOR, captureSingleStrip(openItem.item).getColor());
+
+        RecordedItem earlyItem = recordedItemLabelled("EV-NO-FINISH-EARLY");
+
+        assertEquals(date("2026-10-01 06:00:00"), earlyItem.dateFrom);
+        assertEquals(windowTo, earlyItem.dateTo);
+    }
+
+    @Test
+    public final void shouldPlaceEventWithoutStartDateFromStartOfItemWindowToItsFinish() {
+        // given
+        stubInitializeScale();
+
+        positions.add(position(261L, lineL1, order("ORD-OPEN", product("P-OPEN", "Open-ended")), "2026-10-06 06:00:00",
+                "2026-10-06 13:30:00"));
+        plannedEvents.add(plannedEvent("EV-NO-START", PlannedEventStateStringValues.PLANNED, true, null,
+                "2026-10-07 12:00:00", null, null, division(lineL1, lineL2)));
+        plannedEvents.add(plannedEvent("EV-NO-START-BEFORE", PlannedEventStateStringValues.PLANNED, true, null, FITTED_FROM,
+                lineL3, null, null));
+
+        // when
+        Map<String, List<GanttChartItem>> items = resolver.resolve(scale, context, locale);
+
+        // then
+        List<RecordedItem> openItems = recordedItemsLabelled("EV-NO-START");
+        List<String> expectedContent = Arrays.asList(
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY, EVENT_TYPE_PREFIX + EVENT_TYPE,
+                        EVENT_STATE_PREFIX + PlannedEventStateStringValues.PLANNED),
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY, TRUE_KEY),
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_NO_START_DATE_KEY));
+
+        assertEquals(Arrays.asList("L1", "L2"), rowNamesOf(openItems));
+
+        for (RecordedItem openItem : openItems) {
+            assertEquals(date(FITTED_FROM), openItem.dateFrom);
+            assertEquals(date("2026-10-07 12:00:00"), openItem.dateTo);
+            assertEquals(expectedContent, openItem.tooltip.getContent());
+        }
+
+        assertEquals(Arrays.asList("ORD-OPEN", "EV-NO-START"), itemNames(items.get("L1")));
+        assertEquals(Collections.singletonList("EV-NO-START"), itemNames(items.get("L2")));
+        assertTrue(items.get("L3").isEmpty());
+        assertTrue(recordedItemsLabelled("EV-NO-START-BEFORE").isEmpty());
+    }
+
+    @Test
+    public final void shouldOmitEventWithoutStartAndFinishDate() {
+        // given
+        plannedEvents.add(plannedEvent("EV-NO-DATES", PlannedEventStateStringValues.NEW, true, null, null, lineL2,
+                workstation(lineL2), division(lineL1, lineL2)));
+
+        // when
+        Map<String, List<GanttChartItem>> items = resolver.resolve(scale, context, locale);
+
+        // then
+        assertEquals(Arrays.asList("L1", "L2", "L3"), new ArrayList<String>(items.keySet()));
+
+        for (List<GanttChartItem> row : items.values()) {
+            assertTrue(row.isEmpty());
+        }
+
+        assertTrue(recordedItems.isEmpty());
+        assertTrue(queriesOf(BOARD_EVENTS_QUERY).get(0).rows.isEmpty());
+        assertTrue(queriesOf(DIVISION_LINES_QUERY).isEmpty());
+    }
+
+    @Test
+    public final void shouldAddMissingDateTooltipLineOnlyToEventsWithoutStartOrFinishDate() {
+        // given
+        plannedEvents.add(plannedEvent("EV-DATED", PlannedEventStateStringValues.PLANNED, false, "2026-09-29 06:00:00",
+                "2026-09-29 10:00:00", lineL1, null, null));
+        plannedEvents.add(plannedEvent("EV-NO-START", PlannedEventStateStringValues.PLANNED, false, null,
+                "2026-09-29 10:00:00", lineL2, null, null));
+        plannedEvents.add(plannedEvent("EV-NO-FINISH", PlannedEventStateStringValues.PLANNED, false, "2026-09-29 06:00:00",
+                null, lineL3, null, null));
+
+        // when
+        resolver.resolve(scale, context, locale);
+
+        // then
+        String typeAndStateLine = translated(ProductionMaintenanceGanttChartItemResolver.ITEM_PLANNED_EVENT_KEY,
+                EVENT_TYPE_PREFIX + EVENT_TYPE, EVENT_STATE_PREFIX + PlannedEventStateStringValues.PLANNED);
+        String requiresShutdownLine = translated(ProductionMaintenanceGanttChartItemResolver.ITEM_REQUIRES_SHUTDOWN_KEY,
+                FALSE_KEY);
+
+        RecordedItem datedItem = recordedItemLabelled("EV-DATED");
+        RecordedItem noStartItem = recordedItemLabelled("EV-NO-START");
+        RecordedItem noFinishItem = recordedItemLabelled("EV-NO-FINISH");
+
+        assertEquals(Arrays.asList(typeAndStateLine, requiresShutdownLine), datedItem.tooltip.getContent());
+        assertEquals(date("2026-09-29 06:00:00"), datedItem.dateFrom);
+        assertEquals(date("2026-09-29 10:00:00"), datedItem.dateTo);
+
+        assertEquals(Arrays.asList(typeAndStateLine, requiresShutdownLine,
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_NO_START_DATE_KEY)),
+                noStartItem.tooltip.getContent());
+        assertEquals(scaleFrom, noStartItem.dateFrom);
+        assertEquals(date("2026-09-29 10:00:00"), noStartItem.dateTo);
+
+        assertEquals(Arrays.asList(typeAndStateLine, requiresShutdownLine,
+                translated(ProductionMaintenanceGanttChartItemResolver.ITEM_NO_FINISH_DATE_KEY)),
+                noFinishItem.tooltip.getContent());
+        assertEquals(date("2026-09-29 06:00:00"), noFinishItem.dateFrom);
+        assertEquals(scaleTo, noFinishItem.dateTo);
+    }
+
+
+    @Test
     public final void shouldEscapeUserEnteredDisplayStrings() {
         // given
         Entity escapedLine = productionLine(5L, "L&1");
@@ -2221,6 +2364,37 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
     }
 
     @Test
+    public final void shouldFindShutdownEventNumbersOfOpenEndedEventsWithEventsWithoutStartDateFirst() {
+        // given
+        Date dateFrom = date("2026-09-29 08:00:00");
+        Date dateTo = date("2026-09-29 12:00:00");
+
+        plannedEvents.add(plannedEvent("EV-S-DATED", PlannedEventStateStringValues.PLANNED, true, "2026-09-29 07:00:00",
+                "2026-09-29 09:00:00", lineL2, null, null));
+        plannedEvents.add(plannedEvent("EV-S-NO-FINISH", PlannedEventStateStringValues.PLANNED, true, "2026-09-28 06:00:00",
+                null, null, workstation(lineL2), null));
+        plannedEvents.add(plannedEvent("EV-S-NO-START", PlannedEventStateStringValues.CANCELED, true, null,
+                "2026-09-29 08:30:00", null, null, division(lineL1, lineL2)));
+        plannedEvents.add(plannedEvent("EV-S-NO-DATES", PlannedEventStateStringValues.PLANNED, true, null, null, lineL2,
+                null, null));
+        plannedEvents.add(plannedEvent("EV-S-NO-FINISH-AT-END", PlannedEventStateStringValues.PLANNED, true,
+                "2026-09-29 12:00:00", null, lineL2, null, null));
+        plannedEvents.add(plannedEvent("EV-S-NO-START-AT-START", PlannedEventStateStringValues.PLANNED, true, null,
+                "2026-09-29 08:00:00", lineL2, null, null));
+        plannedEvents.add(plannedEvent("EV-S-NO-FINISH-OTHER-LINE", PlannedEventStateStringValues.PLANNED, true,
+                "2026-09-29 09:00:00", null, lineL1, null, null));
+
+        // when
+        List<String> eventNumbers = resolver.findShutdownEventNumbers(lineL2, dateFrom, dateTo);
+
+        // then
+        assertEquals(Arrays.asList("EV-S-NO-START", "EV-S-NO-FINISH", "EV-S-DATED"), eventNumbers);
+        assertEquals(Collections.singletonList(SHUTDOWN_EVENTS_QUERY), recordedHql());
+        assertEquals(Arrays.asList("EV-S-NO-START", "EV-S-NO-FINISH", "EV-S-DATED"),
+                stringFieldsOf(recordedQueries.get(0).rows, EVENT_NUMBER_ALIAS));
+    }
+
+    @Test
     public final void shouldFindNoShutdownEventNumbersWhenNoEventIsPlacedOnTargetLine() {
         // given
         Date dateFrom = date("2026-09-29 08:00:00");
@@ -2756,7 +2930,14 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
         return map;
     }
 
+    /**
+     * Returns the date of the given {@link DateUtils#L_DATE_TIME_FORMAT} text, or null when the text is null.
+     */
     private static Date date(final String value) {
+        if (value == null) {
+            return null;
+        }
+
         try {
             return new SimpleDateFormat(DateUtils.L_DATE_TIME_FORMAT).parse(value);
         } catch (ParseException e) {
@@ -2814,6 +2995,10 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
         return position;
     }
 
+    /**
+     * Returns a planned event of the fixture type with the next event id; a null start or finish date text gives the event
+     * a null start or finish date.
+     */
     private Entity plannedEvent(final String number, final String state, final boolean requiresShutdown,
             final String startDate, final String finishDate, final Entity productionLine, final Entity workstation,
             final Entity division) {
@@ -3071,19 +3256,20 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
     }
 
     /**
-     * Fixture events overlapping {@code [dateFrom, dateTo)}, ordered by start date and id.
+     * Fixture events overlapping {@code [dateFrom, dateTo)} by the rule of {@link #eventOverlaps(Date, Date, Date, Date)},
+     * ordered by {@link EventStartThenIdOrder}.
      */
     private List<Entity> overlappingEvents(final Date dateFrom, final Date dateTo) {
         List<Entity> matching = new ArrayList<Entity>();
 
         for (Entity event : plannedEvents) {
-            if (overlaps(event.getDateField(PlannedEventFields.START_DATE), event.getDateField(PlannedEventFields.FINISH_DATE),
-                    dateFrom, dateTo)) {
+            if (eventOverlaps(event.getDateField(PlannedEventFields.START_DATE),
+                    event.getDateField(PlannedEventFields.FINISH_DATE), dateFrom, dateTo)) {
                 matching.add(event);
             }
         }
 
-        Collections.sort(matching, new DateThenIdOrder(PlannedEventFields.START_DATE));
+        Collections.sort(matching, new EventStartThenIdOrder());
 
         return matching;
     }
@@ -3124,6 +3310,16 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
 
     private static boolean overlaps(final Date startDate, final Date finishDate, final Date dateFrom, final Date dateTo) {
         return startDate.before(dateTo) && finishDate.after(dateFrom);
+    }
+
+    /**
+     * Returns whether a planned event with the given dates overlaps {@code [dateFrom, dateTo)}: it has a start date, a
+     * finish date or both, its start date is null or before {@code dateTo}, and its finish date is null or after
+     * {@code dateFrom}.
+     */
+    private static boolean eventOverlaps(final Date startDate, final Date finishDate, final Date dateFrom, final Date dateTo) {
+        return (startDate != null || finishDate != null) && (startDate == null || startDate.before(dateTo))
+                && (finishDate == null || finishDate.after(dateFrom));
     }
 
     private static boolean hasId(final Entity entity, final Long id) {
@@ -3466,6 +3662,35 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
 
             if (byDate != 0) {
                 return byDate;
+            }
+
+            return first.getId().compareTo(second.getId());
+        }
+
+    }
+
+    /**
+     * Orders planned events without a start date first, then by start date, then by id.
+     */
+    private static final class EventStartThenIdOrder implements Comparator<Entity> {
+
+        @Override
+        public int compare(final Entity first, final Entity second) {
+            Date firstStartDate = first.getDateField(PlannedEventFields.START_DATE);
+            Date secondStartDate = second.getDateField(PlannedEventFields.START_DATE);
+
+            if (firstStartDate == null && secondStartDate != null) {
+                return -1;
+            }
+            if (firstStartDate != null && secondStartDate == null) {
+                return 1;
+            }
+            if (firstStartDate != null) {
+                int byDate = firstStartDate.compareTo(secondStartDate);
+
+                if (byDate != 0) {
+                    return byDate;
+                }
             }
 
             return first.getId().compareTo(second.getId());

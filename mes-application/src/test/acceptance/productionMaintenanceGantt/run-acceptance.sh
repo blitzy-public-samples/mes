@@ -69,18 +69,25 @@
 #      listener check, and checks the TAP summary and every case line.
 #   5. Stops the running step, the isolation watch and Tomcat on every exit. The steps are the unpacking, the psql
 #      commands, the login page probes and the pauses between them, and acceptance.test.js; each runs as a background
-#      job the script waits for, and SIGINT or SIGTERM ends that wait at once, except for a psql command inside a
-#      command substitution, which finishes first. acceptance.test.js and the psql deadline wrapper get the signal the
-#      script received, any other step SIGTERM; SIGTERM and SIGKILL follow while it still runs. Removes the work
-#      directory once Tomcat has stopped; keeps it and prints its path while Tomcat still runs. The database is kept.
+#      job the script waits for, and SIGHUP, SIGINT or SIGTERM ends that wait at once, except for a psql command
+#      inside a command substitution, which finishes first. SIGPIPE, which a write of the script to a closed standard
+#      output or standard error raises, also stops the run. acceptance.test.js and the psql deadline wrapper get SIGINT
+#      after a SIGINT and SIGTERM otherwise, any other step SIGTERM; SIGTERM and SIGKILL follow while it still runs.
+#      While it stops the run, the script ignores SIGHUP, SIGINT, SIGTERM and SIGPIPE, and the commands it then starts
+#      begin with them ignored; when a signal started the stop, it prints one line to stderr naming that signal.
+#      Removes the work directory once Tomcat has stopped; keeps it and prints its path while Tomcat still runs. The
+#      database is kept.
 #
-# Exit status: 0 for --help, and otherwise only when every acceptance case passed, Tomcat stopped and the work
-# directory was removed; 2 on a usage error; the runner's status when the runner failed; 130 on SIGINT; 143 on SIGTERM,
-# the signal the isolation watch sends on an intrusion; 1 on any other failure, including an intrusion found by a
-# worker isolation check, a worker isolation check that cannot run, a failed or timed-out psql command, any other
-# failed command, Tomcat still running after the stop, a work directory that cannot be removed, an HTTP port listener
-# that is not the started Tomcat or a started Tomcat that is no longer running, and a tee failure. A worker isolation
-# warning leaves the status unchanged. A failed stop or removal keeps a nonzero status unchanged.
+# Exit status: 0 for --help, and otherwise only when every acceptance case passed, Tomcat stopped and the work directory
+# was removed; 2 on a usage error; the runner's status when the runner failed; 129 on SIGHUP, a hangup of the
+# controlling terminal; 130 on SIGINT; 141 on SIGPIPE, a write to a closed standard output or standard error; 143 on
+# SIGTERM, the signal the isolation watch sends on an intrusion, and in place of 0 when the isolation watch exits after
+# an intrusion while the run stops; 1 on any other failure, including an intrusion found by a worker isolation check, a
+# worker isolation check that cannot run, a failed or timed-out psql command, any other failed command, Tomcat still
+# running after the stop, a work directory that cannot be removed, an HTTP port listener that is not the started Tomcat
+# or a started Tomcat that is no longer running, and a tee failure. A worker isolation warning leaves the status
+# unchanged. A signal received while the run stops leaves the status unchanged. A failed stop or removal keeps a nonzero
+# status unchanged.
 
 # Turns off command tracing (xtrace) for the whole run.
 set +x
@@ -865,19 +872,22 @@ holds_controls() {
     [ "$(escape_controls "$1")" != "$1" ]
 }
 
-# Prints a progress line, its message passed through escape_controls.
+# Prints a progress line, its message passed through escape_controls, and returns the status of printf. A write to a
+# closed standard output prints no write-error diagnostic.
 log() {
-    printf '%s: %s\n' "$PROGRAM" "$(escape_controls "$1")"
+    printf '%s: %s\n' "$PROGRAM" "$(escape_controls "$1")" 2> /dev/null
 }
 
-# Prints a warning line to stderr, its message passed through escape_controls.
+# Prints a warning line to stderr, its message passed through escape_controls, and returns the status of printf. A
+# write to a closed standard error prints no write-error diagnostic.
 warn() {
-    printf '%s: warning: %s\n' "$PROGRAM" "$(escape_controls "$1")" >&2
+    printf '%s: warning: %s\n' "$PROGRAM" "$(escape_controls "$1")" >&2 2> /dev/null
 }
 
-# Prints an error line, its message passed through escape_controls, and exits with status 1.
+# Prints an error line to stderr, its message passed through escape_controls, and exits with status 1. A write to a
+# closed standard error prints no write-error diagnostic.
 die() {
-    printf '%s: error: %s\n' "$PROGRAM" "$(escape_controls "$1")" >&2
+    printf '%s: error: %s\n' "$PROGRAM" "$(escape_controls "$1")" >&2 2> /dev/null
     exit 1
 }
 
@@ -978,7 +988,9 @@ Exit status:
   0         --help, or every acceptance case passed, Tomcat stopped and the work directory was removed
   2         a usage error
   <status>  the status of acceptance.test.js when it failed
+  129       SIGHUP, a hangup of the controlling terminal
   130       SIGINT
+  141       SIGPIPE, a write to a closed standard output or standard error
   143       SIGTERM, also the signal the worker isolation watch sends on an intrusion
   1         any other failure
 
@@ -1590,16 +1602,26 @@ stop_step() {
     return "$failed"
 }
 
-# Stops the running step through stop_step, then the isolation watch. On failure prints the last LOG_TAIL_LINES lines
-# of the Tomcat log through LOG_TAIL_JS, which reads the secrets of the run from its standard input, each ended by a NUL
+# Stops the running step through stop_step, then the isolation watch. On failure prints the last LOG_TAIL_LINES lines of
+# the Tomcat log through LOG_TAIL_JS, which reads the secrets of the run from its standard input, each ended by a NUL
 # byte, or a one-line notice without the tail when the filter fails. Then stops Tomcat, and removes the work directory
 # once Tomcat has stopped. Keeps the work directory while Tomcat still runs. Exits with the status given as its argument
-# (130 or 143); without an argument, with the exit status that ran it when that status is 0 or KEPT_STATUS, and with 1
-# for any other status.
-# Exits with 1 in place of 0 when the step, tee or Tomcat still runs or the work directory still exists.
+# (129, 130, 141 or 143); without an argument, with the exit status that ran it when that status is 0 or KEPT_STATUS,
+# and with 1 for any other status. Exits with 143 in place of 0 when the isolation watch exited with status 1, and with
+# 1 in place of 0 when the step, tee or Tomcat still runs or the work directory still exists. From its first command on
+# it has no EXIT trap, ignores SIGHUP, SIGINT, SIGTERM and SIGPIPE, which the commands it starts inherit as ignored, and
+# runs without errexit; a signal it receives leaves the exit status unchanged. Given an argument, it prints one line to
+# stderr naming the signal of that status (SIGHUP for 129, SIGINT for 130, SIGPIPE for 141, SIGTERM for 143) before it
+# stops anything. A write to a closed standard output or standard error fails without ending it.
+#   cleanup [<exit status>]
+#   Example: trap 'cleanup 143' TERM
 # shellcheck disable=SC2317
 cleanup() {
-    local status=$? cleanup_failed=0 remove_status log_tail filter_status
+    local status=$? cleanup_failed=0 remove_status log_tail filter_status signal_name
+
+    trap - EXIT
+    trap '' HUP INT PIPE TERM
+    set +e
 
     if [ "$#" -gt 0 ]; then
         status="$1"
@@ -1607,13 +1629,23 @@ cleanup() {
         status=1
     fi
 
-    trap - EXIT INT TERM
-    set +e
+    if [ "$#" -gt 0 ]; then
+        case "$status" in
+            129) signal_name='SIGHUP' ;;
+            130) signal_name='SIGINT' ;;
+            141) signal_name='SIGPIPE (a write to a closed standard output or standard error)' ;;
+            143) signal_name='SIGTERM' ;;
+            *) signal_name="the signal of exit status $status" ;;
+        esac
+
+        printf '%s: received %s; stopping the run and ignoring %s until it has stopped\n' "$PROGRAM" "$signal_name" \
+            'SIGHUP, SIGINT, SIGTERM and SIGPIPE' >&2 2> /dev/null
+    fi
 
     stop_step "$status" || cleanup_failed=1
 
-    if [ -n "$ISOLATION_WATCH_PID" ]; then
-        stop_isolation_watch
+    if [ -n "$ISOLATION_WATCH_PID" ] && ! stop_isolation_watch && [ "$status" -eq 0 ]; then
+        status=143
     fi
 
     if [ "$status" -ne 0 ] && [ -n "$TOMCAT_LOG" ] && [ -f "$TOMCAT_LOG" ]; then
@@ -1657,7 +1689,9 @@ cleanup() {
 }
 
 trap cleanup EXIT
+trap 'cleanup 129' HUP
 trap 'cleanup 130' INT
+trap 'cleanup 141' PIPE
 trap 'cleanup 143' TERM
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -2134,14 +2168,24 @@ start_isolation_watch() {
     log "worker isolation watch started (pid $ISOLATION_WATCH_PID)"
 }
 
-# Sends SIGTERM to the isolation watch when it runs and reaps it; clears ISOLATION_WATCH_PID.
+# Sends SIGTERM to the isolation watch when it runs and reaps it; clears ISOLATION_WATCH_PID. Returns 1 when the watch
+# exited with status 1, as it does by itself after it reports an intrusion, and 0 for any other status, such as 130 or
+# 143 when SIGINT or SIGTERM ended it.
 # shellcheck disable=SC2317
 stop_isolation_watch() {
+    local watch_status=0
+
     if [ -n "$ISOLATION_WATCH_PID" ]; then
         kill -TERM "$ISOLATION_WATCH_PID" 2> /dev/null
-        wait "$ISOLATION_WATCH_PID" 2> /dev/null
+        wait "$ISOLATION_WATCH_PID" 2> /dev/null || watch_status=$?
         ISOLATION_WATCH_PID=''
     fi
+
+    if [ "$watch_status" -eq 1 ]; then
+        return 1
+    fi
+
+    return 0
 }
 
 # Resolves the distribution against the caller's working directory, rejects an absolute path that holds a character

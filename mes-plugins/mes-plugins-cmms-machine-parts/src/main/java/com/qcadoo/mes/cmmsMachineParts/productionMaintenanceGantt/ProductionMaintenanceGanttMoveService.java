@@ -141,8 +141,14 @@ public class ProductionMaintenanceGanttMoveService {
     /** Latest year, inclusive, of the start and the end of a move. */
     private static final int MAX_DATE_YEAR = 2500;
 
-    /** SQLSTATE reported by the database for a serialization failure. */
+    /** SQLSTATE reported by the database for a serialization failure ({@code serialization_failure}). */
     private static final String SERIALIZATION_FAILURE_SQL_STATE = "40001";
+
+    /** SQLSTATE reported by the database for a detected deadlock ({@code deadlock_detected}). */
+    private static final String DEADLOCK_DETECTED_SQL_STATE = "40P01";
+
+    /** SQLSTATE reported by the database for a lock that could not be acquired ({@code lock_not_available}). */
+    private static final String LOCK_NOT_AVAILABLE_SQL_STATE = "55P03";
 
     /**
      * Message key of the global error the framework adds to an entity when a model validator returns false without a message
@@ -270,12 +276,18 @@ public class ProductionMaintenanceGanttMoveService {
     /**
      * Returns true when the throwable, or any throwable reachable from it through {@link Throwable#getCause()} and
      * {@link SQLException#getNextException()} links in any combination, is a {@link ConcurrencyFailureException} (which
-     * includes {@link org.springframework.dao.OptimisticLockingFailureException} and
-     * {@link org.springframework.dao.CannotSerializeTransactionException}), or a {@link SQLException} whose SQLSTATE is
-     * {@code 40001}. Each reachable throwable is inspected once, so cyclic cause and next-exception links terminate.
+     * includes {@link org.springframework.dao.OptimisticLockingFailureException},
+     * {@link org.springframework.dao.CannotSerializeTransactionException},
+     * {@link org.springframework.dao.DeadlockLoserDataAccessException} and
+     * {@link org.springframework.dao.CannotAcquireLockException}), or a {@link SQLException} whose SQLSTATE is one of
+     * {@code 40001} ({@code serialization_failure}), {@code 40P01} ({@code deadlock_detected}) and {@code 55P03}
+     * ({@code lock_not_available}); every other SQLSTATE, including the other states of class {@code 40}, is no conflict. Each
+     * reachable throwable is inspected once, so cyclic cause and next-exception links terminate.
      * <p>
      * Example: for an SQL exception whose next exception is also its cause, and whose next exception has a {@code 40001} SQL
-     * exception as its cause, the method returns true.
+     * exception as its cause, the method returns true; for a Hibernate {@code GenericJDBCException} whose cause is an SQL
+     * exception with SQLSTATE {@code 40P01}, it returns true; for an SQL exception with SQLSTATE {@code 40002}, it returns
+     * false.
      *
      * @param throwable
      *            the throwable to inspect, may be null
@@ -294,7 +306,7 @@ public class ProductionMaintenanceGanttMoveService {
                 continue;
             }
 
-            if (current instanceof ConcurrencyFailureException || isSerializationFailure(current)) {
+            if (current instanceof ConcurrencyFailureException || isConcurrencySqlState(current)) {
                 return true;
             }
 
@@ -329,11 +341,20 @@ public class ProductionMaintenanceGanttMoveService {
     }
 
     /**
-     * Returns true when the throwable is an {@link SQLException} whose SQLSTATE is {@code 40001}.
+     * Returns true when the throwable is an {@link SQLException} whose SQLSTATE is {@value #SERIALIZATION_FAILURE_SQL_STATE}
+     * ({@code serialization_failure}), {@value #DEADLOCK_DETECTED_SQL_STATE} ({@code deadlock_detected}) or
+     * {@value #LOCK_NOT_AVAILABLE_SQL_STATE} ({@code lock_not_available}), compared case-sensitively. Returns false for any
+     * other throwable, for an SQL exception without an SQLSTATE and for every other SQLSTATE.
      */
-    private static boolean isSerializationFailure(final Throwable throwable) {
-        return throwable instanceof SQLException
-                && SERIALIZATION_FAILURE_SQL_STATE.equals(((SQLException) throwable).getSQLState());
+    private static boolean isConcurrencySqlState(final Throwable throwable) {
+        if (!(throwable instanceof SQLException)) {
+            return false;
+        }
+
+        String sqlState = ((SQLException) throwable).getSQLState();
+
+        return SERIALIZATION_FAILURE_SQL_STATE.equals(sqlState) || DEADLOCK_DETECTED_SQL_STATE.equals(sqlState)
+                || LOCK_NOT_AVAILABLE_SQL_STATE.equals(sqlState);
     }
 
     /**

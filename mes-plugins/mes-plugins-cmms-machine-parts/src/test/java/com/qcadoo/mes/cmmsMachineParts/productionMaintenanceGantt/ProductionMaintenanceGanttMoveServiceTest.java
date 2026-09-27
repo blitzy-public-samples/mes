@@ -69,6 +69,8 @@ import org.apache.log4j.AppenderSkeleton;
 import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
 import org.apache.log4j.spi.LoggingEvent;
+import org.hibernate.exception.GenericJDBCException;
+import org.hibernate.exception.LockAcquisitionException;
 import org.joda.time.DateTime;
 import org.joda.time.DateTimeZone;
 import org.json.JSONException;
@@ -1436,6 +1438,84 @@ public class ProductionMaintenanceGanttMoveServiceTest {
     }
 
     @Test
+    public final void shouldRethrowDeadlockFromRecomputeUnchangedWithoutWarning() {
+        // given: the recompute's session flush fails with the exception Hibernate raises for SQLSTATE 40P01
+        GenericJDBCException deadlock = deadlockFailure();
+
+        stubBelongsToField(savedPosition, ProductionLineSchedulePositionFields.ORDER, order);
+        givenRecomputeThrows(deadlock);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        RuntimeException thrown = null;
+
+        // when
+        try {
+            moveService.move(request);
+            fail("Expected the deadlock to propagate");
+        } catch (MoveRejectedException e) {
+            fail("Expected the deadlock to propagate unchanged, not as the rejection " + e.getMessageKey());
+        } catch (RuntimeException e) {
+            thrown = e;
+        }
+
+        // then: the very exception leaves the move, after the save and the recompute, and nothing is logged
+        assertSame(deadlock, thrown);
+        verify(positionDD).save(position);
+        verify(recomputeService).recompute(schedule, savedPosition, lineL1, positionStart, lineL2, slotFrom);
+        assertEquals(Collections.<String> emptyList(), loggedMessages(Level.WARN));
+    }
+
+    @Test
+    public final void shouldRethrowLockNotAvailableFromRecomputeUnchangedWithoutWarning() {
+        // given: the recompute's session flush fails with the exception Hibernate raises for SQLSTATE 55P03
+        GenericJDBCException lockNotAvailable = new GenericJDBCException(
+                "could not update: [com.qcadoo.model.beans.orders.OrdersProductionLineSchedulePosition#90]",
+                new SQLException("ERROR: canceling statement due to lock timeout", "55P03"));
+
+        givenRecomputeThrows(lockNotAvailable);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        RuntimeException thrown = null;
+
+        // when
+        try {
+            moveService.move(request);
+            fail("Expected the lock timeout to propagate");
+        } catch (RuntimeException e) {
+            thrown = e;
+        }
+
+        // then
+        assertSame(lockNotAvailable, thrown);
+        assertEquals(Collections.<String> emptyList(), loggedMessages(Level.WARN));
+    }
+
+    @Test
+    public final void shouldWrapRecomputeFailureWithOtherTransactionRollbackSqlStateAsRecomputeFailed() {
+        // given: the recompute fails with SQLSTATE 40002 (integrity constraint violation), a class-40 state that is no
+        // concurrency conflict
+        GenericJDBCException failure = new GenericJDBCException("could not update: [x]", new SQLException(
+                "ERROR: integrity constraint violation", "40002"));
+
+        stubBelongsToField(savedPosition, ProductionLineSchedulePositionFields.ORDER, order);
+        givenRecomputeThrows(failure);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, ORDER_NUMBER, TARGET_LINE_NUMBER,
+                SLOT_FROM);
+        assertSame(failure, rejection.getCause());
+        assertEquals(Collections.singletonList("Recompute after the Gantt move of production line schedule position 11 "
+                + "(production line schedule 7, target production line 2) failed"), loggedMessages(Level.WARN));
+    }
+
+    @Test
     public final void shouldPropagateRecomputeRejectionUnchanged() {
         // given: the recompute service rejects naming a following position
         MoveRejectedException recomputeRejection = new MoveRejectedException(
@@ -1514,6 +1594,96 @@ public class ProductionMaintenanceGanttMoveServiceTest {
 
         // then
         assertTrue(wrappedBatchFailureIsConflict);
+    }
+
+    @Test
+    public final void shouldRecogniseDeadlockAndLockNotAvailableSqlStatesAsConflicts() {
+        // given
+        SQLException deadlock = new SQLException("ERROR: deadlock detected", "40P01");
+        SQLException lockNotAvailable = new SQLException("ERROR: canceling statement due to lock timeout", "55P03");
+        RuntimeException wrappedDeadlock = new RuntimeException(new IllegalStateException(new SQLException(
+                "ERROR: deadlock detected", "40P01")));
+
+        // when
+        boolean deadlockIsConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(deadlock);
+        boolean lockNotAvailableIsConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(lockNotAvailable);
+        boolean wrappedDeadlockIsConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(wrappedDeadlock);
+
+        // then
+        assertTrue(deadlockIsConflict);
+        assertTrue(lockNotAvailableIsConflict);
+        assertTrue(wrappedDeadlockIsConflict);
+    }
+
+    @Test
+    public final void shouldRecogniseHibernateExceptionsCarryingConcurrencySqlStatesAsConflicts() {
+        // given: the exceptions Hibernate raises inside the transaction for SQLSTATE 40P01, 55P03 and 40001
+        GenericJDBCException deadlock = deadlockFailure();
+        GenericJDBCException lockNotAvailable = new GenericJDBCException("could not update: [x]", new SQLException(
+                "ERROR: canceling statement due to lock timeout", "55P03"));
+        LockAcquisitionException serializationFailure = new LockAcquisitionException("could not update: [x]",
+                new SQLException("ERROR: could not serialize access due to concurrent update", "40001"));
+        RuntimeException wrappedDeadlock = new RuntimeException("recompute failed", deadlockFailure());
+
+        // when
+        boolean deadlockIsConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(deadlock);
+        boolean lockNotAvailableIsConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(lockNotAvailable);
+        boolean serializationFailureIsConflict = ProductionMaintenanceGanttMoveService
+                .isConcurrencyConflict(serializationFailure);
+        boolean wrappedDeadlockIsConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(wrappedDeadlock);
+
+        // then
+        assertTrue(deadlockIsConflict);
+        assertTrue(lockNotAvailableIsConflict);
+        assertTrue(serializationFailureIsConflict);
+        assertTrue(wrappedDeadlockIsConflict);
+    }
+
+    @Test
+    public final void shouldRecogniseDeadlockAndLockNotAvailableInNextExceptionChain() {
+        // given
+        SQLException deadlockBatchFailure = new SQLException("batch", "08000");
+        SQLException lockNotAvailableBatchFailure = new SQLException("batch", "08000");
+
+        deadlockBatchFailure.setNextException(new SQLException("y", "23505"));
+        deadlockBatchFailure.setNextException(new SQLException("ERROR: deadlock detected", "40P01"));
+        lockNotAvailableBatchFailure.setNextException(new SQLException("y", "23505"));
+        lockNotAvailableBatchFailure.setNextException(new SQLException("ERROR: canceling statement due to lock timeout",
+                "55P03"));
+
+        GenericJDBCException wrappedDeadlockBatchFailure = new GenericJDBCException("could not execute batch",
+                deadlockBatchFailure);
+        RuntimeException wrappedLockNotAvailableBatchFailure = new RuntimeException(lockNotAvailableBatchFailure);
+
+        // when
+        boolean deadlockIsConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(wrappedDeadlockBatchFailure);
+        boolean lockNotAvailableIsConflict = ProductionMaintenanceGanttMoveService
+                .isConcurrencyConflict(wrappedLockNotAvailableBatchFailure);
+
+        // then
+        assertTrue(deadlockIsConflict);
+        assertTrue(lockNotAvailableIsConflict);
+    }
+
+    @Test
+    public final void shouldNotRecogniseOtherSqlStatesAsConflicts() {
+        // given: the other states of class 40 (transaction rollback), a unique violation, a connection exception and a
+        // lower-case spelling of the deadlock state
+        String[] otherSqlStates = { "40000", "40002", "40003", "23505", "08000", "40p01" };
+
+        for (String sqlState : otherSqlStates) {
+            SQLException failure = new SQLException("x", sqlState);
+            GenericJDBCException hibernateFailure = new GenericJDBCException("could not update: [x]", new SQLException("x",
+                    sqlState));
+
+            // when
+            boolean failureIsConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(failure);
+            boolean hibernateFailureIsConflict = ProductionMaintenanceGanttMoveService.isConcurrencyConflict(hibernateFailure);
+
+            // then
+            assertFalse("SQLSTATE " + sqlState, failureIsConflict);
+            assertFalse("SQLSTATE " + sqlState + " as cause", hibernateFailureIsConflict);
+        }
     }
 
     @Test
@@ -1912,6 +2082,16 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         nextFailure.initCause(new SQLException("could not serialize access due to concurrent update", "40001"));
 
         return batchFailure;
+    }
+
+    /**
+     * Returns the exception Hibernate raises when a flush fails because PostgreSQL detected a deadlock: a
+     * {@link GenericJDBCException} whose cause is an SQL exception with SQLSTATE 40P01.
+     */
+    private static GenericJDBCException deadlockFailure() {
+        return new GenericJDBCException(
+                "could not update: [com.qcadoo.model.beans.orders.OrdersProductionLineSchedulePosition#90]", new SQLException(
+                        "ERROR: deadlock detected", "40P01"));
     }
 
     private GanttChartMoveRequest moveRequest() {
