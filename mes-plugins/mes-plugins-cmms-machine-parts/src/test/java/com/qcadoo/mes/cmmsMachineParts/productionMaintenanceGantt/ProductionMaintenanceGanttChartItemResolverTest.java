@@ -28,6 +28,7 @@ import static com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt.Product
 import static com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt.ProductionMaintenanceGanttChartItemResolver.POSITIONS_QUERY;
 import static com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt.ProductionMaintenanceGanttChartItemResolver.PRODUCTION_LINE_ROWS_QUERY;
 import static com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt.ProductionMaintenanceGanttChartItemResolver.SCHEDULE_STATE_QUERY;
+import static com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt.ProductionMaintenanceGanttChartItemResolver.SCHEDULE_WINDOW_QUERY;
 import static com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt.ProductionMaintenanceGanttChartItemResolver.SHUTDOWN_EVENTS_QUERY;
 import static com.qcadoo.testing.model.EntityTestUtils.mockEntity;
 import static com.qcadoo.testing.model.EntityTestUtils.stubBelongsToField;
@@ -45,8 +46,10 @@ import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
@@ -83,6 +86,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Matchers;
 import org.mockito.Mock;
 import org.mockito.Mockito;
@@ -117,6 +121,8 @@ import com.qcadoo.view.api.components.ganttChart.GanttChartItem;
 import com.qcadoo.view.api.components.ganttChart.GanttChartItemStrip;
 import com.qcadoo.view.api.components.ganttChart.GanttChartItemTooltip;
 import com.qcadoo.view.api.components.ganttChart.GanttChartScale;
+import com.qcadoo.view.internal.components.ganttChart.GanttChartComponentState;
+import com.qcadoo.view.internal.components.ganttChart.GanttChartScaleImpl;
 
 /**
  * Unit tests of {@link ProductionMaintenanceGanttChartItemResolver}.
@@ -133,8 +139,9 @@ import com.qcadoo.view.api.components.ganttChart.GanttChartScale;
  * result answers only {@code getEntities()} and {@code toString()}.
  * <p>
  * The scale records every created item and answers with a mocked item exposing the recorded row name, label, tooltip and
- * entity id. Translations answer with their code, followed by their arguments in brackets when there are any. The warnings
- * the resolver logs are recorded.
+ * entity id. It reports {@code getIsDatesSet()} as null, so the resolver keeps its range, unless a test sets the flag;
+ * the tests of the zoom level cap run on a spy of a real {@link GanttChartScaleImpl} instead. Translations answer with
+ * their code, followed by their arguments in brackets when there are any. The warnings the resolver logs are recorded.
  */
 public class ProductionMaintenanceGanttChartItemResolverTest {
 
@@ -143,6 +150,14 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
     private static final String SCALE_FROM = "2026-09-28 00:00:00";
 
     private static final String SCALE_TO = "2026-10-05 00:00:00";
+
+    private static final String SCHEDULE_START_TIME = "2026-09-28 06:00:00";
+
+    private static final String INITIALIZE_SCALE_FROM = "2026-09-27 00:00:00";
+
+    private static final String INITIALIZE_SCALE_TO = "2026-10-18 23:59:59";
+
+    private static final String FITTED_FROM = "2026-10-06 00:00:00";
 
     private static final String EVENT_TYPE = PlannedEventType.REVIEW.getStringValue();
 
@@ -155,6 +170,22 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
     private static final String FALSE_KEY = "qcadooView.false";
 
     private static final int STRIP_SIZE = 100;
+
+    private static final double EVENT_BAR_OPACITY = 0.7;
+
+    private static final double HOVERED_EVENT_BAR_OPACITY = 1.0;
+
+    private static final double MINIMUM_LABEL_CONTRAST = 4.5;
+
+    private static final double BLACK_ON_WHITE_CONTRAST = 21.0;
+
+    private static final double CONTRAST_TOLERANCE = 1e-9;
+
+    private static final double MAXIMUM_CHANNEL = 255.0;
+
+    private static final String WHITE_COLOR = "#FFFFFF";
+
+    private static final Pattern HEX_COLOR_PATTERN = Pattern.compile("#([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})");
 
     private static final String INVALID_SCHEDULE_ID_MESSAGE = "Invalid production line schedule id in Gantt context: ";
 
@@ -193,6 +224,12 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
     private static final String SCHEDULE_IDENTIFIER_ALIAS = "scheduleIdentifier";
 
     private static final String STATE_ALIAS = "state";
+
+    private static final String SCHEDULE_START_TIME_ALIAS = "scheduleStartTime";
+
+    private static final String WINDOW_START_ALIAS = "windowStart";
+
+    private static final String WINDOW_END_ALIAS = "windowEnd";
 
     private static final String PRODUCTION_LINE_ID_ALIAS = "productionLineId";
 
@@ -264,6 +301,8 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
 
     private long nextDivisionId;
 
+    private boolean scheduleWindowWithoutRow;
+
     private Logger resolverLogger;
 
     private Level previousLogLevel;
@@ -310,6 +349,7 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
         given(dataDefinitionService.get(BasicConstants.PLUGIN_IDENTIFIER, BasicConstants.MODEL_DIVISION)).willReturn(divisionDD);
 
         querySpecs.put(SCHEDULE_STATE_QUERY, new QuerySpec(scheduleDD, UNIQUE_RESULT, SCHEDULE_ID_PARAMETER, SET_LONG));
+        querySpecs.put(SCHEDULE_WINDOW_QUERY, new QuerySpec(positionDD, UNIQUE_RESULT, SCHEDULE_ID_PARAMETER, SET_LONG));
         querySpecs.put(PRODUCTION_LINE_ROWS_QUERY, new QuerySpec(productionLineDD, LIST, PRODUCTION_PARAMETER, SET_BOOLEAN,
                 ACTIVE_PARAMETER, SET_BOOLEAN));
         querySpecs.put(POSITIONS_QUERY, new QuerySpec(positionDD, LIST, SCHEDULE_ID_PARAMETER, SET_LONG, DATE_FROM_PARAMETER,
@@ -327,6 +367,7 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
 
         schedule = mockEntity(SCHEDULE_ID, scheduleDD);
         stubStringField(schedule, ProductionLineScheduleFields.STATE, ScheduleStateStringValues.DRAFT);
+        stubDateField(schedule, ProductionLineScheduleFields.START_TIME, date(SCHEDULE_START_TIME));
 
         schedules.add(schedule);
 
@@ -813,6 +854,380 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
     }
 
     @Test
+    public final void shouldFitScaleToScheduleOnInitialize() {
+        // given
+        stubInitializeScale();
+
+        positions.add(position(201L, lineL1, order("ORD-FIT-1", product("P-FIT", "Fit")), "2026-10-06 06:00:00",
+                "2026-10-06 13:30:00"));
+        positions.add(position(202L, lineL2, order("ORD-FIT-2", product("P-FIT", "Fit")), "2026-10-06 08:00:00",
+                "2026-10-06 12:00:00"));
+        plannedEvents.add(plannedEvent("EV-FIT-BEFORE", PlannedEventStateStringValues.PLANNED, false, "2026-09-28 06:00:00",
+                "2026-09-28 10:00:00", lineL3, null, null));
+        plannedEvents.add(plannedEvent("EV-FIT-LAST-DAY", PlannedEventStateStringValues.PLANNED, false,
+                "2026-10-27 20:00:00", "2026-10-28 02:00:00", lineL3, null, null));
+        plannedEvents.add(plannedEvent("EV-FIT-AFTER", PlannedEventStateStringValues.PLANNED, false, "2026-10-28 00:00:00",
+                "2026-10-28 04:00:00", lineL3, null, null));
+
+        // when
+        Map<String, List<GanttChartItem>> items = resolver.resolve(scale, context, locale);
+
+        // then
+        Date fittedFrom = date(FITTED_FROM);
+        Date windowTo = date("2026-10-27 23:59:59");
+
+        InOrder inOrder = inOrder(scale);
+        inOrder.verify(scale).setDateFrom(fittedFrom);
+        inOrder.verify(scale).setDateTo(date("2026-10-27 00:00:00"));
+        inOrder.verify(scale, times(3)).createGanttChartItem(Matchers.any(String.class), Matchers.any(String.class),
+                Matchers.any(GanttChartItemTooltip.class), Matchers.any(Long.class), Matchers.any(Date.class),
+                Matchers.any(Date.class));
+        verify(scale, times(1)).setDateFrom(Matchers.any(Date.class));
+        verify(scale, times(1)).setDateTo(Matchers.any(Date.class));
+
+        assertEquals(Arrays.asList(SCHEDULE_STATE_QUERY, SCHEDULE_WINDOW_QUERY, PRODUCTION_LINE_ROWS_QUERY, POSITIONS_QUERY,
+                BOARD_EVENTS_QUERY), recordedHql());
+        assertQuery(recordedQueries.get(1), Arrays.asList(SET_LONG, UNIQUE_RESULT), mapOf(SCHEDULE_ID_PARAMETER, SCHEDULE_ID));
+        assertQuery(queriesOf(POSITIONS_QUERY).get(0), Arrays.asList(SET_LONG, SET_TIMESTAMP, SET_TIMESTAMP, LIST),
+                mapOf(SCHEDULE_ID_PARAMETER, SCHEDULE_ID, DATE_FROM_PARAMETER, fittedFrom, DATE_TO_PARAMETER, windowTo));
+        assertQuery(queriesOf(BOARD_EVENTS_QUERY).get(0), Arrays.asList(SET_TIMESTAMP, SET_TIMESTAMP, LIST),
+                mapOf(DATE_FROM_PARAMETER, fittedFrom, DATE_TO_PARAMETER, windowTo));
+
+        assertEquals(Arrays.asList("ORD-FIT-1", "ORD-FIT-2", "EV-FIT-LAST-DAY"), recordedLabels());
+        assertEquals(Collections.singletonList("ORD-FIT-1"), itemNames(items.get("L1")));
+        assertEquals(Collections.singletonList("ORD-FIT-2"), itemNames(items.get("L2")));
+        assertEquals(Collections.singletonList("EV-FIT-LAST-DAY"), itemNames(items.get("L3")));
+    }
+
+    @Test
+    public final void shouldExtendFittedScaleToLatestPositionEnd() {
+        // given
+        stubInitializeScale();
+
+        Entity otherSchedule = mockEntity(8L, scheduleDD);
+
+        positions.add(position(211L, lineL1, order("ORD-EXT-1", product("P-EXT", "Extend")), "2026-10-06 06:00:00",
+                "2026-10-06 08:00:00"));
+        positions.add(position(212L, lineL2, order("ORD-EXT-2", product("P-EXT", "Extend")), "2026-10-30 22:00:00",
+                "2026-10-31 02:00:00"));
+        positions.add(position(213L, null, order("ORD-EXT-NO-LINE", product("P-EXT", "Extend")), "2026-10-01 06:00:00",
+                "2026-11-04 06:00:00"));
+        positions.add(position(otherSchedule, 214L, lineL1, order("ORD-EXT-OTHER", product("P-EXT", "Extend")),
+                "2026-10-02 06:00:00", "2026-11-03 06:00:00"));
+
+        // when
+        resolver.resolve(scale, context, locale);
+
+        // then
+        Date fittedFrom = date(FITTED_FROM);
+
+        verify(scale).setDateFrom(fittedFrom);
+        verify(scale).setDateTo(date("2026-10-31 00:00:00"));
+
+        assertEquals(mapOf(SCHEDULE_ID_PARAMETER, SCHEDULE_ID, DATE_FROM_PARAMETER, fittedFrom, DATE_TO_PARAMETER,
+                date("2026-10-31 23:59:59")), queriesOf(POSITIONS_QUERY).get(0).parameters);
+        assertEquals(Arrays.asList("ORD-EXT-1", "ORD-EXT-2"), recordedLabels());
+    }
+
+    @Test
+    public final void shouldCapFittedScaleAtMaximumRangeOfZoomLevel() {
+        // given
+        GanttChartScaleImpl scaleImpl = spyInitializeScale(GanttChartScaleImpl.ZoomLevel.H1);
+
+        positions.add(position(221L, lineL1, order("ORD-CAP-1", product("P-CAP", "Cap")), "2026-10-06 06:00:00",
+                "2026-10-06 08:00:00"));
+        positions.add(position(222L, lineL2, order("ORD-CAP-2", product("P-CAP", "Cap")), "2026-12-18 06:00:00",
+                "2026-12-20 10:00:00"));
+
+        // when
+        resolver.resolve(scaleImpl, context, locale);
+
+        // then
+        assertEquals(date(FITTED_FROM), scaleImpl.getDateFrom());
+        assertEquals(date("2026-11-05 00:00:00"), scaleImpl.getDateTo());
+
+        assertEquals(mapOf(SCHEDULE_ID_PARAMETER, SCHEDULE_ID, DATE_FROM_PARAMETER, date(FITTED_FROM), DATE_TO_PARAMETER,
+                date("2026-11-05 23:59:59")), queriesOf(POSITIONS_QUERY).get(0).parameters);
+        assertEquals(Collections.singletonList("ORD-CAP-1"), recordedLabels());
+
+        GanttChartComponentState componentState = mock(GanttChartComponentState.class);
+
+        assertFalse(new GanttChartScaleImpl(componentState, GanttChartScaleImpl.ZoomLevel.H1, scaleImpl.getDateFrom(),
+                scaleImpl.getDateTo()).isTooLargeRange());
+        assertTrue(new GanttChartScaleImpl(componentState, GanttChartScaleImpl.ZoomLevel.H1, scaleImpl.getDateFrom(),
+                date("2026-11-06 00:00:00")).isTooLargeRange());
+    }
+
+    @Test
+    public final void shouldExtendFittedScaleWithinLongerMaximumRangeOfZoomLevel() {
+        // given
+        GanttChartScaleImpl scaleImpl = spyInitializeScale(GanttChartScaleImpl.ZoomLevel.H3);
+
+        positions.add(position(231L, lineL1, order("ORD-H3-1", product("P-H3", "Three hours")), "2026-10-06 06:00:00",
+                "2026-10-06 08:00:00"));
+        positions.add(position(232L, lineL2, order("ORD-H3-2", product("P-H3", "Three hours")), "2026-11-19 22:00:00",
+                "2026-11-20 10:00:00"));
+
+        // when
+        resolver.resolve(scaleImpl, context, locale);
+
+        // then
+        assertEquals(date(FITTED_FROM), scaleImpl.getDateFrom());
+        assertEquals(date("2026-11-20 00:00:00"), scaleImpl.getDateTo());
+
+        assertEquals(mapOf(SCHEDULE_ID_PARAMETER, SCHEDULE_ID, DATE_FROM_PARAMETER, date(FITTED_FROM), DATE_TO_PARAMETER,
+                date("2026-11-20 23:59:59")), queriesOf(POSITIONS_QUERY).get(0).parameters);
+        assertEquals(Arrays.asList("ORD-H3-1", "ORD-H3-2"), recordedLabels());
+    }
+
+    @Test
+    public final void shouldCapFittedScaleOfOtherScaleImplementationAtSmallestMaximumRange() {
+        // given
+        stubInitializeScale();
+
+        positions.add(position(241L, lineL1, order("ORD-MOCK-1", product("P-MOCK", "Mock")), "2026-10-06 06:00:00",
+                "2026-10-06 08:00:00"));
+        positions.add(position(242L, lineL2, order("ORD-MOCK-2", product("P-MOCK", "Mock")), "2026-12-18 06:00:00",
+                "2026-12-20 10:00:00"));
+
+        // when
+        resolver.resolve(scale, context, locale);
+
+        // then
+        verify(scale).setDateFrom(date(FITTED_FROM));
+        verify(scale).setDateTo(date("2026-11-05 00:00:00"));
+
+        assertEquals(mapOf(SCHEDULE_ID_PARAMETER, SCHEDULE_ID, DATE_FROM_PARAMETER, date(FITTED_FROM), DATE_TO_PARAMETER,
+                date("2026-11-05 23:59:59")), queriesOf(POSITIONS_QUERY).get(0).parameters);
+        assertEquals(Collections.singletonList("ORD-MOCK-1"), recordedLabels());
+    }
+
+    @Test
+    public final void shouldAnchorFittedScaleOfScheduleWithoutPositionsOnItsStartTime() {
+        // given
+        stubInitializeScale();
+        stubDateField(schedule, ProductionLineScheduleFields.START_TIME, date("2026-10-12 06:00:00"));
+
+        Entity otherSchedule = mockEntity(8L, scheduleDD);
+
+        positions.add(position(251L, null, order("ORD-ANCHOR-NO-LINE", product("P-A", "Anchor")), "2026-10-01 06:00:00",
+                "2026-10-01 08:00:00"));
+        positions.add(position(otherSchedule, 252L, lineL1, order("ORD-ANCHOR-OTHER", product("P-A", "Anchor")),
+                "2026-10-02 06:00:00", "2026-10-02 08:00:00"));
+        plannedEvents.add(plannedEvent("EV-ANCHOR", PlannedEventStateStringValues.PLANNED, false, "2026-10-30 06:00:00",
+                "2026-10-30 10:00:00", lineL2, null, null));
+
+        // when
+        Map<String, List<GanttChartItem>> items = resolver.resolve(scale, context, locale);
+
+        // then
+        Date fittedFrom = date("2026-10-12 00:00:00");
+        Date windowTo = date("2026-11-02 23:59:59");
+
+        verify(scale).setDateFrom(fittedFrom);
+        verify(scale).setDateTo(date("2026-11-02 00:00:00"));
+
+        RecordedQuery windowQuery = queriesOf(SCHEDULE_WINDOW_QUERY).get(0);
+
+        assertEquals(1, windowQuery.rows.size());
+        assertNull(windowQuery.rows.get(0).getDateField(WINDOW_START_ALIAS));
+        assertNull(windowQuery.rows.get(0).getDateField(WINDOW_END_ALIAS));
+
+        assertEquals(mapOf(DATE_FROM_PARAMETER, fittedFrom, DATE_TO_PARAMETER, windowTo),
+                queriesOf(BOARD_EVENTS_QUERY).get(0).parameters);
+        assertEquals(Collections.singletonList("EV-ANCHOR"), recordedLabels());
+        assertEquals(Collections.singletonList("EV-ANCHOR"), itemNames(items.get("L2")));
+    }
+
+    @Test
+    public final void shouldAnchorFittedScaleOnScheduleStartTimeWhenWindowHasNoRow() {
+        // given
+        stubInitializeScale();
+        scheduleWindowWithoutRow = true;
+
+        positions.add(position(261L, lineL1, order("ORD-NO-ROW", product("P-NR", "No row")), "2026-09-28 08:00:00",
+                "2026-09-28 12:00:00"));
+
+        // when
+        resolver.resolve(scale, context, locale);
+
+        // then
+        Date fittedFrom = date("2026-09-28 00:00:00");
+
+        verify(scale).setDateFrom(fittedFrom);
+        verify(scale).setDateTo(date("2026-10-19 00:00:00"));
+
+        assertTrue(queriesOf(SCHEDULE_WINDOW_QUERY).get(0).rows.isEmpty());
+        assertEquals(mapOf(SCHEDULE_ID_PARAMETER, SCHEDULE_ID, DATE_FROM_PARAMETER, fittedFrom, DATE_TO_PARAMETER,
+                date("2026-10-19 23:59:59")), queriesOf(POSITIONS_QUERY).get(0).parameters);
+        assertEquals(Collections.singletonList("ORD-NO-ROW"), recordedLabels());
+    }
+
+    @Test
+    public final void shouldKeepScaleOfScheduleWithoutPositionsOrStartTime() {
+        // given
+        stubInitializeScale();
+        stubDateField(schedule, ProductionLineScheduleFields.START_TIME, null);
+
+        plannedEvents.add(plannedEvent("EV-KEEP", PlannedEventStateStringValues.PLANNED, false, "2026-10-01 06:00:00",
+                "2026-10-01 10:00:00", lineL1, null, null));
+
+        // when
+        Map<String, List<GanttChartItem>> items = resolver.resolve(scale, context, locale);
+
+        // then
+        verify(scale, never()).setDateFrom(Matchers.any(Date.class));
+        verify(scale, never()).setDateTo(Matchers.any(Date.class));
+
+        assertEquals(Arrays.asList(SCHEDULE_STATE_QUERY, SCHEDULE_WINDOW_QUERY, PRODUCTION_LINE_ROWS_QUERY, POSITIONS_QUERY,
+                BOARD_EVENTS_QUERY), recordedHql());
+        assertEquals(mapOf(SCHEDULE_ID_PARAMETER, SCHEDULE_ID, DATE_FROM_PARAMETER, date(INITIALIZE_SCALE_FROM),
+                DATE_TO_PARAMETER, date(INITIALIZE_SCALE_TO)), queriesOf(POSITIONS_QUERY).get(0).parameters);
+        assertEquals(mapOf(DATE_FROM_PARAMETER, date(INITIALIZE_SCALE_FROM), DATE_TO_PARAMETER, date(INITIALIZE_SCALE_TO)),
+                queriesOf(BOARD_EVENTS_QUERY).get(0).parameters);
+        assertEquals(Collections.singletonList("EV-KEEP"), itemNames(items.get("L1")));
+    }
+
+    @Test
+    public final void shouldNotFitScaleWhoseDatesAreNotSet() {
+        // given
+        given(scale.getIsDatesSet()).willReturn(false);
+
+        positions.add(position(271L, lineL1, order("ORD-REFRESH", product("P-R", "Refresh")), "2026-09-28 08:00:00",
+                "2026-09-28 12:00:00"));
+
+        // when
+        resolver.resolve(scale, context, locale);
+
+        // then
+        verifyScaleNotFitted();
+        assertEquals(Collections.singletonList("ORD-REFRESH"), recordedLabels());
+    }
+
+    @Test
+    public final void shouldNotFitScaleWithoutDatesSetFlag() {
+        // given
+        given(scale.getIsDatesSet()).willReturn(null);
+
+        positions.add(position(272L, lineL1, order("ORD-NO-FLAG", product("P-F", "No flag")), "2026-09-28 08:00:00",
+                "2026-09-28 12:00:00"));
+
+        // when
+        resolver.resolve(scale, context, locale);
+
+        // then
+        verifyScaleNotFitted();
+        assertEquals(Collections.singletonList("ORD-NO-FLAG"), recordedLabels());
+    }
+
+    @Test
+    public final void shouldNotQueryScheduleWindowOfUnknownScheduleOnInitialize() {
+        // given
+        stubInitializeScale();
+
+        // when
+        Map<String, List<GanttChartItem>> items = resolver.resolve(scale, scheduleContext("8"), locale);
+
+        // then
+        assertTrue(items.isEmpty());
+        assertEquals(Collections.singletonList(SCHEDULE_STATE_QUERY), recordedHql());
+        verify(scale, never()).setDateFrom(Matchers.any(Date.class));
+        verify(scale, never()).setDateTo(Matchers.any(Date.class));
+        assertEquals(Collections.singletonList(UNKNOWN_SCHEDULE_MESSAGE + "8"), loggedWarnings());
+    }
+
+    @Test
+    public final void shouldParseNoScheduleIdFromNullOrBlankValue() {
+        // given
+        String blank = " \t ";
+
+        // when
+        Long nullId = resolver.parseScheduleId(null);
+        Long emptyId = resolver.parseScheduleId("");
+        Long blankId = resolver.parseScheduleId(blank);
+
+        // then
+        assertNull(nullId);
+        assertNull(emptyId);
+        assertNull(blankId);
+        assertTrue(loggedWarnings().isEmpty());
+        verifyZeroInteractions(dataDefinitionService);
+    }
+
+    @Test
+    public final void shouldParsePaddedScheduleId() {
+        // given
+        String padded = " 12 ";
+
+        // when
+        Long paddedId = resolver.parseScheduleId(padded);
+        Long plainId = resolver.parseScheduleId("7");
+
+        // then
+        assertEquals(Long.valueOf(12L), paddedId);
+        assertEquals(SCHEDULE_ID, plainId);
+        assertTrue(loggedWarnings().isEmpty());
+    }
+
+    @Test
+    public final void shouldParseNoScheduleIdFromMalformedValueAndLogIt() {
+        // given
+        String malformed = "12a";
+
+        // when
+        Long malformedId = resolver.parseScheduleId(malformed);
+
+        // then
+        assertNull(malformedId);
+        assertEquals(Collections.singletonList(INVALID_SCHEDULE_ID_MESSAGE + "\"12a\""), loggedWarnings());
+        verifyZeroInteractions(dataDefinitionService);
+    }
+
+    /**
+     * Stubs the mocked scale as the scale of the component's initialize event: dates set, from 2026-09-27 00:00:00 to
+     * 2026-10-18 23:59:59.
+     */
+    private void stubInitializeScale() {
+        given(scale.getIsDatesSet()).willReturn(true);
+        given(scale.getDateFrom()).willReturn(date(INITIALIZE_SCALE_FROM));
+        given(scale.getDateTo()).willReturn(date(INITIALIZE_SCALE_TO));
+    }
+
+    /**
+     * Returns a spy of a real scale at the given zoom level built as the component's initialize event builds it, from
+     * 2026-09-27 to 2026-10-18, with its dates set; its items are recorded and answered as those of the mocked scale.
+     */
+    private GanttChartScaleImpl spyInitializeScale(final GanttChartScaleImpl.ZoomLevel zoomLevel) {
+        GanttChartScaleImpl scaleImpl = spy(new GanttChartScaleImpl(mock(GanttChartComponentState.class), zoomLevel,
+                date(INITIALIZE_SCALE_FROM), date("2026-10-18 00:00:00")));
+
+        scaleImpl.setIsDatesSet(true);
+
+        doAnswer(new CreateItemAnswer(recordedItems)).when(scaleImpl).createGanttChartItem(Matchers.any(String.class),
+                Matchers.any(String.class), Matchers.any(GanttChartItemTooltip.class), Matchers.any(Long.class),
+                Matchers.any(Date.class), Matchers.any(Date.class));
+
+        return scaleImpl;
+    }
+
+    /**
+     * Verifies that the scale was neither fitted nor read for a schedule window, and that the positions and board events were
+     * queried over the range of the fixture scale.
+     */
+    private void verifyScaleNotFitted() {
+        verify(scale, never()).setDateFrom(Matchers.any(Date.class));
+        verify(scale, never()).setDateTo(Matchers.any(Date.class));
+        verify(positionDD, never()).find(SCHEDULE_WINDOW_QUERY);
+
+        assertEquals(Arrays.asList(SCHEDULE_STATE_QUERY, PRODUCTION_LINE_ROWS_QUERY, POSITIONS_QUERY, BOARD_EVENTS_QUERY),
+                recordedHql());
+        assertEquals(mapOf(SCHEDULE_ID_PARAMETER, SCHEDULE_ID, DATE_FROM_PARAMETER, scaleFrom, DATE_TO_PARAMETER, scaleTo),
+                queriesOf(POSITIONS_QUERY).get(0).parameters);
+        assertEquals(mapOf(DATE_FROM_PARAMETER, scaleFrom, DATE_TO_PARAMETER, scaleTo),
+                queriesOf(BOARD_EVENTS_QUERY).get(0).parameters);
+    }
+
+    @Test
     public final void shouldAddRowForProductionLineReferencedByItemButMissingFromSeed() {
         // given
         productionLines.clear();
@@ -858,6 +1273,33 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
         assertEquals(STRIP_SIZE, maintenanceStrip.getSize());
 
         verify(recordedItemLabelled("ORD-S").item, never()).addBackgroundStrip(Matchers.any(GanttChartItemStrip.class));
+    }
+
+    @Test
+    public final void shouldUseStripColoursGivingEventLabelsAaContrast() {
+        // given
+        String maintenanceColor = ProductionMaintenanceGanttChartItemResolver.MAINTENANCE_COLOR;
+        String shutdownColor = ProductionMaintenanceGanttChartItemResolver.SHUTDOWN_COLOR;
+
+        // when
+        double maintenanceContrast = blackLabelContrast(maintenanceColor, EVENT_BAR_OPACITY);
+        double hoveredMaintenanceContrast = blackLabelContrast(maintenanceColor, HOVERED_EVENT_BAR_OPACITY);
+        double shutdownContrast = blackLabelContrast(shutdownColor, EVENT_BAR_OPACITY);
+        double hoveredShutdownContrast = blackLabelContrast(shutdownColor, HOVERED_EVENT_BAR_OPACITY);
+
+        // then
+        assertEquals(BLACK_ON_WHITE_CONTRAST, blackLabelContrast(WHITE_COLOR, HOVERED_EVENT_BAR_OPACITY),
+                CONTRAST_TOLERANCE);
+
+        assertTrue("maintenance label contrast " + maintenanceContrast, maintenanceContrast >= MINIMUM_LABEL_CONTRAST);
+        assertTrue("hovered maintenance label contrast " + hoveredMaintenanceContrast,
+                hoveredMaintenanceContrast >= MINIMUM_LABEL_CONTRAST);
+        assertTrue("shutdown label contrast " + shutdownContrast, shutdownContrast >= MINIMUM_LABEL_CONTRAST);
+        assertTrue("hovered shutdown label contrast " + hoveredShutdownContrast,
+                hoveredShutdownContrast >= MINIMUM_LABEL_CONTRAST);
+
+        assertFalse("maintenance and shutdown strip colours are both " + maintenanceColor,
+                maintenanceColor.equalsIgnoreCase(shutdownColor));
     }
 
     @Test
@@ -2167,6 +2609,56 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
         return stripCaptor.getValue();
     }
 
+    /**
+     * Returns the WCAG 2.x contrast ratio of a black label against a strip of the given #RRGGBB colour, both drawn at the
+     * given bar opacity over a white background: each channel is composited as opacity * channel + (1 - opacity) * 255.
+     */
+    private static double blackLabelContrast(final String stripColor, final double opacity) {
+        double stripLuminance = relativeLuminance(overWhite(hexChannels(stripColor), opacity));
+        double labelLuminance = relativeLuminance(overWhite(new double[] { 0, 0, 0 }, opacity));
+
+        return (Math.max(stripLuminance, labelLuminance) + 0.05) / (Math.min(stripLuminance, labelLuminance) + 0.05);
+    }
+
+    private static double[] hexChannels(final String color) {
+        Matcher matcher = HEX_COLOR_PATTERN.matcher(color);
+
+        assertTrue("colour '" + color + "' has the form #RRGGBB", matcher.matches());
+
+        double[] channels = new double[3];
+
+        for (int index = 0; index < channels.length; index++) {
+            channels[index] = Integer.parseInt(matcher.group(index + 1), 16);
+        }
+
+        return channels;
+    }
+
+    private static double[] overWhite(final double[] channels, final double opacity) {
+        double[] composited = new double[channels.length];
+
+        for (int index = 0; index < channels.length; index++) {
+            composited[index] = opacity * channels[index] + (1 - opacity) * MAXIMUM_CHANNEL;
+        }
+
+        return composited;
+    }
+
+    private static double relativeLuminance(final double[] channels) {
+        return 0.2126 * linearChannel(channels[0]) + 0.7152 * linearChannel(channels[1])
+                + 0.0722 * linearChannel(channels[2]);
+    }
+
+    private static double linearChannel(final double channel) {
+        double value = channel / MAXIMUM_CHANNEL;
+
+        if (value <= 0.03928) {
+            return value / 12.92;
+        }
+
+        return Math.pow((value + 0.055) / 1.055, 2.4);
+    }
+
     private RecordedItem recordedItemLabelled(final String label) {
         List<RecordedItem> labelled = recordedItemsLabelled(label);
 
@@ -2384,6 +2876,9 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
         if (SCHEDULE_STATE_QUERY.equals(query.hql)) {
             return scheduleStateFields((Long) parameters.get(SCHEDULE_ID_PARAMETER));
         }
+        if (SCHEDULE_WINDOW_QUERY.equals(query.hql)) {
+            return scheduleWindowFields((Long) parameters.get(SCHEDULE_ID_PARAMETER));
+        }
         if (PRODUCTION_LINE_ROWS_QUERY.equals(query.hql)) {
             return productionLineRowFields((Boolean) parameters.get(PRODUCTION_PARAMETER),
                     (Boolean) parameters.get(ACTIVE_PARAMETER));
@@ -2407,7 +2902,7 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
     }
 
     /**
-     * Id and state of the fixture schedule with the given id.
+     * Id, state and start time of the fixture schedule with the given id.
      */
     private List<Map<String, Object>> scheduleStateFields(final Long scheduleId) {
         List<Map<String, Object>> rows = new ArrayList<Map<String, Object>>();
@@ -2415,9 +2910,46 @@ public class ProductionMaintenanceGanttChartItemResolverTest {
         for (Entity fixtureSchedule : schedules) {
             if (scheduleId.equals(fixtureSchedule.getId())) {
                 rows.add(mapOf(SCHEDULE_IDENTIFIER_ALIAS, fixtureSchedule.getId(), STATE_ALIAS,
-                        fixtureSchedule.getStringField(ProductionLineScheduleFields.STATE)));
+                        fixtureSchedule.getStringField(ProductionLineScheduleFields.STATE), SCHEDULE_START_TIME_ALIAS,
+                        fixtureSchedule.getDateField(ProductionLineScheduleFields.START_TIME)));
             }
         }
+
+        return rows;
+    }
+
+    /**
+     * Earliest start time and latest end time of the fixture positions of the schedule that have a production line, in one
+     * row whose two values are null when there is no such position; no row when {@link #scheduleWindowWithoutRow} is set.
+     */
+    private List<Map<String, Object>> scheduleWindowFields(final Long scheduleId) {
+        List<Map<String, Object>> rows = new ArrayList<Map<String, Object>>();
+
+        if (scheduleWindowWithoutRow) {
+            return rows;
+        }
+
+        Date windowStart = null;
+        Date windowEnd = null;
+
+        for (Entity position : positions) {
+            Entity positionSchedule = position.getBelongsToField(ProductionLineSchedulePositionFields.PRODUCTION_LINE_SCHEDULE);
+            Entity productionLine = position.getBelongsToField(ProductionLineSchedulePositionFields.PRODUCTION_LINE);
+
+            if (positionSchedule != null && scheduleId.equals(positionSchedule.getId()) && productionLine != null) {
+                Date startTime = position.getDateField(ProductionLineSchedulePositionFields.START_TIME);
+                Date endTime = position.getDateField(ProductionLineSchedulePositionFields.END_TIME);
+
+                if (windowStart == null || startTime.before(windowStart)) {
+                    windowStart = startTime;
+                }
+                if (windowEnd == null || endTime.after(windowEnd)) {
+                    windowEnd = endTime;
+                }
+            }
+        }
+
+        rows.add(mapOf(WINDOW_START_ALIAS, windowStart, WINDOW_END_ALIAS, windowEnd));
 
         return rows;
     }

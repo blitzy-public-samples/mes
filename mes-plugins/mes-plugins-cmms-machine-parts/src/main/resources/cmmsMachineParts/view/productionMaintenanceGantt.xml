@@ -32,9 +32,9 @@
 		<ribbon>
 			<template name="standardFormTemplate" includeItems="navigation.back" />
 		</ribbon>
-		<!-- main tab: title and gantt; translation key prefix cmmsMachineParts.productionMaintenanceGantt.window.mainTab., key suffixes title.label and gantt.header.label -->
+		<!-- main tab: title, gantt and legend; translation key prefix cmmsMachineParts.productionMaintenanceGantt.window.mainTab., key suffixes title.label, gantt.header.label and legend.label -->
 		<component type="gridLayout" name="gridLayout" columns="1"
-			rows="8" hasBorders="true">
+			rows="9" hasBorders="true">
 			<layoutElement column="1" row="1">
 				<component type="input" name="title" reference="title"
 					hasLabel="false" defaultEnabled="false" >
@@ -45,8 +45,8 @@
 
 							boardTitleText.attr("role", "heading").attr("aria-level", "1");
 
-							// Marks the window content body, which holds the title and the gantt but not the ribbon,
-							// as the main landmark named by the heading.
+							// Marks the window content body, which holds the title, the gantt and the legend but not the
+							// ribbon, as the main landmark named by the heading.
 							boardTitleText.closest(".windowContainerContentBody").attr("role", "main").attr("aria-labelledby", boardTitleText.attr("id"));
 						]]>
 					</script>
@@ -62,6 +62,11 @@
 					<listener event="moveItem"
 						class="com.qcadoo.mes.cmmsMachineParts.listeners.ProductionMaintenanceGanttListeners"
 						method="moveItem" />
+				</component>
+			</layoutElement>
+			<layoutElement column="1" row="9">
+				<component type="label" name="legend">
+					<option type="labelStyle" value="text" />
 				</component>
 			</layoutElement>
 		</component>

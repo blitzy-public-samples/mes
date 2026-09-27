@@ -15,8 +15,9 @@
 --   * products, one operation, technologies PMG-T-BOTH, PMG-T-A-ONLY and PMG-T-ZERO with one root operation
 --     component each, their technology production lines and six line changeover norms;
 --   * planned events PMG-EV-SHUTDOWN and PMG-EV-DIVISION;
---   * one draft schedule PMG-<case> per acceptance case, each with 11 orders (A1-A5, B1-B5, SPARE), one operation
---     run per order and 10 positions (every role except SPARE).
+--   * one draft schedule PMG-<case> per acceptance case except browser:ganttButtonUnsavedChangesGuard, which reads
+--     PMG-rowMapping; each with 11 orders (A1-A5, B1-B5, SPARE), one operation run per order and 10 positions
+--     (every role except SPARE).
 -- Then lists the created positions, norms, events and lines.
 --
 -- Writes nothing to public.basic_parameter. The layout reads the seed values

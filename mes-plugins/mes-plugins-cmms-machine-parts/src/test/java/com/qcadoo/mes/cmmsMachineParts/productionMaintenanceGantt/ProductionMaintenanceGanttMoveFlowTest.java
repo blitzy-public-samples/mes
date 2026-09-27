@@ -35,14 +35,18 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.BDDMockito.given;
+import static org.mockito.BDDMockito.willAnswer;
 import static org.mockito.Matchers.any;
 import static org.mockito.Matchers.anyString;
 import static org.mockito.Matchers.eq;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.verifyZeroInteractions;
 import static org.mockito.Mockito.withSettings;
 import static org.springframework.test.util.ReflectionTestUtils.setField;
 
@@ -60,12 +64,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import org.hibernate.SessionFactory;
+import org.hibernate.classic.Session;
 import org.joda.time.DateTime;
 import org.json.JSONException;
 import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+import org.mockito.InOrder;
 import org.mockito.Matchers;
 import org.mockito.Mock;
 import org.mockito.Mockito;
@@ -142,16 +149,22 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * Mocked: the data definitions (the basic parameter data definition counts one parameter), {@link ShiftsService} (the nearest
  * working date of a start is the start itself), {@link ParameterService} (a parameter whose
  * {@code canChangeProdLineForAcceptedOrders} is false), {@link PluginManager} (every plugin disabled),
- * {@link TranslationService} and the {@link GanttChartComponentState} whose {@code getMoveRequest()} returns the move request.
+ * {@link TranslationService}, the {@link GanttChartComponentState} whose {@code getMoveRequest()} returns the move request,
+ * and the {@link SessionFactory} of the recompute service, whose {@code getCurrentSession()} returns a mocked {@link Session}.
+ * That session's {@code flush()} and {@code clear()} each record how many calls the {@link RecordingPsImplementation} built
+ * in {@code wireServices} had received.
  * The position data definition answers {@code find()} with a builder that records its criteria, orders, inner order alias and
  * maximum result count, and selects the fixture positions satisfying every recorded criterion in their current state, and
  * having an order when the inner order alias was created, sorted by the recorded orders. The production line data definition
- * answers the same way. The order and technology data definitions answer the same way over the fixture orders and
- * technologies, accepting only an {@code id in} criterion over the orders of a2 and b2 or over the technologies of those
- * orders. Unknown criteria, unknown orders, any other alias and unknown builder methods fail the test. The planned event data
- * definition answers {@code find(String)} of {@link ProductionMaintenanceGanttChartItemResolver#SHUTDOWN_EVENTS_QUERY} bound
- * with the move's slot, requires shutdown and the id of the target row with the fixture's planned event rows, and fails on
- * {@code find()}, on any other query and on any other parameter.
+ * answers the same way. Unknown criteria, unknown orders, any other alias and unknown builder methods fail the test. The order
+ * data definition answers {@code find(String)} of {@link ProductionMaintenanceGanttRecomputeService#ORDER_TECHNOLOGY_IDS_QUERY}
+ * bound, under {@code orderIds}, with exactly the ids of the orders of a2 and b2 in that order, with one projection row per
+ * bound fixture order holding the order's id and its technology's id; it fails on criteria {@code find()}, on any other query,
+ * on any other binding and on any other query builder method. Criteria {@code find()} on the technology data definition fails.
+ * The planned event data definition answers {@code find(String)} of
+ * {@link ProductionMaintenanceGanttChartItemResolver#SHUTDOWN_EVENTS_QUERY} bound with the move's slot, requires shutdown and
+ * the id of the target row with the fixture's planned event rows, and fails on {@code find()}, on any other query and on any
+ * other parameter.
  * <p>
  * Fixture, on 2026-10-01: draft schedule 7 starting at 06:00, calculated on the time consuming technology basis, with
  * production line change allowed. Production lines A (id 1) and B (id 2), both production and active; the production line
@@ -263,6 +276,12 @@ public class ProductionMaintenanceGanttMoveFlowTest {
 
     private static final String L_ID = "id";
 
+    private static final String ORDER_IDS_PARAMETER = "orderIds";
+
+    private static final String PROJECTION_ORDER_ID = "orderId";
+
+    private static final String PROJECTION_TECHNOLOGY_ID = "technologyId";
+
     private static final String ORDER_A1_NUMBER = "ORD-A1";
 
     private static final String ORDER_MOVED_NUMBER = "ORD-M";
@@ -337,6 +356,12 @@ public class ProductionMaintenanceGanttMoveFlowTest {
     @Mock
     private GanttChartItem item;
 
+    @Mock
+    private SessionFactory sessionFactory;
+
+    @Mock
+    private Session session;
+
     private DataAccessService previousDataAccessService;
 
     private PluginUtilsService previousPluginUtilsService;
@@ -361,6 +386,16 @@ public class ProductionMaintenanceGanttMoveFlowTest {
      * Projection rows of the planned events the shutdown events query selects; the fixture has none.
      */
     private final List<Entity> plannedEvents = new ArrayList<Entity>();
+
+    /**
+     * Number of calls {@link RecordingPsImplementation} had received at each {@code flush()} of the session.
+     */
+    private final List<Integer> recordedCallsAtFlush = new ArrayList<Integer>();
+
+    /**
+     * Number of calls {@link RecordingPsImplementation} had received at each {@code clear()} of the session.
+     */
+    private final List<Integer> recordedCallsAtClear = new ArrayList<Integer>();
 
     /**
      * Builds the fixture, stubs the data definitions and the mocked services, and wires the real services into the listener.
@@ -471,12 +506,8 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         FixtureFindAnswer positionFindAnswer = new FixtureFindAnswer(positions, positionConditions(), positionOrders());
         FixtureFindAnswer productionLineFindAnswer = new FixtureFindAnswer(productionLines, productionLineConditions(),
                 new LinkedHashMap<SearchOrder, Comparator<Entity>>());
-        FixtureFindAnswer orderFindAnswer = new FixtureFindAnswer(Arrays.asList(orderA1, orderMoved, orderA2, orderB1, orderB2),
-                idInConditions(Arrays.asList(orderA2.getId(), orderB2.getId())),
-                new LinkedHashMap<SearchOrder, Comparator<Entity>>());
-        FixtureFindAnswer technologyFindAnswer = new FixtureFindAnswer(Arrays.asList(technologyMoved, technologyA2,
-                technologyB2), idInConditions(Arrays.asList(technologyA2.getId(), technologyB2.getId())),
-                new LinkedHashMap<SearchOrder, Comparator<Entity>>());
+        OrderTechnologyIdsFindAnswer orderTechnologyIdsFindAnswer = new OrderTechnologyIdsFindAnswer(fixtureOrders(),
+                Arrays.asList(orderA2.getId(), orderB2.getId()));
 
         given(parameterDD.count()).willReturn(1L);
         given(positionDD.get(MOVED_POSITION_ID)).willReturn(movedPosition);
@@ -486,8 +517,9 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         given(plannedEventDD.find()).willAnswer(new FailingAnswer("criteria find() of the planned event data definition"));
         given(plannedEventDD.find(anyString())).willAnswer(
                 new ShutdownEventsFindAnswer(plannedEvents, shutdownEventsQueryParameters(LINE_B_ID)));
-        given(orderDD.find()).willAnswer(orderFindAnswer);
-        given(technologyDD.find()).willAnswer(technologyFindAnswer);
+        given(orderDD.find()).willAnswer(new FailingAnswer("criteria find() of the order data definition"));
+        given(orderDD.find(anyString())).willAnswer(orderTechnologyIdsFindAnswer);
+        given(technologyDD.find()).willAnswer(new FailingAnswer("criteria find() of the technology data definition"));
     }
 
     private void stubServices() {
@@ -503,6 +535,9 @@ public class ProductionMaintenanceGanttMoveFlowTest {
 
                 });
         given(item.getEntityId()).willReturn(MOVED_POSITION_ID);
+        given(sessionFactory.getCurrentSession()).willReturn(session);
+        willAnswer(new RecordedCallCountAnswer(recordedCallsAtFlush)).given(session).flush();
+        willAnswer(new RecordedCallCountAnswer(recordedCallsAtClear)).given(session).clear();
     }
 
     private void wireServices() {
@@ -540,6 +575,7 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         setField(recomputeService, "productionLineScheduleService", productionLineScheduleService);
         setField(recomputeService, "productionLineScheduleServicePSExecutorService", psExecutorService);
         setField(recomputeService, "productionLineScheduleServicePPSExecutorService", ppsExecutorService);
+        setField(recomputeService, "sessionFactory", sessionFactory);
 
         ProductionMaintenanceGanttMoveService moveService = new ProductionMaintenanceGanttMoveService();
 
@@ -604,10 +640,14 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         verify(positionDD, times(3)).find();
         verify(positionDD, never()).fastSave(any(Entity.class));
         verify(plannedEventDD).find(ProductionMaintenanceGanttChartItemResolver.SHUTDOWN_EVENTS_QUERY);
-        verify(orderDD).find();
-        verify(technologyDD).find();
+        verifyOrderTechnologyIdsProjectedOnce();
         verify(shiftsService).getNearestWorkingDate(new DateTime(date(SLOT_FROM)), lineBByNumber);
         verify(pluginManager, times(2)).isPluginEnabled(ORDERS_FOR_SUBPRODUCTS_GENERATION_PLUGIN);
+
+        // then: the session was flushed and then cleared after the save of a2, before b2's create, and after the save of b2
+        verifySessionFlushedThenCleared(2);
+        assertEquals(Arrays.asList(2, 4), recordedCallsAtFlush);
+        assertEquals(Arrays.asList(2, 4), recordedCallsAtClear);
     }
 
     @Test
@@ -718,24 +758,22 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         assertNotRecomputed(positionB1, B1_START, B1_END);
         assertOtherSchedulePositionsNotRecomputed(calls);
         assertDownstreamRowsUnchanged();
+        verifyOrderTechnologyIdsProjectedOnce();
+        verifySessionFlushedThenCleared(2);
     }
 
     @Test
     public final void shouldRecomputeLaterSameRowMoveAsOneChain() {
         // given: the move request drops m on row A from 10:00 to 12:00; the shutdown events query binds row A, and a2 is the
-        // only candidate whose order and technology are loaded
+        // only candidate whose order the order technology ids query binds
         GanttChartMoveRequest sameRowMoveRequest = moveRequest(LINE_A_NUMBER);
 
         usePsImplementations(recordingPsImplementation);
         given(gantt.getMoveRequest()).willReturn(sameRowMoveRequest);
         doAnswer(new ShutdownEventsFindAnswer(plannedEvents, shutdownEventsQueryParameters(LINE_A_ID))).when(plannedEventDD)
                 .find(anyString());
-        doAnswer(new FixtureFindAnswer(Arrays.asList(orderA1, orderMoved, orderA2, orderB1, orderB2),
-                idInConditions(Collections.singletonList(orderA2.getId())), new LinkedHashMap<SearchOrder, Comparator<Entity>>()))
-                .when(orderDD).find();
-        doAnswer(new FixtureFindAnswer(Arrays.asList(technologyMoved, technologyA2, technologyB2),
-                idInConditions(Collections.singletonList(technologyA2.getId())),
-                new LinkedHashMap<SearchOrder, Comparator<Entity>>())).when(technologyDD).find();
+        doAnswer(new OrderTechnologyIdsFindAnswer(fixtureOrders(), Collections.singletonList(orderA2.getId()))).when(orderDD)
+                .find(anyString());
 
         // when
         listeners.moveItem(view, gantt, new String[0]);
@@ -764,10 +802,14 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         verify(positionDD, times(2)).find();
         verify(positionDD, never()).fastSave(any(Entity.class));
         verify(plannedEventDD).find(ProductionMaintenanceGanttChartItemResolver.SHUTDOWN_EVENTS_QUERY);
-        verify(orderDD).find();
-        verify(technologyDD).find();
+        verifyOrderTechnologyIdsProjectedOnce();
         verify(shiftsService).getNearestWorkingDate(new DateTime(date(SLOT_FROM)), lineAByNumber);
         verify(pluginManager, times(1)).isPluginEnabled(ORDERS_FOR_SUBPRODUCTS_GENERATION_PLUGIN);
+
+        // then: the session was flushed and then cleared once, after the save of a2
+        verifySessionFlushedThenCleared(1);
+        assertEquals(Collections.singletonList(2), recordedCallsAtFlush);
+        assertEquals(Collections.singletonList(2), recordedCallsAtClear);
     }
 
     @Test
@@ -798,7 +840,9 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         verify(positionDD, times(3)).find();
         verify(positionDD, never()).fastSave(any(Entity.class));
         verify(orderDD, never()).find();
+        verify(orderDD, never()).find(anyString());
         verify(pluginManager, never()).isPluginEnabled(ORDERS_FOR_SUBPRODUCTS_GENERATION_PLUGIN);
+        verifyZeroInteractions(sessionFactory, session);
     }
 
     @Test
@@ -833,19 +877,54 @@ public class ProductionMaintenanceGanttMoveFlowTest {
         verify(parameterDD, times(2)).count();
         verify(parameterDD, never()).save(any(Entity.class));
         verify(parameterDD, never()).create();
+        verify(orderDD, never()).find(anyString());
+        verifyZeroInteractions(sessionFactory, session);
     }
 
 
     /**
-     * Verifies that the listener rejected the move with {@code RECOMPUTE_FAILED_KEY}, never accepted it, that no position was
-     * fast-saved, and that the orders and the technologies of the recomputed positions were read with exactly one query each.
+     * Verifies that the listener rejected the move once, with {@code RECOMPUTE_FAILED_KEY} and the order number, production
+     * line number and stored start of a2, the first downstream position, never accepted it, that no position was fast-saved,
+     * that the technology ids of the recomputed positions' orders were read with exactly one projection and no criteria
+     * query, and that the session was neither flushed nor cleared.
      */
     private void verifyRecomputeFailedRejection() {
-        verify(gantt).rejectMove(eq(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY), Matchers.<String> anyVararg());
+        verify(gantt).rejectMove(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, ORDER_A2_NUMBER, LINE_A_NUMBER,
+                A2_START);
+        verify(gantt, times(1)).rejectMove(anyString(), Matchers.<String> anyVararg());
         verify(gantt, never()).acceptMove();
         verify(positionDD, never()).fastSave(any(Entity.class));
-        verify(orderDD).find();
-        verify(technologyDD).find();
+        verifyOrderTechnologyIdsProjectedOnce();
+        verifyZeroInteractions(sessionFactory, session);
+    }
+
+    /**
+     * Verifies that the order data definition ran the order technology ids query once and no criteria query, and that no
+     * criteria query of the technology data definition ran.
+     */
+    private void verifyOrderTechnologyIdsProjectedOnce() {
+        verify(orderDD, times(1)).find(ProductionMaintenanceGanttRecomputeService.ORDER_TECHNOLOGY_IDS_QUERY);
+        verify(orderDD, times(1)).find(anyString());
+        verify(orderDD, never()).find();
+        verify(technologyDD, never()).find();
+    }
+
+    /**
+     * Verifies that the current session was taken from the session factory, flushed and cleared exactly the given number of
+     * times, each flush followed by a clear before the next flush, and that neither was used otherwise.
+     */
+    private void verifySessionFlushedThenCleared(final int pairs) {
+        InOrder inOrder = inOrder(session);
+
+        for (int pair = 0; pair < pairs; pair++) {
+            inOrder.verify(session).flush();
+            inOrder.verify(session).clear();
+        }
+
+        verify(sessionFactory, times(pairs)).getCurrentSession();
+        verify(session, times(pairs)).flush();
+        verify(session, times(pairs)).clear();
+        verifyNoMoreInteractions(sessionFactory, session);
     }
 
     /**
@@ -1080,14 +1159,10 @@ public class ProductionMaintenanceGanttMoveFlowTest {
     }
 
     /**
-     * Returns the only criterion an order or technology query may use: the id is one of the given ids, in the given order.
+     * Returns the orders of the fixture schedule's positions: those of a1, m, a2, b1 and b2.
      */
-    private static Map<SearchCriterion, EntityCondition> idInConditions(final List<Long> ids) {
-        Map<SearchCriterion, EntityCondition> conditions = new LinkedHashMap<SearchCriterion, EntityCondition>();
-
-        conditions.put(SearchRestrictions.in(L_ID, ids), new IdInCondition(ids));
-
-        return conditions;
+    private List<Entity> fixtureOrders() {
+        return Arrays.asList(orderA1, orderMoved, orderA2, orderB1, orderB2);
     }
 
     private static Date date(final String value) {
@@ -1726,19 +1801,165 @@ public class ProductionMaintenanceGanttMoveFlowTest {
     }
 
     /**
-     * Satisfied when the entity's id is one of the given ids.
+     * Answers {@code find(String)} of {@link ProductionMaintenanceGanttRecomputeService#ORDER_TECHNOLOGY_IDS_QUERY} with a new
+     * {@link OrderTechnologyIdsQueryBuilderAnswer} query builder over the given orders and the expected order ids. Fails on
+     * every other query.
      */
-    private static final class IdInCondition implements EntityCondition {
+    private static final class OrderTechnologyIdsFindAnswer implements Answer<SearchQueryBuilder> {
 
-        private final List<Long> ids;
+        private final List<Entity> orders;
 
-        private IdInCondition(final List<Long> ids) {
-            this.ids = new ArrayList<Long>(ids);
+        private final List<Long> expectedOrderIds;
+
+        private OrderTechnologyIdsFindAnswer(final List<Entity> orders, final List<Long> expectedOrderIds) {
+            this.orders = orders;
+            this.expectedOrderIds = expectedOrderIds;
         }
 
         @Override
-        public boolean matches(final Entity entity) {
-            return ids.contains(entity.getId());
+        public SearchQueryBuilder answer(final InvocationOnMock invocation) {
+            String queryString = (String) invocation.getArguments()[0];
+
+            if (!ProductionMaintenanceGanttRecomputeService.ORDER_TECHNOLOGY_IDS_QUERY.equals(queryString)) {
+                throw new AssertionError("Unexpected order query: " + queryString);
+            }
+
+            return mock(SearchQueryBuilder.class, new OrderTechnologyIdsQueryBuilderAnswer(new ArrayList<Entity>(orders),
+                    expectedOrderIds));
+        }
+
+    }
+
+    /**
+     * Answers one {@code setParameterList("orderIds", ids)} whose ids equal the expected order ids, in their order, with the
+     * builder itself, and one {@code list()} after it with a projection row for each given order whose id is bound: the
+     * order's id under {@code orderId} and its technology's id, or {@code null} without a technology, under
+     * {@code technologyId}. Fails on any other parameter or ids, a second binding, {@code list()} before the binding, a second
+     * {@code list()} and every other method {@link SearchQueryBuilder} declares. Methods {@link Object} declares return the
+     * Mockito default.
+     */
+    private static final class OrderTechnologyIdsQueryBuilderAnswer implements Answer<Object> {
+
+        private final List<Entity> orders;
+
+        private final List<Long> expectedOrderIds;
+
+        private boolean bound;
+
+        private boolean listed;
+
+        private OrderTechnologyIdsQueryBuilderAnswer(final List<Entity> orders, final List<Long> expectedOrderIds) {
+            this.orders = orders;
+            this.expectedOrderIds = expectedOrderIds;
+        }
+
+        @Override
+        public Object answer(final InvocationOnMock invocation) throws Throwable {
+            String methodName = invocation.getMethod().getName();
+            Object[] arguments = invocation.getArguments();
+
+            if (Object.class.equals(invocation.getMethod().getDeclaringClass())) {
+                return Mockito.RETURNS_DEFAULTS.answer(invocation);
+            }
+            if ("setParameterList".equals(methodName)) {
+                if (bound || !ORDER_IDS_PARAMETER.equals(arguments[0]) || !expectedOrderIds.equals(arguments[1])) {
+                    throw new AssertionError("Unexpected order technology ids query parameter " + arguments[0] + ": "
+                            + arguments[1]);
+                }
+
+                bound = true;
+
+                return invocation.getMock();
+            }
+            if ("list".equals(methodName)) {
+                if (!bound || listed) {
+                    throw new AssertionError("Unexpected order technology ids query list() call");
+                }
+
+                listed = true;
+
+                return new FixedSearchResult(projectionRows());
+            }
+
+            throw new AssertionError("Unexpected order technology ids query builder method: " + methodName);
+        }
+
+        private List<Entity> projectionRows() {
+            List<Entity> rows = new ArrayList<Entity>();
+
+            for (Entity order : orders) {
+                if (!expectedOrderIds.contains(order.getId())) {
+                    continue;
+                }
+
+                Entity technology = order.getBelongsToField(OrderFields.TECHNOLOGY);
+                Long technologyId = null;
+
+                if (technology != null) {
+                    technologyId = technology.getId();
+                }
+
+                rows.add(mock(Entity.class, new ProjectionRowAnswer(order.getId(), technologyId)));
+            }
+
+            return rows;
+        }
+
+    }
+
+    /**
+     * Answers a projection row of the order technology ids query: {@code getLongField} of {@code orderId} with the order id
+     * and of {@code technologyId} with the technology id. Fails on every other method {@link Entity} declares and on
+     * {@code getLongField} of any other field. Methods {@link Object} declares return the Mockito default.
+     */
+    private static final class ProjectionRowAnswer implements Answer<Object> {
+
+        private final Long orderId;
+
+        private final Long technologyId;
+
+        private ProjectionRowAnswer(final Long orderId, final Long technologyId) {
+            this.orderId = orderId;
+            this.technologyId = technologyId;
+        }
+
+        @Override
+        public Object answer(final InvocationOnMock invocation) throws Throwable {
+            String methodName = invocation.getMethod().getName();
+            Object[] arguments = invocation.getArguments();
+
+            if (Object.class.equals(invocation.getMethod().getDeclaringClass())) {
+                return Mockito.RETURNS_DEFAULTS.answer(invocation);
+            }
+            if ("getLongField".equals(methodName) && PROJECTION_ORDER_ID.equals(arguments[0])) {
+                return orderId;
+            }
+            if ("getLongField".equals(methodName) && PROJECTION_TECHNOLOGY_ID.equals(arguments[0])) {
+                return technologyId;
+            }
+
+            throw new AssertionError("Unexpected projection row call: " + methodName + Arrays.asList(arguments));
+        }
+
+    }
+
+    /**
+     * Adds the number of calls the {@link RecordingPsImplementation} built in {@code wireServices} had received to the given
+     * list and answers {@code null}.
+     */
+    private final class RecordedCallCountAnswer implements Answer<Void> {
+
+        private final List<Integer> counts;
+
+        private RecordedCallCountAnswer(final List<Integer> counts) {
+            this.counts = counts;
+        }
+
+        @Override
+        public Void answer(final InvocationOnMock invocation) {
+            counts.add(recordingPsImplementation.getCalls().size());
+
+            return null;
         }
 
     }

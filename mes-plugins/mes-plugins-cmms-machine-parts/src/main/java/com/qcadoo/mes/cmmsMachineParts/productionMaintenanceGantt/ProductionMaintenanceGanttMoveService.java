@@ -25,6 +25,7 @@ package com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt;
 
 import java.sql.SQLException;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
 import java.util.Deque;
@@ -48,6 +49,8 @@ import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.google.common.base.Preconditions;
+import com.qcadoo.localization.api.utils.DateUtils;
+import com.qcadoo.mes.orders.constants.OrderFields;
 import com.qcadoo.mes.orders.constants.OrdersConstants;
 import com.qcadoo.mes.orders.constants.ProductionLineScheduleFields;
 import com.qcadoo.mes.orders.constants.ProductionLineSchedulePositionFields;
@@ -57,6 +60,7 @@ import com.qcadoo.mes.productionLines.constants.ProductionLinesConstants;
 import com.qcadoo.model.api.DataDefinition;
 import com.qcadoo.model.api.DataDefinitionService;
 import com.qcadoo.model.api.Entity;
+import com.qcadoo.model.api.FieldDefinition;
 import com.qcadoo.model.api.search.SearchRestrictions;
 import com.qcadoo.model.api.validators.ErrorMessage;
 import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
@@ -87,12 +91,18 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * </ol>
  * The first step rejects with {@link #DATE_OUT_OF_RANGE_KEY} and the arguments {@code 1500} and {@code 2500}, and the next
  * three steps reject with {@link #OPTIMISTIC_LOCK_KEY}. A missing basic parameter rejects with
- * {@link #SAVE_FAILED_KEY} before the position is changed or saved. An invalid save rejects with the saved entity's first global
- * error, else its first field error, else {@link #SAVE_FAILED_KEY}. A recompute failure rejects with
- * {@link #RECOMPUTE_FAILED_KEY}, except a concurrency conflict (see {@link #isConcurrencyConflict(Throwable)}), which is
- * rethrown unchanged. Every exception thrown out of {@code move}, a {@link MoveRejectedException} included, rolls the
- * transaction back, leaving no change of the move persisted; a conflict detected by the database at commit propagates to the
- * caller as well.
+ * {@link #SAVE_FAILED_KEY} before the position is changed or saved. An invalid save rejects, with the message key and
+ * arguments of the error chosen, with the saved entity's first global error other than the framework's generic
+ * {@value #GENERIC_VALIDATION_ERROR_KEY}, else its first field error, taking field errors in the order of the fields of the
+ * saved entity's data definition and then any others in field-name order, else its first global error, else
+ * {@link #SAVE_FAILED_KEY}. A recompute failure rejects with {@link #RECOMPUTE_FAILED_KEY}, except a concurrency conflict
+ * (see {@link #isConcurrencyConflict(Throwable)}), which is rethrown unchanged. A {@link MoveRejectedException} of the
+ * recompute service is rethrown unchanged and logged at debug level; any other recompute failure is logged at warn level with
+ * the ids of the moved position, the schedule and the target production line, and rejects with the order number of the moved
+ * position, the number of the target production line and the dropped start as arguments (see
+ * {@link #recomputeFailedArgs(Entity, Entity, Date)}). Every exception thrown out of {@code move}, a
+ * {@link MoveRejectedException} included, rolls the transaction back, leaving no change of the move persisted; a conflict
+ * detected by the database at commit propagates to the caller as well.
  * <p>
  * Its caller, {@link com.qcadoo.mes.cmmsMachineParts.listeners.ProductionMaintenanceGanttListeners}, calls it outside any
  * transaction; called that way, {@code move} returns after its transaction has committed, and the caller accepts the move
@@ -107,7 +117,16 @@ public class ProductionMaintenanceGanttMoveService {
     /** Message key of a move rejected because the moved position could not be saved. */
     public static final String SAVE_FAILED_KEY = "cmmsMachineParts.productionMaintenanceGantt.move.error.saveFailed";
 
-    /** Message key of a move rejected because a following position could not be recomputed. */
+    /**
+     * Message key of a move rejected because a following position could not be recomputed. Every rejection with this key
+     * carries the three arguments of {@link #recomputeFailedArgs(Entity, Entity, Date)}: the order number, the production line
+     * number and the start of the position at which the recompute failed. A failure raised while the recompute service
+     * recomputes, or loads the references of, a following position names that position with the start it had as stored
+     * before the move; a failure the recompute service does not attribute to a following position names the moved position,
+     * the target production line and the dropped start.
+     * <p>
+     * Example: {@code {"ORD-7", "L2", "2026-10-01 10:30:00"}}.
+     */
     public static final String RECOMPUTE_FAILED_KEY = "cmmsMachineParts.productionMaintenanceGantt.move.error.recomputeFailed";
 
     /**
@@ -124,6 +143,12 @@ public class ProductionMaintenanceGanttMoveService {
 
     /** SQLSTATE reported by the database for a serialization failure. */
     private static final String SERIALIZATION_FAILURE_SQL_STATE = "40001";
+
+    /**
+     * Message key of the global error the framework adds to an entity when a model validator returns false without a message
+     * of its own ("Validation failure.").
+     */
+    private static final String GENERIC_VALIDATION_ERROR_KEY = "qcadooView.validate.global.error.custom";
 
     /** Largest number of production lines loaded by the lookup of the target row's production line. */
     private static final int TARGET_LINE_LOOKUP_LIMIT = 2;
@@ -321,8 +346,44 @@ public class ProductionMaintenanceGanttMoveService {
     }
 
     /**
+     * Returns the three message arguments of a {@link #RECOMPUTE_FAILED_KEY} rejection, raw and never null: the
+     * {@link OrderFields#NUMBER} of the given order, the {@link ProductionLineFields#NUMBER} of the given production line and
+     * the given start formatted with {@link DateUtils#toDateTimeString(Date)} ({@value DateUtils#L_DATE_TIME_FORMAT}). A null
+     * entity, a null number or a null start gives an empty argument.
+     * <p>
+     * Example: an order numbered {@code ORD-7}, a production line numbered {@code L2} and 2026-10-01 10:30 give
+     * {@code {"ORD-7", "L2", "2026-10-01 10:30:00"}}; {@code (null, null, null)} gives {@code {"", "", ""}}.
+     *
+     * @param order
+     *            order of the position at which the recompute failed, may be null
+     * @param productionLine
+     *            production line of that position, may be null
+     * @param startTime
+     *            start of that position, may be null
+     * @return the order number, the production line number and the formatted start
+     */
+    static String[] recomputeFailedArgs(final Entity order, final Entity productionLine, final Date startTime) {
+        return new String[] { stringFieldOf(order, OrderFields.NUMBER),
+                stringFieldOf(productionLine, ProductionLineFields.NUMBER), DateUtils.toDateTimeString(startTime) };
+    }
+
+    /**
+     * Returns the value of the string field of the entity, or an empty string when the entity or the value is null.
+     */
+    private static String stringFieldOf(final Entity entity, final String fieldName) {
+        if (entity == null) {
+            return StringUtils.EMPTY;
+        }
+
+        return StringUtils.defaultString(entity.getStringField(fieldName));
+    }
+
+    /**
      * Recomputes the positions after the move and turns a failure other than a concurrency conflict into a
-     * {@link #RECOMPUTE_FAILED_KEY} rejection.
+     * {@link #RECOMPUTE_FAILED_KEY} rejection. A {@link MoveRejectedException} of the recompute service is logged at debug
+     * level and rethrown unchanged. Any other failure is logged at warn level with its stack trace and the ids of the moved
+     * position, the schedule and the target production line, and becomes a rejection whose cause is that failure and whose
+     * arguments are those of {@link #movedPositionRecomputeFailedArgs(Entity, Entity, Date)}.
      */
     private void recompute(final Entity schedule, final Entity savedPosition, final Entity originLine, final Date vacatedStart,
             final Entity targetLine, final Date slotStart) {
@@ -330,16 +391,21 @@ public class ProductionMaintenanceGanttMoveService {
             productionMaintenanceGanttRecomputeService.recompute(schedule, savedPosition, originLine, vacatedStart, targetLine,
                     slotStart);
         } catch (MoveRejectedException e) {
+            LOG.debug("Gantt move of production line schedule position {} rejected with {}", savedPosition.getId(),
+                    e.getMessageKey());
+
             throw e;
         } catch (RuntimeException e) {
             if (isConcurrencyConflict(e)) {
                 throw e;
             }
 
-            LOG.warn("Recompute after the Gantt move of production line schedule position " + savedPosition.getId() + " failed",
-                    e);
+            LOG.warn("Recompute after the Gantt move of production line schedule position {} (production line schedule {}, "
+                    + "target production line {}) failed", new Object[] { savedPosition.getId(), schedule.getId(),
+                    targetLine.getId(), e });
 
-            MoveRejectedException recomputeFailed = new MoveRejectedException(RECOMPUTE_FAILED_KEY);
+            MoveRejectedException recomputeFailed = new MoveRejectedException(RECOMPUTE_FAILED_KEY,
+                    movedPositionRecomputeFailedArgs(savedPosition, targetLine, slotStart));
             recomputeFailed.initCause(e);
 
             throw recomputeFailed;
@@ -347,27 +413,117 @@ public class ProductionMaintenanceGanttMoveService {
     }
 
     /**
-     * Returns the rejection of an invalid save: the first global error, else the first field error, else
-     * {@link #SAVE_FAILED_KEY}.
+     * Returns the {@link #recomputeFailedArgs(Entity, Entity, Date)} of the moved position's order, the target production line
+     * and the dropped start. When reading the moved position's order or its number throws a runtime exception, logs that
+     * exception at debug level with the moved position's id and returns the arguments without an order.
+     */
+    private static String[] movedPositionRecomputeFailedArgs(final Entity savedPosition, final Entity targetLine,
+            final Date slotStart) {
+        try {
+            return recomputeFailedArgs(savedPosition.getBelongsToField(ProductionLineSchedulePositionFields.ORDER), targetLine,
+                    slotStart);
+        } catch (RuntimeException e) {
+            LOG.debug("Order number of the moved production line schedule position {} could not be read", savedPosition.getId(),
+                    e);
+
+            return recomputeFailedArgs(null, targetLine, slotStart);
+        }
+    }
+
+    /**
+     * Returns the rejection of an invalid save: the first global error whose message key is not
+     * {@value #GENERIC_VALIDATION_ERROR_KEY}, else the first field error of {@link #firstFieldError(Entity)}, else the first
+     * global error, else {@link #SAVE_FAILED_KEY}. A null saved position, or null error collections, count as having no
+     * errors.
+     * <p>
+     * Example: the global errors {@code [qcadooView.validate.global.error.custom]} and the field error
+     * {@code orders.validate.global.error.endTime} of {@code endTime} give {@code orders.validate.global.error.endTime};
+     * the global errors {@code [qcadooView.validate.global.error.custom, qcadooView.validate.global.optimisticLock]} with the
+     * same field error give {@code qcadooView.validate.global.optimisticLock}.
      */
     private MoveRejectedException saveRejection(final Entity savedPosition) {
         if (savedPosition != null) {
             List<ErrorMessage> globalErrors = savedPosition.getGlobalErrors();
+            ErrorMessage firstGlobalError = null;
 
-            if (globalErrors != null && !globalErrors.isEmpty()) {
-                return toRejection(globalErrors.get(0));
+            if (globalErrors != null) {
+                for (ErrorMessage globalError : globalErrors) {
+                    if (!GENERIC_VALIDATION_ERROR_KEY.equals(globalError.getMessage())) {
+                        return toRejection(globalError);
+                    }
+                    if (firstGlobalError == null) {
+                        firstGlobalError = globalError;
+                    }
+                }
             }
 
-            Map<String, ErrorMessage> fieldErrors = savedPosition.getErrors();
+            ErrorMessage fieldError = firstFieldError(savedPosition);
 
-            if (fieldErrors != null) {
-                for (ErrorMessage fieldError : fieldErrors.values()) {
-                    return toRejection(fieldError);
-                }
+            if (fieldError != null) {
+                return toRejection(fieldError);
+            }
+            if (firstGlobalError != null) {
+                return toRejection(firstGlobalError);
             }
         }
 
         return new MoveRejectedException(SAVE_FAILED_KEY);
+    }
+
+    /**
+     * Returns the first non-null field error of the saved position, taking the fields in the key order of
+     * {@link DataDefinition#getFields()} of the position's data definition, then the remaining field names in their natural
+     * order, then a field error without a field name; returns null when the position has no field error. A null data
+     * definition or a null field map gives field-name order only.
+     * <p>
+     * Example: with the model fields {@code [startTime, endTime]}, the field errors {@code {endTime=e1, startTime=s1}} give
+     * {@code s1}; without a data definition they give {@code e1}.
+     */
+    private static ErrorMessage firstFieldError(final Entity savedPosition) {
+        Map<String, ErrorMessage> fieldErrors = savedPosition.getErrors();
+
+        if (fieldErrors == null || fieldErrors.isEmpty()) {
+            return null;
+        }
+
+        DataDefinition dataDefinition = savedPosition.getDataDefinition();
+        Map<String, FieldDefinition> fields = null;
+
+        if (dataDefinition != null) {
+            fields = dataDefinition.getFields();
+        }
+        if (fields != null) {
+            for (String fieldName : fields.keySet()) {
+                ErrorMessage fieldError = fieldErrors.get(fieldName);
+
+                if (fieldError != null) {
+                    return fieldError;
+                }
+            }
+        }
+
+        List<String> fieldNames = new ArrayList<String>();
+        ErrorMessage unnamedFieldError = null;
+
+        for (Map.Entry<String, ErrorMessage> entry : fieldErrors.entrySet()) {
+            if (entry.getKey() == null) {
+                unnamedFieldError = entry.getValue();
+            } else {
+                fieldNames.add(entry.getKey());
+            }
+        }
+
+        Collections.sort(fieldNames);
+
+        for (String fieldName : fieldNames) {
+            ErrorMessage fieldError = fieldErrors.get(fieldName);
+
+            if (fieldError != null) {
+                return fieldError;
+            }
+        }
+
+        return unnamedFieldError;
     }
 
     private MoveRejectedException toRejection(final ErrorMessage errorMessage) {

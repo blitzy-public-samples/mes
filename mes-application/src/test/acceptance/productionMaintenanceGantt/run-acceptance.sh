@@ -67,8 +67,12 @@
 #   4. Starts Tomcat and, once the login page answers, checks that the started Tomcat runs and holds every LISTEN socket
 #      on the HTTP port. Repeats the worker isolation check, runs acceptance.test.js with the TAP reporter, repeats the
 #      listener check, and checks the TAP summary and every case line.
-#   5. Stops the isolation watch and Tomcat on every exit. Removes the work directory once Tomcat has stopped; keeps it
-#      and prints its path while Tomcat still runs. The database is kept.
+#   5. Stops the running step, the isolation watch and Tomcat on every exit. The steps are the unpacking, the psql
+#      commands, the login page probes and the pauses between them, and acceptance.test.js; each runs as a background
+#      job the script waits for, and SIGINT or SIGTERM ends that wait at once, except for a psql command inside a
+#      command substitution, which finishes first. acceptance.test.js and the psql deadline wrapper get the signal the
+#      script received, any other step SIGTERM; SIGTERM and SIGKILL follow while it still runs. Removes the work
+#      directory once Tomcat has stopped; keeps it and prints its path while Tomcat still runs. The database is kept.
 #
 # Exit status: 0 for --help, and otherwise only when every acceptance case passed, Tomcat stopped and the work
 # directory was removed; 2 on a usage error; the runner's status when the runner failed; 130 on SIGINT; 143 on SIGTERM,
@@ -85,7 +89,7 @@ unset CDPATH
 
 readonly PROGRAM='run-acceptance.sh'
 readonly MARKER='qcadoo-acceptance:productionMaintenanceGantt'
-readonly REQUIRED_TOOLS=(psql setsid node unzip curl chrome-headless-shell)
+readonly REQUIRED_TOOLS=(psql setsid node unzip curl chrome-headless-shell java)
 readonly REQUIRED_PLUGINS=(productionScheduling lineChangeoverNormsForOrders cmmsMachineParts)
 readonly EXPECTED_CASES=(
     'http:rowMapping'
@@ -100,10 +104,13 @@ readonly EXPECTED_CASES=(
     'http:concurrentMembershipChange'
     'http:concurrentMoves'
     'http:rollbackAfterPsSideEffect'
+    'browser:ganttButtonUnsavedChangesGuard'
 )
 readonly MIN_NODE_MAJOR=22
 readonly DEFAULT_DB_HOST='localhost'
 readonly DEFAULT_DB_PORT='5432'
+readonly JDBC_HOST_URL_RE='^jdbc:postgresql://([^/:]+)(:([0-9]+))?/([^/]*)$'
+readonly JDBC_LOCAL_URL_RE='^jdbc:postgresql:([^/].*)$'
 readonly DEFAULT_HTTP_PORT='8080'
 readonly DEFAULT_SHUTDOWN_PORT='8005'
 readonly STARTUP_TIMEOUT_SECONDS=600
@@ -111,6 +118,8 @@ readonly STARTUP_POLL_SECONDS=2
 readonly STARTUP_REPORT_SECONDS=10
 readonly STOP_WAIT_SECONDS=30
 readonly KILL_WAIT_SECONDS=10
+readonly STEP_STOP_WAIT_SECONDS=20
+readonly STEP_TEE_WAIT_SECONDS=5
 readonly TOMCAT_CMDLINE_READS=10
 readonly LOG_TAIL_LINES=200
 readonly PSQL_CONNECT_TIMEOUT_SECONDS=30
@@ -135,6 +144,14 @@ CATALINA_BASE=''
 # Nonzero exit status the cleanup trap keeps: 2 after a usage error, the runner's status after a failed runner, else 0.
 KEPT_STATUS=0
 ISOLATION_WATCH_PID=''
+# The step run_step or run_teed_step runs: how cleanup stops it (forward or terminate; empty while no step runs), the
+# pid and name of its command, the pid of its tee and its FIFO, and the value of $! before its latest launch.
+STEP_STOP=''
+STEP_PID=''
+STEP_NAME=''
+STEP_TEE_PID=''
+STEP_FIFO=''
+STEP_PREVIOUS_JOB=''
 
 # Reads the port attributes of conf/server.xml outside XML comments, or rewrites them.
 #   ports <server.xml>                           prints "<http port> <shutdown port>"; an absent value prints "-"
@@ -869,12 +886,106 @@ usage() {
         "$PROGRAM" >&"${1:-2}"
 }
 
-# Prints a usage error, its message passed through escape_controls, with the usage line and exits with status 2.
+# Prints a usage error, its message passed through escape_controls, with the usage line and a pointer to --help, and
+# exits with status 2.
 usage_error() {
     printf '%s: %s\n' "$PROGRAM" "$(escape_controls "$1")" >&2
     usage 2
+    printf 'Run %s --help for the options, their defaults, the requirements and the exit statuses.\n' "$PROGRAM" >&2
     KEPT_STATUS=2
     exit 2
+}
+
+# Prints the database of dbJdbcUrl in mes/mes-application/conf/tomcat/db.properties of the checkout that holds this
+# script; fails when the file or the key is missing, or the value is not jdbc:postgresql:DB,
+# jdbc:postgresql://HOST/DB or jdbc:postgresql://HOST:PORT/DB with a non-empty DB.
+help_default_db_name() {
+    local script_dir url
+
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2> /dev/null && pwd)" || return 1
+    url="$(property_value "$script_dir/../../../../conf/tomcat/db.properties" dbJdbcUrl 2> /dev/null)" || return 1
+
+    if [[ "$url" =~ $JDBC_HOST_URL_RE ]] && [ -n "${BASH_REMATCH[4]}" ]; then
+        printf '%s' "${BASH_REMATCH[4]}"
+    elif [[ "$url" =~ $JDBC_LOCAL_URL_RE ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    else
+        return 1
+    fi
+}
+
+# Prints the help to standard output: the usage lines, what the script does, every option with its default, the
+# tools, environment, database and plugins it needs, the exit statuses and an example. The tool and plugin lists come
+# from REQUIRED_TOOLS and REQUIRED_PLUGINS, and the default database from help_default_db_name when it resolves.
+print_help() {
+    local db_default tools plugins
+
+    if db_default="$(help_default_db_name)" && [ -n "$db_default" ]; then
+        db_default="$(escape_controls "$db_default") in this checkout"
+    else
+        db_default='mes as shipped'
+    fi
+
+    tools="$(printf '%s, ' "${REQUIRED_TOOLS[@]}")"
+    plugins="$(printf '%s, ' "${REQUIRED_PLUGINS[@]}")"
+
+    usage 1
+    cat << EOF
+       $PROGRAM --help | -h
+
+Runs the acceptance suite of the production and maintenance Gantt board. Drops and recreates the acceptance
+database only when its comment is $MARKER, creates it when it is absent
+and refuses it with any other comment; loads mes_db_en.sql and fixture.sql into it; runs acceptance.test.js against
+a Tomcat unpacked from --dist; stops that Tomcat and keeps the database.
+
+Options, each also accepted as --name=value:
+  --dist <mes-application.zip>  Required. The Tomcat distribution that (cd mes/mes-application && mvn -B -Ptomcat
+                                clean install) builds as mes/mes-application/target/mes-application.zip. A relative
+                                path is resolved against the current directory.
+  --user <login>                Required. The application login acceptance.test.js signs in with.
+  --password <password>         Required. The password of that login. On a shared host, processes outside this run
+                                can read it.
+  --db-name <database>          The acceptance database, also set in the unpacked distribution: a letter or _
+                                followed by letters, digits and _, at most 63 characters.
+                                Default: the database of dbJdbcUrl in mes/mes-application/conf/tomcat/db.properties
+                                (${db_default}).
+  --http-port <port>            HTTP connector port of the unpacked distribution, 1 to 65535.
+                                Default: the port in the distribution's conf/server.xml, $DEFAULT_HTTP_PORT in the
+                                distribution the tomcat profile builds.
+  --shutdown-port <port>        Shutdown port of the unpacked distribution, 1 to 65535, other than the HTTP port.
+                                Default: the port in the distribution's conf/server.xml, $DEFAULT_SHUTDOWN_PORT in the
+                                distribution the tomcat profile builds.
+  --work-root <directory>       Existing directory outside the repository that holds the temporary work directory;
+                                its physical path may hold only $SAFE_PATH_CHARACTERS.
+                                Default: the directory mktemp -t uses (TMPDIR, else /tmp), which has to meet the
+                                same conditions.
+  -h, --help                    Prints this help and exits with status 0.
+
+Requirements:
+  Tools on PATH  ${tools%, }; node $MIN_NODE_MAJOR or later.
+  Environment    The script reads no environment variable besides PATH, the source of its tools; mktemp -t reads
+                 TMPDIR for the default work root, and every exported variable whose name starts with PG is unset
+                 before psql runs.
+  PostgreSQL     Version 14 or later, at the host and port of dbJdbcUrl in
+                 mes/mes-application/conf/tomcat/db.properties; that host has to be localhost or a 127.0.0.0/8
+                 address. psql connects as its dbUsername with its dbPassword, an account that may create and drop
+                 databases, and the db.properties of the distribution has to hold the same dbJdbcUrl, dbUsername
+                 and dbPassword.
+  Plugins        mes_db_en.sql has to enable ${plugins%, }.
+
+Exit status:
+  0         --help, or every acceptance case passed, Tomcat stopped and the work directory was removed
+  2         a usage error
+  <status>  the status of acceptance.test.js when it failed
+  130       SIGINT
+  143       SIGTERM, also the signal the worker isolation watch sends on an intrusion
+  1         any other failure
+
+Example, run from the repository root:
+  mes/mes-application/src/test/acceptance/productionMaintenanceGantt/$PROGRAM \\
+      --dist mes/mes-application/target/mes-application.zip --user admin --password admin \\
+      --db-name mes_accept_c4 --http-port 20042 --shutdown-port 20043
+EOF
 }
 
 # Prints the argument without leading and trailing whitespace.
@@ -1079,14 +1190,154 @@ require_free_port() {
     fi
 }
 
-# Runs psql -X -w -v ON_ERROR_STOP=1 with the given arguments and fails with status 124 when it runs longer than the
-# given number of seconds.
-#   psql_with_deadline <seconds> <psql argument>...
-psql_with_deadline() {
-    local seconds="$1"
+# Exits unless the argument is forward or terminate, the ways cleanup can stop a step.
+require_step_stop() {
+    case "$1" in
+        forward | terminate) ;;
+        *) die "internal error: a step is stopped with forward or terminate, not '$1'" ;;
+    esac
+}
 
+# Runs an external command as a step: a background job with standard input from /dev/null whose pid STEP_PID holds
+# while the script waits for it. Returns the command's exit status. <stop> is what cleanup sends the command when the
+# script ends while it runs: forward sends the signal the script received (SIGINT for exit status 130, else SIGTERM),
+# terminate sends SIGTERM. --stdout and --stderr write the command's standard output or standard error to a file. A
+# redirection of the run_step call itself also applies to cleanup when cleanup runs during the step. Inside a command
+# substitution the step runs in the subshell, which records it for itself.
+#   run_step forward|terminate [--stdout <file>] [--stderr <file>] <command> [<argument>...]
+#   Example: run_step terminate --stderr /dev/null sleep 2
+run_step() {
+    local stop="$1" stdout='' stderr='' status=0
+
+    require_step_stop "$stop"
     shift
-    node -e "$PSQL_DEADLINE_JS" -- "$PROGRAM" "$seconds" "$PSQL_KILL_GRACE_SECONDS" psql -X -w -v ON_ERROR_STOP=1 "$@"
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --stdout | --stderr)
+                [ "$#" -ge 3 ] || die "internal error: run_step $1 needs a file and a command"
+
+                if [ "$1" = '--stdout' ]; then
+                    stdout="$2"
+                else
+                    stderr="$2"
+                fi
+
+                shift 2
+                ;;
+            *) break ;;
+        esac
+    done
+
+    [ "$#" -gt 0 ] || die 'internal error: run_step needs a command'
+    STEP_PREVIOUS_JOB="${!:-}"
+    STEP_NAME="${1##*/}"
+    STEP_STOP="$stop"
+
+    if [ -n "$stdout" ] && [ -n "$stderr" ]; then
+        "$@" < /dev/null > "$stdout" 2> "$stderr" &
+    elif [ -n "$stdout" ]; then
+        "$@" < /dev/null > "$stdout" &
+    elif [ -n "$stderr" ]; then
+        "$@" < /dev/null 2> "$stderr" &
+    else
+        "$@" < /dev/null &
+    fi
+
+    STEP_PID=$!
+    wait "$STEP_PID" || status=$?
+
+    STEP_STOP=''
+    STEP_PID=''
+    STEP_NAME=''
+    STEP_PREVIOUS_JOB=''
+    return "$status"
+}
+
+# Runs an external command as a step like run_step, with tee copying its standard output (<streams> stdout), or its
+# standard output and standard error (<streams> both), to a log file and to the script's standard output through the
+# FIFO step.fifo of WORK_DIR; STEP_TEE_PID and STEP_FIFO hold tee and the FIFO while the step runs. Sets
+# STEP_COMMAND_STATUS and STEP_TEE_STATUS to the exit statuses of the command and of tee, removes the FIFO, and returns
+# the status of tee when it is not 0, else the status of the command.
+#   run_teed_step forward|terminate stdout|both <log file> <command> [<argument>...]
+#   Example: run_teed_step forward stdout "$WORK_DIR/out.log" node script.js
+run_teed_step() {
+    local stop="$1" streams="$2" log_file="$3" fifo="$WORK_DIR/step.fifo"
+
+    require_step_stop "$stop"
+
+    case "$streams" in
+        stdout | both) ;;
+        *) die "internal error: a teed step copies stdout or both, not '$streams'" ;;
+    esac
+
+    shift 3
+    STEP_COMMAND_STATUS=0
+    STEP_TEE_STATUS=0
+
+    mkfifo -m 600 -- "$fifo" || die "cannot create the FIFO $fifo"
+    STEP_FIFO="$fifo"
+    STEP_PREVIOUS_JOB="${!:-}"
+    STEP_NAME="${1##*/}"
+    STEP_STOP="$stop"
+
+    tee -- "$log_file" < "$fifo" &
+    STEP_TEE_PID=$!
+    STEP_PREVIOUS_JOB="$STEP_TEE_PID"
+
+    if [ "$streams" = 'both' ]; then
+        "$@" < /dev/null > "$fifo" 2>&1 &
+    else
+        "$@" < /dev/null > "$fifo" &
+    fi
+
+    STEP_PID=$!
+    wait "$STEP_PID" || STEP_COMMAND_STATUS=$?
+    STEP_PREVIOUS_JOB="$STEP_PID"
+    STEP_PID=''
+
+    wait "$STEP_TEE_PID" || STEP_TEE_STATUS=$?
+    STEP_TEE_PID=''
+
+    STEP_STOP=''
+    STEP_NAME=''
+    STEP_PREVIOUS_JOB=''
+    rm -f -- "$fifo"
+    STEP_FIFO=''
+
+    if [ "$STEP_TEE_STATUS" -ne 0 ]; then
+        return "$STEP_TEE_STATUS"
+    fi
+
+    return "$STEP_COMMAND_STATUS"
+}
+
+# Sets the array named by the first argument to the command that runs psql -X -w -v ON_ERROR_STOP=1 with the remaining
+# arguments under PSQL_DEADLINE_JS, which exits with status 124 when psql runs longer than <seconds>.
+#   psql_deadline_command <array name> <seconds> <psql argument>...
+psql_deadline_command() {
+    local -n psql_deadline_command_result="$1"
+    local seconds="$2"
+
+    shift 2
+    psql_deadline_command_result=(node -e "$PSQL_DEADLINE_JS" -- "$PROGRAM" "$seconds" "$PSQL_KILL_GRACE_SECONDS"
+        psql -X -w -v ON_ERROR_STOP=1 "$@")
+}
+
+# Runs psql -X -w -v ON_ERROR_STOP=1 with the given arguments as a forward step of run_step and fails with status 124
+# when it runs longer than the given number of seconds. --stdout writes the standard output of psql to a file.
+#   psql_with_deadline [--stdout <file>] <seconds> <psql argument>...
+psql_with_deadline() {
+    local psql_command=() output=()
+
+    if [ "${1:-}" = '--stdout' ]; then
+        [ "$#" -ge 3 ] || die 'internal error: psql_with_deadline --stdout needs a file and a deadline'
+        output=(--stdout "$2")
+        shift 2
+    fi
+
+    psql_deadline_command psql_command "$@"
+    run_step forward "${output[@]}" "${psql_command[@]}"
 }
 
 # Prints a PL/pgSQL DO block that raises an exception naming the database, server address and server port the session
@@ -1219,12 +1470,132 @@ stop_tomcat() {
     return 0
 }
 
-# Stops the isolation watch. On failure prints the last LOG_TAIL_LINES lines of the Tomcat log through LOG_TAIL_JS,
-# which reads the secrets of the run from its standard input, each ended by a NUL byte, or a one-line notice without
-# the tail when the filter fails. Then stops Tomcat, and removes the work directory once Tomcat has stopped. Keeps the
-# work directory while Tomcat still runs. Exits with the status given as its argument (130 or 143); without an
-# argument, with the exit status that ran it when that status is 0 or KEPT_STATUS, and with 1 for any other status.
-# Exits with 1 in place of 0 when Tomcat still runs or the work directory still exists.
+# Succeeds while the process of the given pid exists and is not a zombie.
+# shellcheck disable=SC2317
+process_running() {
+    local stat=''
+
+    kill -0 "$1" 2> /dev/null || return 1
+    IFS= read -r stat 2> /dev/null < "/proc/$1/stat" || return 0
+    stat="${stat##*) }"
+    [ "${stat:0:1}" != 'Z' ]
+}
+
+# Stops a background job of the script in stages and reaps it. Each stage <signal>:<seconds> sends the signal while
+# the job runs, or no signal for -, and then waits up to <seconds> for the job to exit, checking every 0.1 s. Logs each
+# signal it sends. Returns 0 once the job has exited and been reaped, 1 while it still runs.
+#   stop_job <name> <pid> <signal>:<seconds>...
+#   Example: stop_job tee 1234 -:5 TERM:10 KILL:10
+# shellcheck disable=SC2317
+stop_job() {
+    local name="$1" pid="$2" stage signal seconds polls previous=''
+
+    shift 2
+
+    for stage in "$@"; do
+        process_running "$pid" || break
+        signal="${stage%%:*}"
+        seconds="${stage#*:}"
+
+        if [ "$signal" != '-' ]; then
+            if [ -n "$previous" ]; then
+                log "$name (pid $pid) still runs $previous; sending SIG$signal"
+            else
+                log "stopping $name (pid $pid) with SIG$signal"
+            fi
+
+            kill -s "$signal" "$pid" 2> /dev/null
+            previous="$seconds s after SIG$signal"
+        else
+            previous="after $seconds s"
+        fi
+
+        polls=$((seconds * 10))
+
+        while [ "$polls" -gt 0 ] && process_running "$pid"; do
+            sleep 0.1
+            polls=$((polls - 1))
+        done
+    done
+
+    if process_running "$pid"; then
+        return 1
+    fi
+
+    wait "$pid" 2> /dev/null
+    return 0
+}
+
+# Stops the step that run_step or run_teed_step runs and reaps it, for the exit status the script ends with. A command
+# or tee the step launched whose pid is not yet recorded is taken from $!. The command gets SIGINT when it is a forward
+# step and the status is 130, else SIGTERM; then SIGTERM, unless that was the first signal, and SIGKILL. It has
+# STEP_STOP_WAIT_SECONDS to exit after the first signal and KILL_WAIT_SECONDS after each other. Then tee has
+# STEP_TEE_WAIT_SECONDS to exit before SIGTERM and SIGKILL, KILL_WAIT_SECONDS apart. Removes the FIFO. Returns 1 when
+# the command or tee still runs, else 0.
+#   stop_step <exit status>
+# shellcheck disable=SC2317
+stop_step() {
+    local status="$1" last_job="${!:-}" signal='TERM' signals stages=() failed=0
+
+    if [ -n "$STEP_STOP" ] && [ -n "$last_job" ] && [ "$last_job" != "$STEP_PREVIOUS_JOB" ] \
+            && [ "$last_job" != "$STEP_PID" ] && [ "$last_job" != "$STEP_TEE_PID" ]; then
+        if [ -n "$STEP_FIFO" ] && [ -z "$STEP_TEE_PID" ]; then
+            STEP_TEE_PID="$last_job"
+        elif [ -z "$STEP_PID" ]; then
+            STEP_PID="$last_job"
+        fi
+    fi
+
+    if [ -n "$STEP_PID" ]; then
+        if [ "$STEP_STOP" = 'forward' ] && [ "$status" -eq 130 ]; then
+            signal='INT'
+        fi
+
+        stages=("$signal:$STEP_STOP_WAIT_SECONDS")
+        signals="SIG$signal"
+
+        if [ "$signal" != 'TERM' ]; then
+            stages+=("TERM:$KILL_WAIT_SECONDS")
+            signals+=', SIGTERM'
+        fi
+
+        stages+=("KILL:$KILL_WAIT_SECONDS")
+
+        if stop_job "the running step ${STEP_NAME:-command}" "$STEP_PID" "${stages[@]}"; then
+            STEP_PID=''
+        else
+            printf '%s: error: the running step %s (pid %s) still runs after %s and SIGKILL\n' "$PROGRAM" \
+                "$(escape_controls "${STEP_NAME:-command}")" "$STEP_PID" "$signals" >&2
+            failed=1
+        fi
+    fi
+
+    if [ -n "$STEP_TEE_PID" ]; then
+        if stop_job tee "$STEP_TEE_PID" "-:$STEP_TEE_WAIT_SECONDS" "TERM:$KILL_WAIT_SECONDS" "KILL:$KILL_WAIT_SECONDS"
+        then
+            STEP_TEE_PID=''
+        else
+            printf '%s: error: tee (pid %s) still runs after SIGTERM and SIGKILL\n' "$PROGRAM" "$STEP_TEE_PID" >&2
+            failed=1
+        fi
+    fi
+
+    if [ -n "$STEP_FIFO" ]; then
+        rm -f -- "$STEP_FIFO"
+        STEP_FIFO=''
+    fi
+
+    STEP_STOP=''
+    return "$failed"
+}
+
+# Stops the running step through stop_step, then the isolation watch. On failure prints the last LOG_TAIL_LINES lines
+# of the Tomcat log through LOG_TAIL_JS, which reads the secrets of the run from its standard input, each ended by a NUL
+# byte, or a one-line notice without the tail when the filter fails. Then stops Tomcat, and removes the work directory
+# once Tomcat has stopped. Keeps the work directory while Tomcat still runs. Exits with the status given as its argument
+# (130 or 143); without an argument, with the exit status that ran it when that status is 0 or KEPT_STATUS, and with 1
+# for any other status.
+# Exits with 1 in place of 0 when the step, tee or Tomcat still runs or the work directory still exists.
 # shellcheck disable=SC2317
 cleanup() {
     local status=$? cleanup_failed=0 remove_status log_tail filter_status
@@ -1237,6 +1608,8 @@ cleanup() {
 
     trap - EXIT INT TERM
     set +e
+
+    stop_step "$status" || cleanup_failed=1
 
     if [ -n "$ISOLATION_WATCH_PID" ]; then
         stop_isolation_watch
@@ -1305,7 +1678,7 @@ while [ "$#" -gt 0 ]; do
 
     case "$argument" in
         -h | --help)
-            usage 1
+            print_help
             exit 0
             ;;
         --*=*)
@@ -1786,7 +2159,33 @@ case "${DIST##*/}" in
     *[*?[]*) usage_error "--dist file name ${DIST##*/} holds * ? or [, which unzip matches as a pattern; rename the file" ;;
 esac
 
-[ -f "$DIST" ] || die "distribution $DIST does not exist; build it with (cd mes/mes-application && mvn -B -Ptomcat clean install)"
+# Requires the distribution to be an existing regular file, directly or through symbolic links, and readable; names a
+# missing path, a symbolic link that resolves to no existing file, and a path of another file type apart.
+if [ ! -e "$DIST" ]; then
+    if [ -L "$DIST" ]; then
+        dist_link_target="$(readlink -- "$DIST")" || dist_link_target=''
+        die "distribution $DIST is a symbolic link to ${dist_link_target:-a target that cannot be read}, which does not resolve to an existing file; point it at the mes-application.zip that (cd mes/mes-application && mvn -B -Ptomcat clean install) builds, or pass that file"
+    fi
+
+    die "distribution $DIST does not exist; build it with (cd mes/mes-application && mvn -B -Ptomcat clean install)"
+fi
+
+if [ ! -f "$DIST" ]; then
+    if [ -d "$DIST" ]; then
+        dist_file_type='a directory'
+    elif [ -p "$DIST" ]; then
+        dist_file_type='a named pipe'
+    elif [ -S "$DIST" ]; then
+        dist_file_type='a socket'
+    elif [ -b "$DIST" ] || [ -c "$DIST" ]; then
+        dist_file_type='a device'
+    else
+        dist_file_type='a file of another type'
+    fi
+
+    die "distribution $DIST is not a regular file but $dist_file_type; pass the mes-application.zip file that (cd mes/mes-application && mvn -B -Ptomcat clean install) writes, mes/mes-application/target/mes-application.zip"
+fi
+
 [ -r "$DIST" ] || die "distribution $DIST is not readable"
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1892,6 +2291,30 @@ if ! [[ "$NODE_MAJOR" =~ ^[0-9]+$ ]] || [ "$NODE_MAJOR" -lt "$MIN_NODE_MAJOR" ];
     die "node $MIN_NODE_MAJOR or later is required, found $(node --version)"
 fi
 
+# Runs java -version and keeps the first line of its output that is not a "Picked up" notice of the JVM as the version
+# line; fails when java -version exits with a nonzero status.
+java_status=0
+java_output="$(java -version 2>&1 < /dev/null)" || java_status=$?
+JAVA_VERSION_LINE=''
+
+while IFS= read -r java_line; do
+    case "$java_line" in
+        'Picked up '* | 'NOTE: Picked up '*) ;;
+        *)
+            JAVA_VERSION_LINE="$java_line"
+            break
+            ;;
+    esac
+done <<< "$java_output"
+
+if [ "$java_status" -ne 0 ]; then
+    die "java on PATH ($(type -P java)) cannot run: java -version exited with status $java_status${JAVA_VERSION_LINE:+: $JAVA_VERSION_LINE}"
+fi
+
+if [ -z "$JAVA_VERSION_LINE" ]; then
+    JAVA_VERSION_LINE="java at $(type -P java)"
+fi
+
 # Chooses the first day 2 to 13 days ahead whose UTC offset is the same at every minute from its midnight to the
 # midnight 9 days later.
 BASE_DAY_WINDOW="every minute from its midnight to the midnight $((BASE_DAY_FOLLOWING_DAYS + 1)) days later"
@@ -1914,7 +2337,7 @@ if [ ! -f "$CHROME" ] || [ ! -x "$CHROME" ]; then
     die "chrome-headless-shell at $CHROME is not an executable regular file"
 fi
 
-log "node $(node --version), $(psql --version), chrome-headless-shell at $CHROME"
+log "node $(node --version), $(psql --version), $JAVA_VERSION_LINE, chrome-headless-shell at $CHROME"
 
 # Creates the temporary work directory and checks its physical path like --work-root.
 if [ -n "$WORK_ROOT" ]; then
@@ -1984,9 +2407,6 @@ PACKAGED_DB_PASSWORD="$(property_value /dev/stdin dbPassword <<< "$dist_db_prope
 [ -n "$PACKAGED_DB_PASSWORD" ] || die "dbPassword is empty in $DIST_DB_PROPERTIES_ENTRY of $DIST"
 
 # Splits dbJdbcUrl into host, port and database.
-readonly JDBC_HOST_URL_RE='^jdbc:postgresql://([^/:]+)(:([0-9]+))?/([^/]*)$'
-readonly JDBC_LOCAL_URL_RE='^jdbc:postgresql:([^/].*)$'
-
 if [[ "$REPO_DB_URL" =~ $JDBC_HOST_URL_RE ]]; then
     DB_HOST="${BASH_REMATCH[1]}"
     DB_PORT="${BASH_REMATCH[3]:-$DEFAULT_DB_PORT}"
@@ -2114,12 +2534,12 @@ DIST_FILE_COUNT="$(node -e "$ZIP_INSPECT_JS" -- "$DIST")" \
 
 [[ "$DIST_FILE_COUNT" =~ ^[0-9]+$ ]] || die "cannot count the regular files of $DIST, got '$DIST_FILE_COUNT'"
 
-# Unpacks the distribution without overwriting and without reading standard input.
+# Unpacks the distribution without overwriting and without reading standard input, as a step of run_step.
 DIST_DIR="$WORK_DIR/dist"
 
 log "unpacking $DIST into $DIST_DIR"
 mkdir -- "$DIST_DIR"
-unzip -q -n "$DIST" -d "$DIST_DIR" < /dev/null || die "cannot unpack $DIST into $DIST_DIR"
+run_step terminate unzip -q -n "$DIST" -d "$DIST_DIR" || die "cannot unpack $DIST into $DIST_DIR"
 
 # Checks the unpacked tree holds only directories and the regular files the distribution lists.
 unpacked_others=()
@@ -2308,17 +2728,20 @@ psql_admin -q -c "CREATE DATABASE \"$DB_NAME\" ENCODING 'UTF8' TEMPLATE template
 
 # Loads the seed.
 log "loading $SEED_SQL into $DB_NAME"
-psql_with_deadline "$PSQL_SEED_TIMEOUT_SECONDS" -q -d "$DB_URI" -c "$DB_GUARD_SQL" -f "$SEED_SQL" > "$WORK_DIR/seed.log" \
-    || die "loading $SEED_SQL into $DB_NAME failed: psql exited with status $?"
+psql_with_deadline --stdout "$WORK_DIR/seed.log" "$PSQL_SEED_TIMEOUT_SECONDS" -q -d "$DB_URI" -c "$DB_GUARD_SQL" \
+    -f "$SEED_SQL" || die "loading $SEED_SQL into $DB_NAME failed: psql exited with status $?"
 log 'seed loaded'
 
-# Loads the fixture.
+# Loads the fixture as a forward step of run_teed_step, tee copying the standard output and standard error of psql
+# to FIXTURE_LOG and to standard output.
 FIXTURE_LOG="$WORK_DIR/fixture.log"
 
 log "loading $FIXTURE_SQL into $DB_NAME"
-psql_with_deadline "$PSQL_FIXTURE_TIMEOUT_SECONDS" -v base_day="$BASE_DAY" -d "$DB_URI" -c "$DB_GUARD_SQL" \
-    -f "$FIXTURE_SQL" 2>&1 | tee "$FIXTURE_LOG" \
-    || die "loading $FIXTURE_SQL into $DB_NAME failed: psql exited with status ${PIPESTATUS[0]}, tee with status ${PIPESTATUS[1]}"
+fixture_command=()
+psql_deadline_command fixture_command "$PSQL_FIXTURE_TIMEOUT_SECONDS" -v base_day="$BASE_DAY" -d "$DB_URI" \
+    -c "$DB_GUARD_SQL" -f "$FIXTURE_SQL"
+run_teed_step forward both "$FIXTURE_LOG" "${fixture_command[@]}" \
+    || die "loading $FIXTURE_SQL into $DB_NAME failed: psql exited with status $STEP_COMMAND_STATUS, tee with status $STEP_TEE_STATUS"
 log 'fixture loaded'
 
 # Checks the plugins the suite needs are enabled.
@@ -2360,11 +2783,12 @@ log "starting Tomcat from $CATALINA_BASE on $BASE_URL (log $TOMCAT_LOG)"
 TOMCAT_PID=$!
 printf '%s\n' "$TOMCAT_PID" > "$CATALINA_BASE/catalina.pid"
 
-# Waits for the login page.
+# Waits for the login page, running curl and sleep as steps of run_step.
 startup_began=$SECONDS
 next_report="$STARTUP_REPORT_SECONDS"
 
-until curl -q -fsS -o /dev/null --max-time 10 --noproxy '*' "$BASE_URL/login.html" 2> /dev/null; do
+until run_step terminate --stderr /dev/null curl -q -fsS -o /dev/null --max-time 10 --noproxy '*' "$BASE_URL/login.html"
+do
     elapsed=$((SECONDS - startup_began))
 
     if ! tomcat_alive; then
@@ -2380,7 +2804,7 @@ until curl -q -fsS -o /dev/null --max-time 10 --noproxy '*' "$BASE_URL/login.htm
         next_report=$(((elapsed / STARTUP_REPORT_SECONDS + 1) * STARTUP_REPORT_SECONDS))
     fi
 
-    sleep "$STARTUP_POLL_SECONDS"
+    run_step terminate sleep "$STARTUP_POLL_SECONDS"
 done
 
 log "Tomcat answered $BASE_URL/login.html after $((SECONDS - startup_began)) s"
@@ -2400,14 +2824,13 @@ check_worker_isolation 'before acceptance.test.js starts'
 log "running acceptance.test.js against $BASE_URL with base day $BASE_DAY"
 cd "$SCRIPT_DIR"
 
-set +e
-node --test-reporter=tap acceptance.test.js --base-url="$BASE_URL" --user="$USER_ARG" --password="$PASSWORD_ARG" \
-    --db-uri="$DB_URI" --chrome="$CHROME" --base-day="$BASE_DAY" | tee "$TAP_LOG"
-pipe_status=("${PIPESTATUS[@]}")
-set -e
+# Runs acceptance.test.js as a forward step of run_teed_step, tee copying its standard output to TAP_LOG and to
+# standard output.
+run_teed_step forward stdout "$TAP_LOG" node --test-reporter=tap acceptance.test.js --base-url="$BASE_URL" \
+    --user="$USER_ARG" --password="$PASSWORD_ARG" --db-uri="$DB_URI" --chrome="$CHROME" --base-day="$BASE_DAY" || true
 
-RUNNER_STATUS="${pipe_status[0]}"
-TEE_STATUS="${pipe_status[1]}"
+RUNNER_STATUS="$STEP_COMMAND_STATUS"
+TEE_STATUS="$STEP_TEE_STATUS"
 
 if [ "$RUNNER_STATUS" -ne 0 ]; then
     printf '%s: error: acceptance.test.js exited with status %s\n' "$PROGRAM" "$RUNNER_STATUS" >&2

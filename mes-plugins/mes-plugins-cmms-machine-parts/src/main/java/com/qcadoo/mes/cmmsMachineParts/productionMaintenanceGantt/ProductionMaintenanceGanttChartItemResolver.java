@@ -37,6 +37,9 @@ import java.util.TreeMap;
 
 import org.apache.commons.lang3.StringEscapeUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.joda.time.Days;
+import org.joda.time.LocalDate;
+import org.joda.time.LocalTime;
 import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -68,6 +71,7 @@ import com.qcadoo.view.api.components.ganttChart.GanttChartItemResolver;
 import com.qcadoo.view.api.components.ganttChart.GanttChartItemStripFactory;
 import com.qcadoo.view.api.components.ganttChart.GanttChartItemTooltipBuilder;
 import com.qcadoo.view.api.components.ganttChart.GanttChartScale;
+import com.qcadoo.view.internal.components.ganttChart.GanttChartScaleImpl;
 
 /**
  * Resolves the items of the production and maintenance Gantt board.
@@ -83,6 +87,13 @@ import com.qcadoo.view.api.components.ganttChart.GanttChartScale;
  * </ul>
  * User-entered display strings are HTML-escaped before they become item labels or tooltip lines. Overlapping items are left
  * to the Gantt component's collision detection.
+ * <p>
+ * On the component's {@code initialize} event, whose scale reports {@link GanttChartScale#getIsDatesSet()} as
+ * {@code true}, the scale is fitted to the schedule before any item is placed: it starts on the day of the schedule's
+ * earliest position start, or on the day of the schedule's start time when the schedule has no position on a production
+ * line, and keeps the length in days of the incoming scale, extended to the day of the latest position end and capped at
+ * the maximum range of the zoom level. A schedule with neither a position on a production line nor a start time keeps the
+ * incoming scale. On every other event the scale is used as it comes.
  * <p>
  * Every read is one HQL query through {@link DataDefinition#find(String)}, without a row count and without loading whole
  * entities; each query constant documents its projection. Besides the columns the board shows, the queries select the
@@ -101,14 +112,14 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
     public static final String CONTEXT_SCHEDULE_ID = "productionLineScheduleId";
 
     /**
-     * Strip colour of planned events that do not require a shutdown.
+     * Strip colour (light blue) of planned events that do not require a shutdown.
      */
-    public static final String MAINTENANCE_COLOR = "#2E86C1";
+    public static final String MAINTENANCE_COLOR = "#B3DBF7";
 
     /**
-     * Strip colour of planned events that require a shutdown.
+     * Strip colour (light red) of planned events that require a shutdown.
      */
-    public static final String SHUTDOWN_COLOR = "#C0392B";
+    public static final String SHUTDOWN_COLOR = "#F7968E";
 
     /**
      * Tooltip line of a position: {0} product number, {1} product name.
@@ -208,12 +219,28 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
 
     private static final String L_DIVISION_ID = "divisionId";
 
+    private static final String L_SCHEDULE_START_TIME = "scheduleStartTime";
+
+    private static final String L_WINDOW_START = "windowStart";
+
+    private static final String L_WINDOW_END = "windowEnd";
+
     /**
-     * Id and state of one production line schedule, by id.
+     * Id, state and start time of one production line schedule, by id.
      */
     static final String SCHEDULE_STATE_QUERY = "select s.id as " + L_SCHEDULE_IDENTIFIER + ", s."
-            + ProductionLineScheduleFields.STATE + " as " + L_STATE + " from #orders_productionLineSchedule s where s.id = :"
-            + L_SCHEDULE_ID;
+            + ProductionLineScheduleFields.STATE + " as " + L_STATE + ", s." + ProductionLineScheduleFields.START_TIME + " as "
+            + L_SCHEDULE_START_TIME + " from #orders_productionLineSchedule s where s.id = :" + L_SCHEDULE_ID;
+
+    /**
+     * Earliest start time and latest end time of the positions of one schedule that have a production line; one row whose
+     * two values are null when the schedule has no such position.
+     */
+    static final String SCHEDULE_WINDOW_QUERY = "select min(p." + ProductionLineSchedulePositionFields.START_TIME + ") as "
+            + L_WINDOW_START + ", max(p." + ProductionLineSchedulePositionFields.END_TIME + ") as " + L_WINDOW_END
+            + " from #orders_productionLineSchedulePosition p where p."
+            + ProductionLineSchedulePositionFields.PRODUCTION_LINE_SCHEDULE + ".id = :" + L_SCHEDULE_ID + " and p."
+            + ProductionLineSchedulePositionFields.PRODUCTION_LINE + " is not null";
 
     /**
      * Ids and numbers of the production lines with {@code production = true} and {@code active = true}.
@@ -293,6 +320,12 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
     /**
      * Returns the board rows, keyed by production line number in natural order, each holding the positions and planned
      * events placed on that production line.
+     * <p>
+     * When {@link GanttChartScale#getIsDatesSet()} returns {@code true}, the scale is first fitted to the schedule as
+     * {@link #fitScale(GanttChartScale, Long, Entity)} describes, and the items are those overlapping the fitted days from
+     * the start of the first day to 23:59:59 of the last day. Otherwise, and when the fit leaves the scale unchanged, the
+     * items are those overlapping {@code [scale.getDateFrom(), scale.getDateTo())}. A context naming no existing schedule
+     * leaves the scale unchanged.
      *
      * @param scale
      *            the scale whose date range bounds the items and which creates them
@@ -323,9 +356,19 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
 
         boolean draft = ScheduleStateStringValues.DRAFT.equals(schedule.getStringField(L_STATE));
 
+        ItemWindow window = null;
+
+        if (Boolean.TRUE.equals(scale.getIsDatesSet())) {
+            window = fitScale(scale, scheduleId, schedule);
+        }
+
+        if (window == null) {
+            window = new ItemWindow(scale.getDateFrom(), scale.getDateTo());
+        }
+
         addProductionLineRows(items);
-        addPositionItems(items, scale, scheduleId, draft, locale);
-        addPlannedEventItems(items, scale, locale);
+        addPositionItems(items, scale, window, scheduleId, draft, locale);
+        addPlannedEventItems(items, scale, window, locale);
 
         return items;
     }
@@ -479,16 +522,18 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
     }
 
     /**
-     * Returns the schedule id of the context, or null when the context is null or its id is missing, blank or not a number;
-     * a malformed id is logged through {@link #toLogValue(String)}.
+     * Returns the schedule id a component context value holds: null when the value is null or blank; otherwise the value
+     * without leading and trailing whitespace read as a {@code long}, or null when it is not one, in which case the value is
+     * logged as a warning through {@link #toLogValue(String)}.
+     * <p>
+     * For example {@code " 12 "} gives {@code 12}, and {@code "12a"} gives null and logs
+     * {@code Invalid production line schedule id in Gantt context: "12a"}.
+     *
+     * @param scheduleId
+     *            the text of the {@link #CONTEXT_SCHEDULE_ID} context value, may be null
+     * @return the schedule id, or null when the value holds none
      */
-    private Long getScheduleId(final JSONObject context) {
-        if (context == null) {
-            return null;
-        }
-
-        String scheduleId = context.optString(CONTEXT_SCHEDULE_ID);
-
+    public Long parseScheduleId(final String scheduleId) {
         if (StringUtils.isBlank(scheduleId)) {
             return null;
         }
@@ -502,6 +547,103 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
         }
     }
 
+    /**
+     * Returns the schedule id of the context through {@link #parseScheduleId(String)}, or null when the context is null.
+     */
+    private Long getScheduleId(final JSONObject context) {
+        if (context == null) {
+            return null;
+        }
+
+        return parseScheduleId(context.optString(CONTEXT_SCHEDULE_ID));
+    }
+
+    /**
+     * Fits the scale to the schedule and returns the item window of the fitted days, or returns null and leaves the scale
+     * unchanged when the schedule has neither a position on a production line nor a start time.
+     * <p>
+     * The first day is the day of the earliest start of the schedule's positions that have a production line, or the day
+     * of the schedule's start time when there is no such position. The last day is the first day plus the number of days
+     * from the day of the incoming scale start to the day of the incoming scale end, at least zero; it moves to the day of
+     * the latest end of those positions when that day is later, and back to the day before the first day plus the maximum
+     * range in months of the scale's zoom level when it is later than that day. A scale that is no
+     * {@link GanttChartScaleImpl} is capped at the smallest maximum range of the {@link GanttChartScaleImpl.ZoomLevel}
+     * values.
+     * <p>
+     * For example positions from 2026-10-06 06:00 to 2026-10-06 13:30 and an incoming scale from 2026-09-27 to 2026-10-18
+     * give a scale from 2026-10-06 to 2026-10-27 and the item window 2026-10-06 00:00:00 to 2026-10-27 23:59:59.
+     *
+     * @param scale
+     *            the scale to fit
+     * @param scheduleId
+     *            the id of the schedule
+     * @param schedule
+     *            the {@link #SCHEDULE_STATE_QUERY} row of the schedule
+     * @return the item window from the start of the first day to 23:59:59 of the last day, or null when the scale is not
+     *         fitted
+     */
+    private ItemWindow fitScale(final GanttChartScale scale, final Long scheduleId, final Entity schedule) {
+        Entity scheduleWindow = getPositionDD().find(SCHEDULE_WINDOW_QUERY).setLong(L_SCHEDULE_ID, scheduleId).uniqueResult();
+
+        Date windowStart = null;
+        Date windowEnd = null;
+
+        if (scheduleWindow != null) {
+            windowStart = scheduleWindow.getDateField(L_WINDOW_START);
+            windowEnd = scheduleWindow.getDateField(L_WINDOW_END);
+        }
+
+        Date anchor = windowStart;
+
+        if (anchor == null) {
+            anchor = schedule.getDateField(L_SCHEDULE_START_TIME);
+        }
+
+        if (anchor == null) {
+            return null;
+        }
+
+        LocalDate firstDay = new LocalDate(anchor);
+        int span = Math.max(0, Days.daysBetween(new LocalDate(scale.getDateFrom()), new LocalDate(scale.getDateTo()))
+                .getDays());
+        LocalDate lastDay = firstDay.plusDays(span);
+
+        if (windowEnd != null && new LocalDate(windowEnd).isAfter(lastDay)) {
+            lastDay = new LocalDate(windowEnd);
+        }
+
+        LocalDate maxLastDay = firstDay.plusMonths(getMaxRangeInMonths(scale)).minusDays(1);
+
+        if (lastDay.isAfter(maxLastDay)) {
+            lastDay = maxLastDay;
+        }
+
+        Date firstDayStart = firstDay.toDateTimeAtStartOfDay().toDate();
+
+        scale.setDateFrom(firstDayStart);
+        scale.setDateTo(lastDay.toDateTimeAtStartOfDay().toDate());
+
+        return new ItemWindow(firstDayStart, lastDay.toDateTime(new LocalTime(23, 59, 59)).toDate());
+    }
+
+    /**
+     * Returns the maximum range in months of the scale's zoom level, or the smallest maximum range of the
+     * {@link GanttChartScaleImpl.ZoomLevel} values when the scale is no {@link GanttChartScaleImpl}.
+     */
+    private static int getMaxRangeInMonths(final GanttChartScale scale) {
+        if (scale instanceof GanttChartScaleImpl) {
+            return ((GanttChartScaleImpl) scale).getMaxRangeInMonths();
+        }
+
+        int maxRangeInMonths = Integer.MAX_VALUE;
+
+        for (GanttChartScaleImpl.ZoomLevel zoomLevel : GanttChartScaleImpl.ZoomLevel.values()) {
+            maxRangeInMonths = Math.min(maxRangeInMonths, zoomLevel.getMaxRangeInMonths());
+        }
+
+        return maxRangeInMonths;
+    }
+
     private void addProductionLineRows(final Map<String, List<GanttChartItem>> items) {
         List<Entity> productionLines = getProductionLineDD().find(PRODUCTION_LINE_ROWS_QUERY).setBoolean(L_PRODUCTION, true)
                 .setBoolean(L_ACTIVE, true).list().getEntities();
@@ -512,9 +654,9 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
     }
 
     private void addPositionItems(final Map<String, List<GanttChartItem>> items, final GanttChartScale scale,
-            final Long scheduleId, final boolean draft, final Locale locale) {
+            final ItemWindow window, final Long scheduleId, final boolean draft, final Locale locale) {
         List<Entity> positions = getPositionDD().find(POSITIONS_QUERY).setLong(L_SCHEDULE_ID, scheduleId)
-                .setTimestamp(L_DATE_FROM, scale.getDateFrom()).setTimestamp(L_DATE_TO, scale.getDateTo()).list()
+                .setTimestamp(L_DATE_FROM, window.getDateFrom()).setTimestamp(L_DATE_TO, window.getDateTo()).list()
                 .getEntities();
 
         for (Entity position : positions) {
@@ -539,9 +681,9 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
     }
 
     private void addPlannedEventItems(final Map<String, List<GanttChartItem>> items, final GanttChartScale scale,
-            final Locale locale) {
-        List<Entity> events = getPlannedEventDD().find(BOARD_EVENTS_QUERY).setTimestamp(L_DATE_FROM, scale.getDateFrom())
-                .setTimestamp(L_DATE_TO, scale.getDateTo()).list().getEntities();
+            final ItemWindow window, final Locale locale) {
+        List<Entity> events = getPlannedEventDD().find(BOARD_EVENTS_QUERY).setTimestamp(L_DATE_FROM, window.getDateFrom())
+                .setTimestamp(L_DATE_TO, window.getDateTo()).list().getEntities();
 
         for (PlacedEvent placedEvent : placeEvents(events)) {
             Entity event = placedEvent.getEvent();
@@ -847,6 +989,31 @@ public class ProductionMaintenanceGanttChartItemResolver implements GanttChartIt
 
         private String getNumber() {
             return number;
+        }
+
+    }
+
+    /**
+     * Date range whose overlapping positions and planned events become board items: from {@code dateFrom} to
+     * {@code dateTo}.
+     */
+    private static final class ItemWindow {
+
+        private final Date dateFrom;
+
+        private final Date dateTo;
+
+        private ItemWindow(final Date dateFrom, final Date dateTo) {
+            this.dateFrom = dateFrom;
+            this.dateTo = dateTo;
+        }
+
+        private Date getDateFrom() {
+            return dateFrom;
+        }
+
+        private Date getDateTo() {
+            return dateTo;
         }
 
     }

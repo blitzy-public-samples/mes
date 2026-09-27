@@ -27,6 +27,7 @@ import static com.qcadoo.testing.model.EntityTestUtils.mockEntity;
 import static com.qcadoo.testing.model.EntityTestUtils.stubBelongsToField;
 import static com.qcadoo.testing.model.EntityTestUtils.stubDateField;
 import static com.qcadoo.testing.model.EntityTestUtils.stubStringField;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -37,12 +38,12 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.willAnswer;
+import static org.mockito.BDDMockito.willThrow;
 import static org.mockito.Matchers.any;
 import static org.mockito.Matchers.anyString;
 import static org.mockito.Matchers.argThat;
 import static org.mockito.Matchers.eq;
 import static org.mockito.Matchers.same;
-import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -53,6 +54,7 @@ import static org.mockito.Mockito.verifyZeroInteractions;
 import static org.springframework.test.util.ReflectionTestUtils.setField;
 
 import java.lang.reflect.Field;
+import java.sql.SQLException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -61,13 +63,20 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
-import org.hibernate.criterion.Criterion;
-import org.hibernate.criterion.InExpression;
+import org.apache.log4j.AppenderSkeleton;
+import org.apache.log4j.Level;
+import org.apache.log4j.Logger;
+import org.apache.log4j.spi.LoggingEvent;
+import org.hibernate.HibernateException;
+import org.hibernate.SessionFactory;
+import org.hibernate.classic.Session;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -79,7 +88,7 @@ import org.mockito.Mockito;
 import org.mockito.MockitoAnnotations;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
-import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.dao.CannotSerializeTransactionException;
 
 import com.qcadoo.mes.orders.ProductionLineScheduleService;
 import com.qcadoo.mes.orders.ProductionLineScheduleServicePPSExecutorService;
@@ -90,6 +99,7 @@ import com.qcadoo.mes.orders.constants.OrdersConstants;
 import com.qcadoo.mes.orders.constants.ProductionLineScheduleFields;
 import com.qcadoo.mes.orders.constants.ProductionLineSchedulePositionFields;
 import com.qcadoo.mes.orders.listeners.ProductionLinePositionNewData;
+import com.qcadoo.mes.productionLines.constants.ProductionLineFields;
 import com.qcadoo.mes.technologies.constants.TechnologiesConstants;
 import com.qcadoo.model.api.DataDefinition;
 import com.qcadoo.model.api.DataDefinitionService;
@@ -99,6 +109,7 @@ import com.qcadoo.model.api.search.SearchCriteriaBuilder;
 import com.qcadoo.model.api.search.SearchCriterion;
 import com.qcadoo.model.api.search.SearchOrder;
 import com.qcadoo.model.api.search.SearchOrders;
+import com.qcadoo.model.api.search.SearchQueryBuilder;
 import com.qcadoo.model.api.search.SearchRestrictions;
 import com.qcadoo.model.api.search.SearchResult;
 import com.qcadoo.model.internal.api.DataAccessService;
@@ -115,6 +126,19 @@ import com.qcadoo.model.internal.api.DataAccessService;
  * the entity's id: belongs-to criteria built from distinct entities with one id are equal, and a belongs-to criterion selects
  * the rows whose field holds an entity with that id.
  * <p>
+ * The order data definition answers {@code find(String)} only for
+ * {@link ProductionMaintenanceGanttRecomputeService#ORDER_TECHNOLOGY_IDS_QUERY}, with a query builder that accepts one
+ * {@code setParameterList("orderIds", list)} followed by {@code list()}. That {@code list()} records the bound ids as a
+ * projection query and a projection event, and answers one projection row for each distinct order of the position table, in
+ * table order, whose id is bound: its {@code orderId} is the order's id and its {@code technologyId} the id of the order's
+ * technology reference, or {@code null} for an order without one. {@code omitProjectionRow} leaves an order's row out and
+ * {@code nullProjectionTechnologyId} answers it with a {@code null} technology id. A projection row answers only those two
+ * long fields. Criteria {@code find()} on the order data definition, any other query text, parameter or query builder method,
+ * a second binding, {@code list()} before the binding, and every request for the technology data definition fail the test.
+ * <p>
+ * The mocked {@link SessionFactory} answers {@code getCurrentSession()} with the mocked {@link Session}, whose
+ * {@code flush()} and {@code clear()} each record an event of their own.
+ * <p>
  * The {@link ProductionLineScheduleService} answers run one recompute step per position and read the chain caches the way
  * the real service does: {@code getFinishDate} answers the line's cached finish date or the schedule start;
  * {@code getFinishDateWithChildren} answers the position's children end time from {@code childrenEndTimes} when it is
@@ -126,17 +150,27 @@ import com.qcadoo.model.internal.api.DataAccessService;
  * order and a copy of the finish cache it received and records the date it answered in it; the
  * {@code getFinishDateWithChildren} and {@code getPreviousOrder} answers record what they received and answered in the step.
  * <p>
- * Both executor services answer {@code createProductionLinePositionNewData} by recording their executor and the finish date
- * and previous order they received in the step, recording every call as a create event and, while
- * {@code executorProducesData} is set, putting new data only into the map they received: a start
+ * Both executor services answer {@code createProductionLinePositionNewData} by requiring the technology they receive to be
+ * the technology reference of the order {@code getFinishDate} received, recording their executor and the finish date and
+ * previous order they received in the step, recording every call as a create event and, while
+ * {@code executorProducesData} is set and the position they received is not in {@code positionsWithoutExecutorData},
+ * putting new data only into the map they received: a start
  * {@value #CHANGEOVER_MINUTES} minutes after the finish date and an end {@value #DURATION_MINUTES} minutes after that start,
  * under the id of the line they received or of {@code executorDataLine}. Their first call of a test adds the rows created by
  * {@code positionInsertedAtFirstCreate} to the position table. Both answer {@code savePosition} by requiring the position's
- * step to have run on the same executor and recording a save event.
+ * step to have run on the same executor and recording a save event. Failure tests replace one of these answers, or one
+ * {@link ProductionLineScheduleService} answer, for one position with a thrown exception.
  * <p>
- * Row A is production line {@value #LINE_A_ID_VALUE} and row B is production line {@value #LINE_B_ID_VALUE}. All times are
- * on {@value #DAY}; the schedule starts at {@value #SCHEDULE_START}. Positions belong to the fixture schedule unless a test
- * places them in another schedule.
+ * Row A is production line {@value #LINE_A_ID_VALUE} numbered {@value #LINE_A_NUMBER} and row B is production line
+ * {@value #LINE_B_ID_VALUE} numbered {@value #LINE_B_NUMBER}; every order reference is numbered
+ * {@value #ORDER_NUMBER_PREFIX} followed by its id unless a test numbers it otherwise. All times are on {@value #DAY}; the
+ * schedule starts at {@value #SCHEDULE_START}. Positions belong to the fixture schedule unless a test places them in another
+ * schedule.
+ * <p>
+ * The log4j logger of the recompute service is set to the debug level, without additivity, with an appender recording its
+ * events, and is restored after each test. Every rejection test asserts the rejection's three arguments and the single
+ * warning the service logs for it; every test of an exception the service propagates unchanged asserts that no warning was
+ * logged.
  */
 public class ProductionMaintenanceGanttRecomputeServiceTest {
 
@@ -153,6 +187,26 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
     private static final long LINE_A_ID_VALUE = 1L;
 
     private static final long LINE_B_ID_VALUE = 2L;
+
+    private static final String LINE_A_NUMBER = "A";
+
+    private static final String LINE_B_NUMBER = "B";
+
+    private static final String ORDER_NUMBER_PREFIX = "ORD-";
+
+    private static final String NO_ORDER_WARNING = "the position has no order";
+
+    private static final String ORDER_NOT_LOADED_WARNING = "the order technology projection returned no row for the "
+            + "position's order";
+
+    private static final String NO_TECHNOLOGY_WARNING = "the position's order has no technology";
+
+    private static final String NO_EXECUTOR_DATA_WARNING = "the executor produced no data for the production line";
+
+    private static final String SCHEDULING_FAILED_WARNING = "a scheduling service or executor call failed";
+
+    private static final String NO_SCHEDULE_START_WARNING_OF_TWO_CANDIDATES = "the production line schedule has no start "
+            + "time; 2 production line schedule positions cannot be recomputed";
 
     private static final Long SCHEDULE_ID = 7L;
 
@@ -172,13 +226,17 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
     private static final String SAVE_EVENT = "save";
 
-    private static final String ORDER_FIND_EVENT = "orderFind";
+    private static final String PROJECTION_EVENT = "projection";
 
-    private static final String TECHNOLOGY_FIND_EVENT = "technologyFind";
+    private static final String FLUSH_EVENT = "flush";
 
-    private static final String IN_PROPERTY_NAME_FIELD = "propertyName";
+    private static final String CLEAR_EVENT = "clear";
 
-    private static final String IN_VALUES_FIELD = "values";
+    private static final String PROJECTION_ORDER_ID = "orderId";
+
+    private static final String PROJECTION_TECHNOLOGY_ID = "technologyId";
+
+    private static final String PROJECTION_ORDER_IDS_PARAMETER = "orderIds";
 
     /**
      * Element a position query records for {@code createAlias(ORDER, ORDER, JoinType.INNER)}, the only alias the position
@@ -214,7 +272,10 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
     private DataDefinition orderDD;
 
     @Mock
-    private DataDefinition technologyDD;
+    private SessionFactory sessionFactory;
+
+    @Mock
+    private Session session;
 
     private DataAccessService previousDataAccessService;
 
@@ -223,6 +284,8 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
     private boolean executorProducesData;
 
     private Entity executorDataLine;
+
+    private final List<Entity> positionsWithoutExecutorData = new ArrayList<Entity>();
 
     private final List<Entity> positionTable = new ArrayList<Entity>();
 
@@ -241,18 +304,27 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
     private final List<String> events = new ArrayList<String>();
 
     /**
-     * Rows of the order load that replace, or with a {@code null} value remove, the row of their id.
+     * Order ids whose projection row the order technology ids query leaves out.
      */
-    private final Map<Long, Entity> loadedOrderOverrides = new HashMap<Long, Entity>();
+    private final Set<Long> omittedProjectionRows = new HashSet<Long>();
 
     /**
-     * Rows of the technology load that replace, or with a {@code null} value remove, the row of their id.
+     * Order ids whose projection row the order technology ids query answers with a {@code null} technology id.
      */
-    private final Map<Long, Entity> loadedTechnologyOverrides = new HashMap<Long, Entity>();
+    private final Set<Long> projectionRowsWithoutTechnologyId = new HashSet<Long>();
 
-    private final List<List<Long>> orderQueries = new ArrayList<List<Long>>();
+    /**
+     * Order ids bound by each order technology ids query, in binding order.
+     */
+    private final List<List<Long>> projectionQueries = new ArrayList<List<Long>>();
 
-    private final List<List<Long>> technologyQueries = new ArrayList<List<Long>>();
+    private final RecordingAppender logAppender = new RecordingAppender();
+
+    private Logger recomputeServiceLogger;
+
+    private Level previousLogLevel;
+
+    private boolean previousLogAdditivity;
 
     @Before
     public void init() throws Exception {
@@ -264,6 +336,11 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
         setField(recomputeService, "productionLineScheduleService", productionLineScheduleService);
         setField(recomputeService, "productionLineScheduleServicePSExecutorService", psExecutor);
         setField(recomputeService, "productionLineScheduleServicePPSExecutorService", ppsExecutor);
+        setField(recomputeService, "sessionFactory", sessionFactory);
+
+        given(sessionFactory.getCurrentSession()).willReturn(session);
+        willAnswer(new EventAnswer(FLUSH_EVENT)).given(session).flush();
+        willAnswer(new EventAnswer(CLEAR_EVENT)).given(session).clear();
 
         given(dataAccessService.convertToDatabaseEntity(Matchers.any(Entity.class))).willAnswer(new DatabaseReferenceAnswer());
 
@@ -293,7 +370,9 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
                 any(ProductionLinePositionNewData.class));
 
         lineA = mockEntity(LINE_A_ID_VALUE);
+        stubStringField(lineA, ProductionLineFields.NUMBER, LINE_A_NUMBER);
         lineB = mockEntity(LINE_B_ID_VALUE);
+        stubStringField(lineB, ProductionLineFields.NUMBER, LINE_B_NUMBER);
 
         schedule = mockEntity(SCHEDULE_ID);
         stubDateField(schedule, ProductionLineScheduleFields.START_TIME, at(SCHEDULE_START));
@@ -301,11 +380,23 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
                 DurationOfOrderCalculatedOnBasis.TIME_CONSUMING_TECHNOLOGY.getStringValue());
 
         executorProducesData = true;
+
+        recomputeServiceLogger = Logger.getLogger(ProductionMaintenanceGanttRecomputeService.class);
+        previousLogLevel = recomputeServiceLogger.getLevel();
+        previousLogAdditivity = recomputeServiceLogger.getAdditivity();
+
+        recomputeServiceLogger.setLevel(Level.DEBUG);
+        recomputeServiceLogger.setAdditivity(false);
+        recomputeServiceLogger.addAppender(logAppender);
     }
 
     @After
     public void restoreSearchRestrictions() throws Exception {
         swapSearchRestrictionsDataAccessService(previousDataAccessService);
+
+        recomputeServiceLogger.removeAppender(logAppender);
+        recomputeServiceLogger.setLevel(previousLogLevel);
+        recomputeServiceLogger.setAdditivity(previousLogAdditivity);
     }
 
     @Test
@@ -681,7 +772,7 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
         // then: both candidate queries and the predecessor query run, and no scheduling service or executor is called
         assertEquals(3, positionQueries.size());
-        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor, sessionFactory, session);
         assertTrue(steps.isEmpty());
 
         assertUntouched(a1);
@@ -755,15 +846,16 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
             fail("MoveRejectedException expected");
         } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
-            // then
-            assertEquals(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, e.getMessageKey());
-            assertEquals(0, e.getArgs().length);
+            // then: the rejection names b2's order, row B and b2's start, and has no cause
+            assertRecomputeFailed(e, "ORD-53", LINE_B_NUMBER, "13:00");
+            assertNull(e.getCause());
         }
 
+        assertWarnings(warning(22L, LINE_B_ID_VALUE, 53L, NO_EXECUTOR_DATA_WARNING));
         assertEquals(PS, step(b2).executor);
         verify(b2, never()).setField(anyString(), any());
         verify(psExecutor, never()).savePosition(any(Entity.class), any(ProductionLinePositionNewData.class));
-        verifyZeroInteractions(ppsExecutor);
+        verifyZeroInteractions(ppsExecutor, sessionFactory, session);
     }
 
     @Test
@@ -781,18 +873,18 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
             fail("MoveRejectedException expected");
         } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
-            // then
-            assertEquals(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, e.getMessageKey());
-            assertEquals(0, e.getArgs().length);
+            // then: the rejection names b2's order, row B and b2's start
+            assertRecomputeFailed(e, "ORD-53", LINE_B_NUMBER, "13:00");
         }
 
+        assertWarnings(warning(22L, LINE_B_ID_VALUE, 53L, NO_EXECUTOR_DATA_WARNING));
         verify(psExecutor).createProductionLinePositionNewData(Matchers.<Map<Long, ProductionLinePositionNewData>> any(),
                 same(lineB), eq(at("12:00")), same(b2), any(Entity.class), any(Entity.class));
         assertEquals(1, steps.size());
         assertEquals(PS, step(b2).executor);
         verify(b2, never()).setField(anyString(), any());
         verify(psExecutor, never()).savePosition(any(Entity.class), any(ProductionLinePositionNewData.class));
-        verifyZeroInteractions(ppsExecutor);
+        verifyZeroInteractions(ppsExecutor, sessionFactory, session);
     }
 
     @Test
@@ -1036,12 +1128,14 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
             fail("MoveRejectedException expected");
         } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
-            // then
-            assertEquals(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, e.getMessageKey());
+            // then: the rejection names b2's order, row B and b2's start
+            assertRecomputeFailed(e, "ORD-53", LINE_B_NUMBER, "13:00");
         }
 
+        assertWarnings(warning(22L, LINE_B_ID_VALUE, 53L, NO_EXECUTOR_DATA_WARNING));
+
         verify(b2, never()).setField(anyString(), any());
-        verifyZeroInteractions(psExecutor, ppsExecutor);
+        verifyZeroInteractions(psExecutor, ppsExecutor, sessionFactory, session);
     }
 
     @Test
@@ -1056,12 +1150,15 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
             fail("MoveRejectedException expected");
         } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
-            // then
-            assertEquals(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, e.getMessageKey());
+            // then: the rejection names no order, b2's row B and b2's start
+            assertRecomputeFailed(e, "", LINE_B_NUMBER, "13:00");
         }
 
+        assertWarnings(warning(22L, LINE_B_ID_VALUE, null, NO_ORDER_WARNING));
+
         verify(b2, never()).setField(anyString(), any());
-        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor, orderDD, sessionFactory, session);
+        assertTrue(projectionQueries.isEmpty());
     }
 
     @Test
@@ -1079,14 +1176,16 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
             fail("MoveRejectedException expected");
         } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
-            // then
-            assertEquals(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, e.getMessageKey());
-            assertEquals(0, e.getArgs().length);
+            // then: the rejection names a2, the first candidate of the origin chain, with its order, row A and start
+            assertRecomputeFailed(e, "ORD-52", LINE_A_NUMBER, "11:00");
         }
+
+        // then: one warning names a2 and the number of candidates
+        assertWarnings(warning(12L, LINE_A_ID_VALUE, 52L, NO_SCHEDULE_START_WARNING_OF_TWO_CANDIDATES));
 
         // then: the position queries ran; no scheduling service or executor was called and no candidate was changed
         assertEquals(3, positionQueries.size());
-        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor, sessionFactory, session);
         assertTrue(steps.isEmpty());
         verify(a2, never()).setField(anyString(), any());
         verify(b2, never()).setField(anyString(), any());
@@ -1111,14 +1210,16 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
             fail("MoveRejectedException expected");
         } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
-            // then
-            assertEquals(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, e.getMessageKey());
-            assertEquals(0, e.getArgs().length);
+            // then: the rejection names p, the first candidate of the chain, with its order, row A and start
+            assertRecomputeFailed(e, "ORD-52", LINE_A_NUMBER, "10:00");
         }
+
+        // then: one warning names p and the number of candidates
+        assertWarnings(warning(12L, LINE_A_ID_VALUE, 52L, NO_SCHEDULE_START_WARNING_OF_TWO_CANDIDATES));
 
         // then: the position queries ran; no scheduling service or executor was called and no candidate was changed
         assertEquals(2, positionQueries.size());
-        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor, sessionFactory, session);
         assertTrue(steps.isEmpty());
         verify(p, never()).setField(anyString(), any());
         verify(q, never()).setField(anyString(), any());
@@ -1142,7 +1243,7 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
         // executor was called
         assertEquals(3, positionQueries.size());
         verify(schedule, never()).getDateField(ProductionLineScheduleFields.START_TIME);
-        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor, sessionFactory, session);
         assertTrue(steps.isEmpty());
 
         assertUntouched(a1);
@@ -1167,7 +1268,8 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
             assertNotNull(e.getMessage());
         }
 
-        verifyZeroInteractions(dataDefinitionService, positionDD, productionLineScheduleService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(dataDefinitionService, positionDD, productionLineScheduleService, psExecutor, ppsExecutor,
+                sessionFactory);
     }
 
     @Test
@@ -1185,7 +1287,8 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
             assertNotNull(e.getMessage());
         }
 
-        verifyZeroInteractions(dataDefinitionService, positionDD, productionLineScheduleService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(dataDefinitionService, positionDD, productionLineScheduleService, psExecutor, ppsExecutor,
+                sessionFactory);
     }
 
     @Test
@@ -1202,7 +1305,8 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
             assertNotNull(e.getMessage());
         }
 
-        verifyZeroInteractions(dataDefinitionService, positionDD, productionLineScheduleService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(dataDefinitionService, positionDD, productionLineScheduleService, psExecutor, ppsExecutor,
+                sessionFactory);
     }
 
     @Test
@@ -1220,7 +1324,8 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
             assertNotNull(e.getMessage());
         }
 
-        verifyZeroInteractions(dataDefinitionService, positionDD, productionLineScheduleService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(dataDefinitionService, positionDD, productionLineScheduleService, psExecutor, ppsExecutor,
+                sessionFactory);
     }
 
     @Test
@@ -1238,7 +1343,8 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
             assertNotNull(e.getMessage());
         }
 
-        verifyZeroInteractions(dataDefinitionService, positionDD, productionLineScheduleService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(dataDefinitionService, positionDD, productionLineScheduleService, psExecutor, ppsExecutor,
+                sessionFactory);
     }
 
     @Test
@@ -1256,13 +1362,14 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
             assertNotNull(e.getMessage());
         }
 
-        verifyZeroInteractions(dataDefinitionService, positionDD, productionLineScheduleService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(dataDefinitionService, positionDD, productionLineScheduleService, psExecutor, ppsExecutor,
+                sessionFactory);
     }
 
     @Test
     public final void shouldRejectBeforeAnyExecutorCallForCandidateOrderWithoutTechnology() {
         // given: time consuming technology schedule; m moves from A 09:00 to B 11:00-12:00; A holds a2 11:00; B holds b2 13:00
-        // whose order has no technology
+        // whose order has no technology, so the projection answers its row without a technology id
         Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
         Entity a2 = position(12L, lineA, order(52L), "11:00", "12:00");
         Entity b2 = position(22L, lineB, order(53L, null), "13:00", "14:00");
@@ -1273,21 +1380,24 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
             fail("MoveRejectedException expected");
         } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
-            // then
-            assertEquals(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, e.getMessageKey());
+            // then: the rejection names b2's order, row B and b2's start
+            assertRecomputeFailed(e, "ORD-53", LINE_B_NUMBER, "13:00");
         }
 
-        assertEquals(Collections.singletonList(Arrays.asList(52L, 53L)), orderQueries);
-        verify(technologyDD, never()).find();
+        assertWarnings(warning(22L, LINE_B_ID_VALUE, 53L, NO_TECHNOLOGY_WARNING));
+
+        // then: one projection over a2's and b2's orders ran; no scheduling service, executor or session was used and no
+        // candidate was changed
+        assertEquals(Collections.singletonList(Arrays.asList(52L, 53L)), projectionQueries);
         verify(a2, never()).setField(anyString(), any());
         verify(b2, never()).setField(anyString(), any());
-        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor, sessionFactory, session);
     }
 
     @Test
     public final void shouldRejectBeforeAnyExecutorCallForCandidateOrderWithoutTechnologyOnPlanForShiftSchedule() {
         // given: plan for shift schedule; m moves on A from 08:00-09:00 to 11:00-12:00; A holds p 10:00 and q 13:00 whose
-        // order has no technology
+        // order has no technology, so the projection answers its row without a technology id
         stubStringField(schedule, ProductionLineScheduleFields.DURATION_OF_ORDER_CALCULATED_ON_BASIS,
                 DurationOfOrderCalculatedOnBasis.PLAN_FOR_SHIFT.getStringValue());
 
@@ -1301,88 +1411,83 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
             fail("MoveRejectedException expected");
         } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
-            // then
-            assertEquals(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, e.getMessageKey());
+            // then: the rejection names q's order, row A and q's start
+            assertRecomputeFailed(e, "ORD-53", LINE_A_NUMBER, "13:00");
         }
 
-        assertEquals(Collections.singletonList(Arrays.asList(52L, 53L)), orderQueries);
-        verify(technologyDD, never()).find();
+        assertWarnings(warning(13L, LINE_A_ID_VALUE, 53L, NO_TECHNOLOGY_WARNING));
+
+        // then: one projection over p's and q's orders ran; no scheduling service, executor or session was used and no
+        // candidate was changed
+        assertEquals(Collections.singletonList(Arrays.asList(52L, 53L)), projectionQueries);
         verify(p, never()).setField(anyString(), any());
         verify(q, never()).setField(anyString(), any());
-        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor, sessionFactory, session);
     }
 
     @Test
-    public final void shouldLoadCandidateOrdersAndTechnologiesWithOneQueryEachBeforeFirstExecutorCall() {
+    public final void shouldCheckCandidateOrderTechnologiesWithOneProjectionBeforeFirstExecutorCall() {
         // given: m moves from A 09:00 to B 11:00-12:00; A holds a1 07:00-08:00, a2 10:00 and a3 12:00; B holds b2 13:00 and
-        // b3 15:00, whose order is a3's order under another reference; the order load returns other instances of the
-        // candidates' orders, each with its own technology, which the technology load returns
-        Entity a1Order = order(50L);
-        Entity a1 = position(11L, lineA, a1Order, "07:00", "08:00");
+        // b3 15:00, whose order is a3's order under another reference with a technology reference of its own; the positions
+        // enter the position table in the order m, b3, b2, a3, a2, a1
         Entity movedOrder = order(51L);
         Entity moved = position(MOVED_ID, lineB, movedOrder, "11:00", "12:00");
-        Entity a2OrderReference = order(52L);
-        Entity a2 = position(12L, lineA, a2OrderReference, "10:00", "11:00");
-        Entity a3OrderReference = order(53L);
-        Entity a3 = position(13L, lineA, a3OrderReference, "12:00", "13:00");
-        Entity b2OrderReference = order(54L);
-        Entity b2 = position(22L, lineB, b2OrderReference, "13:00", "14:00");
-        Entity b3OrderReference = order(53L);
+        Entity b3Technology = mockEntity(153L);
+        Entity b3OrderReference = order(53L, b3Technology);
         Entity b3 = position(23L, lineB, b3OrderReference, "15:00", "16:00");
-
-        Entity loadedTechnology52 = mockEntity(252L);
-        Entity loadedTechnology53 = mockEntity(253L);
-        Entity loadedTechnology54 = mockEntity(254L);
-        Entity loadedOrder52 = overrideLoadedOrder(52L, loadedTechnology52);
-        Entity loadedOrder53 = overrideLoadedOrder(53L, loadedTechnology53);
-        Entity loadedOrder54 = overrideLoadedOrder(54L, loadedTechnology54);
+        Entity b2Technology = mockEntity(154L);
+        Entity b2OrderReference = order(54L, b2Technology);
+        Entity b2 = position(22L, lineB, b2OrderReference, "13:00", "14:00");
+        Entity a3Technology = mockEntity(153L);
+        Entity a3OrderReference = order(53L, a3Technology);
+        Entity a3 = position(13L, lineA, a3OrderReference, "12:00", "13:00");
+        Entity a2Technology = mockEntity(152L);
+        Entity a2OrderReference = order(52L, a2Technology);
+        Entity a2 = position(12L, lineA, a2OrderReference, "10:00", "11:00");
+        Entity a1Order = order(50L);
+        Entity a1 = position(11L, lineA, a1Order, "07:00", "08:00");
 
         // when
         recompute(moved, lineA, "09:00", lineB, "11:00");
 
-        // then: one order query over the distinct candidate order ids and one technology query over the distinct technology
-        // ids of the loaded orders, both after the last position query and before the first executor call
-        verify(orderDD, times(1)).find();
-        verify(technologyDD, times(1)).find();
-        assertEquals(Collections.singletonList(Arrays.asList(52L, 53L, 54L)), orderQueries);
-        assertEquals(Collections.singletonList(Arrays.asList(252L, 253L, 254L)), technologyQueries);
+        // then: one order technology ids projection over the distinct candidate order ids in chain order, after the last
+        // position query and before the first executor call; no criteria query of orders ran and the technology data
+        // definition was not requested
+        verify(orderDD, times(1)).find(ProductionMaintenanceGanttRecomputeService.ORDER_TECHNOLOGY_IDS_QUERY);
+        verify(orderDD, never()).find();
+        verify(dataDefinitionService, never()).get(TechnologiesConstants.PLUGIN_IDENTIFIER,
+                TechnologiesConstants.MODEL_TECHNOLOGY);
+        assertEquals(Collections.singletonList(Arrays.asList(52L, 53L, 54L)), projectionQueries);
         assertEquals(3, positionQueries.size());
-        assertTrue(events.lastIndexOf(READ_EVENT) < events.indexOf(ORDER_FIND_EVENT));
-        assertTrue(events.indexOf(ORDER_FIND_EVENT) < events.indexOf(TECHNOLOGY_FIND_EVENT));
-        assertTrue(events.indexOf(TECHNOLOGY_FIND_EVENT) < events.indexOf(CREATE_EVENT));
+        assertEquals(1, Collections.frequency(events, PROJECTION_EVENT));
+        assertTrue(events.lastIndexOf(READ_EVENT) < events.indexOf(PROJECTION_EVENT));
+        assertTrue(events.indexOf(PROJECTION_EVENT) < events.indexOf(CREATE_EVENT));
 
-        // then: every candidate is recomputed with its loaded order and the loaded technology of that order
+        // then: every candidate is recomputed with its own order reference and that reference's technology reference
         InOrder inOrder = inOrder(a2, a3, b2, b3, psExecutor);
         verifyRecomputedAndSaved(inOrder, a2, "08:15", "09:15");
         verifyRecomputedAndSaved(inOrder, a3, "09:30", "10:30");
         verifyRecomputedAndSaved(inOrder, b2, "12:15", "13:15");
         verifyRecomputedAndSaved(inOrder, b3, "13:30", "14:30");
 
-        assertSame(loadedOrder52, step(a2).order);
-        assertSame(loadedOrder53, step(a3).order);
-        assertSame(loadedOrder54, step(b2).order);
-        assertSame(loadedOrder53, step(b3).order);
+        assertSame(a2OrderReference, step(a2).order);
+        assertSame(a3OrderReference, step(a3).order);
+        assertSame(b2OrderReference, step(b2).order);
+        assertSame(b3OrderReference, step(b3).order);
 
         assertChainedFrom(a2, lineA, "08:00", a1Order);
-        assertChainedFrom(a3, lineA, "09:15", loadedOrder52);
+        assertChainedFrom(a3, lineA, "09:15", a2OrderReference);
         assertChainedFrom(b2, lineB, "12:00", movedOrder);
-        assertChainedFrom(b3, lineB, "13:15", loadedOrder54);
+        assertChainedFrom(b3, lineB, "13:15", b2OrderReference);
 
         verify(psExecutor).createProductionLinePositionNewData(Matchers.<Map<Long, ProductionLinePositionNewData>> any(),
-                same(lineA), eq(at("08:00")), same(a2), same(loadedTechnology52), same(a1Order));
+                same(lineA), eq(at("08:00")), same(a2), same(a2Technology), same(a1Order));
         verify(psExecutor).createProductionLinePositionNewData(Matchers.<Map<Long, ProductionLinePositionNewData>> any(),
-                same(lineA), eq(at("09:15")), same(a3), same(loadedTechnology53), same(loadedOrder52));
+                same(lineA), eq(at("09:15")), same(a3), same(a3Technology), same(a2OrderReference));
         verify(psExecutor).createProductionLinePositionNewData(Matchers.<Map<Long, ProductionLinePositionNewData>> any(),
-                same(lineB), eq(at("12:00")), same(b2), same(loadedTechnology54), same(movedOrder));
+                same(lineB), eq(at("12:00")), same(b2), same(b2Technology), same(movedOrder));
         verify(psExecutor).createProductionLinePositionNewData(Matchers.<Map<Long, ProductionLinePositionNewData>> any(),
-                same(lineB), eq(at("13:15")), same(b3), same(loadedTechnology53), same(loadedOrder54));
-
-        // then: the candidates' own order references serve only for their ids
-        verify(a2OrderReference, atLeastOnce()).getId();
-        verify(a3OrderReference, atLeastOnce()).getId();
-        verify(b2OrderReference, atLeastOnce()).getId();
-        verify(b3OrderReference, atLeastOnce()).getId();
-        verifyNoMoreInteractions(a2OrderReference, a3OrderReference, b2OrderReference, b3OrderReference);
+                same(lineB), eq(at("13:15")), same(b3), same(b3Technology), same(b2OrderReference));
 
         assertUntouched(a1);
         assertUntouched(moved);
@@ -1390,7 +1495,7 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
     }
 
     @Test
-    public final void shouldNotLoadOrdersOrTechnologiesWithoutCandidates() {
+    public final void shouldRunNoProjectionAndLeaveSessionUntouchedWithoutCandidates() {
         // given: m moves from A 09:00 to B 11:00-12:00; A holds only a1 07:00 and B only b1 08:00, both at or before their
         // row's affected start
         Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
@@ -1400,14 +1505,15 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
         // when
         recompute(moved, lineA, "09:00", lineB, "11:00");
 
-        // then: the position queries ran; neither the order nor the technology data definition was used
+        // then: the position queries ran; neither the order nor the technology data definition was requested, no projection
+        // ran and the session was not used
         assertEquals(3, positionQueries.size());
         verify(dataDefinitionService, never()).get(OrdersConstants.PLUGIN_IDENTIFIER, OrdersConstants.MODEL_ORDER);
         verify(dataDefinitionService, never()).get(TechnologiesConstants.PLUGIN_IDENTIFIER,
                 TechnologiesConstants.MODEL_TECHNOLOGY);
-        verifyZeroInteractions(orderDD, technologyDD, productionLineScheduleService, psExecutor, ppsExecutor);
-        assertTrue(orderQueries.isEmpty());
-        assertTrue(technologyQueries.isEmpty());
+        verifyZeroInteractions(orderDD, sessionFactory, session, productionLineScheduleService, psExecutor, ppsExecutor);
+        assertTrue(projectionQueries.isEmpty());
+        assertFalse(events.contains(PROJECTION_EVENT));
         assertTrue(steps.isEmpty());
 
         assertUntouched(a1);
@@ -1416,12 +1522,15 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
     }
 
     @Test
-    public final void shouldRejectBeforeAnyExecutorCallWhenOrderLoadDoesNotReturnCandidateOrder() {
-        // given: m moves from A 09:00 to B 11:00-12:00; B holds b2 13:00 whose order the order load does not return
+    public final void shouldRejectBeforeAnyExecutorCallWhenProjectionReturnsNoRowForCandidateOrder() {
+        // given: m moves from A 09:00 to B 11:00-12:00; A holds a2 10:00; B holds b2 13:00, whose order the projection
+        // answers no row for
         Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
-        Entity b2 = position(22L, lineB, order(53L), "13:00", "14:00");
+        Entity a2 = position(12L, lineA, order(52L), "10:00", "11:00");
+        Entity b2OrderReference = order(53L);
+        Entity b2 = position(22L, lineB, b2OrderReference, "13:00", "14:00");
 
-        omitLoadedOrder(53L);
+        omitProjectionRow(53L);
 
         // when
         try {
@@ -1429,25 +1538,30 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
             fail("MoveRejectedException expected");
         } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
-            // then
-            assertEquals(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, e.getMessageKey());
+            // then: the rejection names no order, b2's row B and b2's start; b2's own order reference is not read
+            assertRecomputeFailed(e, "", LINE_B_NUMBER, "13:00");
         }
 
-        assertEquals(Collections.singletonList(Collections.singletonList(53L)), orderQueries);
-        verify(technologyDD, never()).find();
+        assertWarnings(warning(22L, LINE_B_ID_VALUE, 53L, ORDER_NOT_LOADED_WARNING));
+        verify(b2OrderReference, never()).getStringField(anyString());
+
+        // then: one projection over a2's and b2's orders ran; no scheduling service, executor or session was used and no
+        // candidate was changed
+        assertEquals(Collections.singletonList(Arrays.asList(52L, 53L)), projectionQueries);
+        verify(a2, never()).setField(anyString(), any());
         verify(b2, never()).setField(anyString(), any());
-        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor, sessionFactory, session);
     }
 
     @Test
-    public final void shouldRejectBeforeAnyExecutorCallWhenTechnologyLoadDoesNotReturnOrderTechnology() {
-        // given: m moves from A 09:00 to B 11:00-12:00; B holds b2 13:00 whose order's technology the technology load does
-        // not return
+    public final void shouldRejectBeforeAnyExecutorCallWhenProjectionRowOfOrderWithTechnologyReferenceHasNoTechnologyId() {
+        // given: m moves from A 09:00 to B 11:00-12:00; B holds b2 13:00, whose order has a technology reference, and the
+        // projection answers that order's row without a technology id
         Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
         Entity technology = mockEntity(81L);
         Entity b2 = position(22L, lineB, order(53L, technology), "13:00", "14:00");
 
-        omitLoadedTechnology(81L);
+        nullProjectionTechnologyId(53L);
 
         // when
         try {
@@ -1455,16 +1569,694 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
             fail("MoveRejectedException expected");
         } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
-            // then
-            assertEquals(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, e.getMessageKey());
+            // then: the rejection names b2's order, row B and b2's start
+            assertRecomputeFailed(e, "ORD-53", LINE_B_NUMBER, "13:00");
         }
 
-        assertEquals(Collections.singletonList(Collections.singletonList(53L)), orderQueries);
-        assertEquals(Collections.singletonList(Collections.singletonList(81L)), technologyQueries);
+        assertWarnings(warning(22L, LINE_B_ID_VALUE, 53L, NO_TECHNOLOGY_WARNING));
+
+        // then: one projection over b2's order ran; no scheduling service, executor or session was used and b2 was not
+        // changed
+        assertEquals(Collections.singletonList(Collections.singletonList(53L)), projectionQueries);
         verify(b2, never()).setField(anyString(), any());
-        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor);
+        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor, sessionFactory, session);
     }
 
+    @Test
+    public final void shouldSelectOrderAndTechnologyIdsOfBoundOrdersInOrderTechnologyIdsQuery() {
+        // then: the query selects each bound order's id and its technology's id, null through the left join for an order
+        // without a technology, under the aliases the projection rows are read by
+        assertEquals("select o.id as orderId, t.id as technologyId from #orders_order o left join o.technology t"
+                + " where o.id in (:orderIds)", ProductionMaintenanceGanttRecomputeService.ORDER_TECHNOLOGY_IDS_QUERY);
+    }
+
+    @Test
+    public final void shouldFlushAndClearSessionAfterEachSavedPositionOnCrossRowMove() {
+        // given: m moves from A 09:00 to B 11:00-12:00; A holds a1 07:00-08:00, a2 10:00 and a3 12:00; B holds b2 13:00
+        Entity a1Order = order(50L);
+        Entity a1 = position(11L, lineA, a1Order, "07:00", "08:00");
+        Entity movedOrder = order(51L);
+        Entity moved = position(MOVED_ID, lineB, movedOrder, "11:00", "12:00");
+        Entity a2Order = order(52L);
+        Entity a2 = position(12L, lineA, a2Order, "10:00", "11:00");
+        Entity a3 = position(13L, lineA, order(53L), "12:00", "13:00");
+        Entity b2 = position(22L, lineB, order(54L), "13:00", "14:00");
+
+        // when
+        recompute(moved, lineA, "09:00", lineB, "11:00");
+
+        // then: after the projection, each position is created and saved, then the session is flushed and cleared before the
+        // next position is created
+        assertEquals(Arrays.asList(PROJECTION_EVENT, CREATE_EVENT, SAVE_EVENT, FLUSH_EVENT, CLEAR_EVENT, CREATE_EVENT,
+                SAVE_EVENT, FLUSH_EVENT, CLEAR_EVENT, CREATE_EVENT, SAVE_EVENT, FLUSH_EVENT, CLEAR_EVENT), eventsAfterLastRead());
+
+        InOrder inOrder = inOrder(psExecutor, session);
+        inOrder.verify(psExecutor).savePosition(same(a2), newData("08:15", "09:15"));
+        inOrder.verify(session).flush();
+        inOrder.verify(session).clear();
+        inOrder.verify(psExecutor).createProductionLinePositionNewData(Matchers.<Map<Long, ProductionLinePositionNewData>> any(),
+                same(lineA), eq(at("09:15")), same(a3), any(Entity.class), same(a2Order));
+        inOrder.verify(psExecutor).savePosition(same(a3), newData("09:30", "10:30"));
+        inOrder.verify(session).flush();
+        inOrder.verify(session).clear();
+        inOrder.verify(psExecutor).createProductionLinePositionNewData(Matchers.<Map<Long, ProductionLinePositionNewData>> any(),
+                same(lineB), eq(at("12:00")), same(b2), any(Entity.class), same(movedOrder));
+        inOrder.verify(psExecutor).savePosition(same(b2), newData("12:15", "13:15"));
+        inOrder.verify(session).flush();
+        inOrder.verify(session).clear();
+
+        verifySessionFlushedAndCleared(3);
+        verifyEachSavedOnce(a2, a3, b2);
+
+        // then: the chains are those of an unflushed session: a2 from a1, a3 from a2, b2 from m
+        assertChainedFrom(a2, lineA, "08:00", a1Order);
+        assertChainedFrom(a3, lineA, "09:15", a2Order);
+        assertChainedFrom(b2, lineB, "12:00", movedOrder);
+
+        assertUntouched(a1);
+        assertUntouched(moved);
+        assertEquals(3, steps.size());
+    }
+
+    @Test
+    public final void shouldFlushAndClearSessionAfterEachSavedPositionOnSameRowMove() {
+        // given: m moves on A from 08:00-09:00 to 11:00-12:00; A holds a1 06:00-07:00, p 10:00 before the anchor, and q 13:00
+        // and r 15:00 after it; origin and destination are distinct entities of row A
+        Entity a1Order = order(52L);
+        Entity a1 = position(11L, lineA, a1Order, "06:00", "07:00");
+        Entity movedOrder = order(51L);
+        Entity moved = position(MOVED_ID, lineA, movedOrder, "11:00", "12:00");
+        Entity p = position(12L, lineA, order(53L), "10:00", "11:00");
+        Entity qOrder = order(54L);
+        Entity q = position(13L, lineA, qOrder, "13:00", "14:00");
+        Entity r = position(14L, lineA, order(55L), "15:00", "16:00");
+        Entity originLine = entityWithIdOf(lineA);
+        Entity destinationLine = entityWithIdOf(lineA);
+
+        // when
+        recompute(moved, originLine, "08:00", destinationLine, "11:00");
+
+        // then: after the projection, p is created and saved before the anchor, then q and r after it; each save is followed
+        // by a flush and a clear before the next position is created
+        assertEquals(Arrays.asList(PROJECTION_EVENT, CREATE_EVENT, SAVE_EVENT, FLUSH_EVENT, CLEAR_EVENT, CREATE_EVENT,
+                SAVE_EVENT, FLUSH_EVENT, CLEAR_EVENT, CREATE_EVENT, SAVE_EVENT, FLUSH_EVENT, CLEAR_EVENT), eventsAfterLastRead());
+
+        InOrder inOrder = inOrder(psExecutor, session);
+        inOrder.verify(psExecutor).savePosition(same(p), newData("07:15", "08:15"));
+        inOrder.verify(session).flush();
+        inOrder.verify(session).clear();
+        inOrder.verify(psExecutor).createProductionLinePositionNewData(Matchers.<Map<Long, ProductionLinePositionNewData>> any(),
+                same(destinationLine), eq(at("12:00")), same(q), any(Entity.class), same(movedOrder));
+        inOrder.verify(psExecutor).savePosition(same(q), newData("12:15", "13:15"));
+        inOrder.verify(session).flush();
+        inOrder.verify(session).clear();
+        inOrder.verify(psExecutor).createProductionLinePositionNewData(Matchers.<Map<Long, ProductionLinePositionNewData>> any(),
+                same(destinationLine), eq(at("13:15")), same(r), any(Entity.class), same(qOrder));
+        inOrder.verify(psExecutor).savePosition(same(r), newData("13:30", "14:30"));
+        inOrder.verify(session).flush();
+        inOrder.verify(session).clear();
+
+        verifySessionFlushedAndCleared(3);
+        verifyEachSavedOnce(p, q, r);
+
+        // then: p is chained from a1, q from m, whose caches were seeded after the clear that followed p, and r from q
+        assertChainedFrom(p, destinationLine, "07:00", a1Order);
+        assertChainedFrom(q, destinationLine, "12:00", movedOrder);
+        assertChainedFrom(r, destinationLine, "13:15", qOrder);
+
+        assertUntouched(a1);
+        assertUntouched(moved);
+        assertEquals(3, steps.size());
+    }
+
+    @Test
+    public final void shouldFlushAndClearOnlyAfterPositionsSavedBeforeRejectedCandidate() {
+        // given: m moves from A 09:00 to B 11:00-12:00; A holds a2 10:00 and a3 12:00; B holds b2 13:00, for which the
+        // executor produces no data, and b3 15:00
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity a2 = position(12L, lineA, order(52L), "10:00", "11:00");
+        Entity a3 = position(13L, lineA, order(53L), "12:00", "13:00");
+        Entity b2 = position(22L, lineB, order(54L), "13:00", "14:00");
+        Entity b3 = position(23L, lineB, order(55L), "15:00", "16:00");
+
+        positionsWithoutExecutorData.add(b2);
+
+        // when
+        try {
+            recompute(moved, lineA, "09:00", lineB, "11:00");
+
+            fail("MoveRejectedException expected");
+        } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
+            // then: the rejection names b2's order, row B and b2's start, and has no cause
+            assertRecomputeFailed(e, "ORD-54", LINE_B_NUMBER, "13:00");
+            assertNull(e.getCause());
+        }
+
+        assertWarnings(warning(22L, LINE_B_ID_VALUE, 54L, NO_EXECUTOR_DATA_WARNING));
+
+        // then: a2 and a3, the two positions saved before b2, were each followed by one flush and one clear; b2 was created
+        // and then neither changed, saved, flushed nor cleared, and b3 was never created
+        assertEquals(Arrays.asList(PROJECTION_EVENT, CREATE_EVENT, SAVE_EVENT, FLUSH_EVENT, CLEAR_EVENT, CREATE_EVENT,
+                SAVE_EVENT, FLUSH_EVENT, CLEAR_EVENT, CREATE_EVENT), eventsAfterLastRead());
+
+        InOrder inOrder = inOrder(psExecutor, session);
+        inOrder.verify(psExecutor).savePosition(same(a3), any(ProductionLinePositionNewData.class));
+        inOrder.verify(session).flush();
+        inOrder.verify(session).clear();
+        inOrder.verify(psExecutor).createProductionLinePositionNewData(Matchers.<Map<Long, ProductionLinePositionNewData>> any(),
+                same(lineB), any(Date.class), same(b2), any(Entity.class), any(Entity.class));
+
+        verifySessionFlushedAndCleared(2);
+        verifyEachSavedOnce(a2, a3);
+        verify(b2, never()).setField(anyString(), any());
+        verify(psExecutor, never()).createProductionLinePositionNewData(Matchers.<Map<Long, ProductionLinePositionNewData>> any(),
+                any(Entity.class), any(Date.class), same(b3), any(Entity.class), any(Entity.class));
+        assertUntouched(b3);
+        assertUntouched(moved);
+        verifyZeroInteractions(ppsExecutor);
+        assertEquals(3, steps.size());
+    }
+
+    @Test
+    public final void shouldPropagateSessionFlushFailureUnchangedWithoutFurtherExecutorCall() {
+        // given: m moves from A 09:00 to B 11:00-12:00; A holds a2 10:00 and a3 12:00; B holds b2 13:00; flushing the session
+        // fails with a serialization failure
+        HibernateException flushFailure = new HibernateException("could not flush the session", new SQLException(
+                "could not serialize access due to read/write dependencies among transactions", "40001"));
+
+        willThrow(flushFailure).given(session).flush();
+
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity a2 = position(12L, lineA, order(52L), "10:00", "11:00");
+        Entity a3 = position(13L, lineA, order(53L), "12:00", "13:00");
+        Entity b2 = position(22L, lineB, order(54L), "13:00", "14:00");
+
+        // when
+        try {
+            recompute(moved, lineA, "09:00", lineB, "11:00");
+
+            fail("HibernateException expected");
+        } catch (RuntimeException e) {
+            // then: the flush failure itself leaves the recompute, and no warning is logged
+            assertSame(flushFailure, e);
+        }
+
+        assertWarnings();
+
+        // then: a2 was created and saved and the session flushed once, never cleared; neither a3 nor b2 was created
+        InOrder inOrder = inOrder(psExecutor, session);
+        inOrder.verify(psExecutor).createProductionLinePositionNewData(Matchers.<Map<Long, ProductionLinePositionNewData>> any(),
+                same(lineA), any(Date.class), same(a2), any(Entity.class), any(Entity.class));
+        inOrder.verify(psExecutor).savePosition(same(a2), newData("05:15", "06:15"));
+        inOrder.verify(session).flush();
+
+        verify(psExecutor, times(1)).createProductionLinePositionNewData(
+                Matchers.<Map<Long, ProductionLinePositionNewData>> any(), any(Entity.class), any(Date.class),
+                any(Entity.class), any(Entity.class), any(Entity.class));
+        verifyEachSavedOnce(a2);
+        verify(sessionFactory, times(1)).getCurrentSession();
+        verify(session, times(1)).flush();
+        verify(session, never()).clear();
+        verifyNoMoreInteractions(sessionFactory, session);
+        verifyZeroInteractions(ppsExecutor);
+
+        assertUntouched(a3);
+        assertUntouched(b2);
+        assertUntouched(moved);
+        assertEquals(1, steps.size());
+    }
+
+    @Test
+    public final void shouldPropagateNonConflictSessionFlushFailureUnchangedWithoutWarning() {
+        // given: m moves from A 09:00 to B 11:00-12:00; A holds a2 10:00; B holds b2 13:00; flushing the session fails with a
+        // unique violation, which is not a concurrency conflict
+        HibernateException flushFailure = new HibernateException("could not flush the session", new SQLException(
+                "duplicate key value violates unique constraint", "23505"));
+
+        willThrow(flushFailure).given(session).flush();
+
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity a2 = position(12L, lineA, order(52L), "10:00", "11:00");
+        Entity b2 = position(22L, lineB, order(54L), "13:00", "14:00");
+
+        // when
+        try {
+            recompute(moved, lineA, "09:00", lineB, "11:00");
+
+            fail("HibernateException expected");
+        } catch (RuntimeException e) {
+            // then: the flush failure itself leaves the recompute, not a rejection wrapping it
+            assertSame(flushFailure, e);
+        }
+
+        // then: the failure is no concurrency conflict, and no warning is logged
+        assertFalse(ProductionMaintenanceGanttMoveService.isConcurrencyConflict(flushFailure));
+        assertWarnings();
+
+        // then: a2 was created and saved and the session flushed once, never cleared; b2 was never created
+        assertEquals(Arrays.asList(PROJECTION_EVENT, CREATE_EVENT, SAVE_EVENT), eventsAfterLastRead());
+        verifyEachSavedOnce(a2);
+        verify(sessionFactory, times(1)).getCurrentSession();
+        verify(session, times(1)).flush();
+        verify(session, never()).clear();
+        verifyNoMoreInteractions(sessionFactory, session);
+        verifyZeroInteractions(ppsExecutor);
+
+        assertUntouched(b2);
+        assertUntouched(moved);
+        assertEquals(1, steps.size());
+    }
+
+    @Test
+    public final void shouldNameCandidateWithoutOrderAfterCandidatesWithOrders() {
+        // given: m moves from A 09:00 to B 11:00-12:00; A holds a2 11:00; B holds b2 13:00 and b3 14:00 without an order
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity a2 = position(12L, lineA, order(52L), "11:00", "12:00");
+        Entity b2 = position(22L, lineB, order(53L), "13:00", "14:00");
+        Entity b3 = position(23L, lineB, null, "14:00", "15:00");
+
+        // when
+        ProductionMaintenanceGanttMoveService.MoveRejectedException rejection = recomputeRejection(moved, lineA, "09:00",
+                lineB, "11:00");
+
+        // then: the rejection names no order, b3's row B and b3's start; no projection ran, the session was not used and
+        // nothing is recomputed
+        assertRecomputeFailed(rejection, "", LINE_B_NUMBER, "14:00");
+        assertNull(rejection.getCause());
+        assertWarnings(warning(23L, LINE_B_ID_VALUE, null, NO_ORDER_WARNING));
+        assertTrue(projectionQueries.isEmpty());
+        verifyZeroInteractions(orderDD, productionLineScheduleService, psExecutor, ppsExecutor, sessionFactory, session);
+        assertUntouched(a2);
+        assertUntouched(b2);
+        assertUntouched(b3);
+    }
+
+    @Test
+    public final void shouldNameFirstCandidateInChainOrderOfOrderWithoutProjectionRow() {
+        // given: m moves from A 09:00 to B 11:00-12:00; A holds a2 11:00 of order 53; B holds b2 13:00 of order 52 and b3
+        // 14:00 of order 53 under another reference; the projection answers no row for order 53
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity a2OrderReference = order(53L);
+        Entity a2 = position(12L, lineA, a2OrderReference, "11:00", "12:00");
+        Entity b2 = position(22L, lineB, order(52L), "13:00", "14:00");
+        Entity b3OrderReference = order(53L);
+        Entity b3 = position(23L, lineB, b3OrderReference, "14:00", "15:00");
+
+        omitProjectionRow(53L);
+
+        // when
+        ProductionMaintenanceGanttMoveService.MoveRejectedException rejection = recomputeRejection(moved, lineA, "09:00",
+                lineB, "11:00");
+
+        // then: the one projection ran over the distinct order ids in chain order; the rejection names no order, a2's row A
+        // and a2's start, and neither reference of order 53 is read for its number
+        assertEquals(Collections.singletonList(Arrays.asList(53L, 52L)), projectionQueries);
+        assertRecomputeFailed(rejection, "", LINE_A_NUMBER, "11:00");
+        assertNull(rejection.getCause());
+        assertWarnings(warning(12L, LINE_A_ID_VALUE, 53L, ORDER_NOT_LOADED_WARNING));
+        verify(a2OrderReference, never()).getStringField(anyString());
+        verify(b3OrderReference, never()).getStringField(anyString());
+        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor, sessionFactory, session);
+        assertUntouched(a2);
+        assertUntouched(b2);
+        assertUntouched(b3);
+    }
+
+    @Test
+    public final void shouldNameFirstCandidateOfOrderWithoutTechnologyIdWithItsOrderReferenceNumber() {
+        // given: m moves from A 09:00 to B 11:00-12:00; A holds a2 11:00 of order 52; B holds b2 13:00 and b3 14:00 of order
+        // 53 under two references numbered B2-REF-53 and B3-REF-53; the projection answers order 53's row without a
+        // technology id
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity a2 = position(12L, lineA, order(52L), "11:00", "12:00");
+        Entity b2OrderReference = order(53L);
+        Entity b2 = position(22L, lineB, b2OrderReference, "13:00", "14:00");
+        Entity b3OrderReference = order(53L);
+        Entity b3 = position(23L, lineB, b3OrderReference, "14:00", "15:00");
+
+        stubStringField(b2OrderReference, OrderFields.NUMBER, "B2-REF-53");
+        stubStringField(b3OrderReference, OrderFields.NUMBER, "B3-REF-53");
+        nullProjectionTechnologyId(53L);
+
+        // when
+        ProductionMaintenanceGanttMoveService.MoveRejectedException rejection = recomputeRejection(moved, lineA, "09:00",
+                lineB, "11:00");
+
+        // then: the rejection names the number of b2's own order reference, b2's row B and b2's start; b3's reference is not
+        // read for its number
+        assertRecomputeFailed(rejection, "B2-REF-53", LINE_B_NUMBER, "13:00");
+        assertNull(rejection.getCause());
+        assertWarnings(warning(22L, LINE_B_ID_VALUE, 53L, NO_TECHNOLOGY_WARNING));
+        assertEquals(Collections.singletonList(Arrays.asList(52L, 53L)), projectionQueries);
+        verify(b3OrderReference, never()).getStringField(anyString());
+        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor, sessionFactory, session);
+        assertUntouched(a2);
+        assertUntouched(b2);
+        assertUntouched(b3);
+    }
+
+    @Test
+    public final void shouldNameFirstCandidateInChainOrderWhenOrdersSharingTechnologyHaveNoTechnologyId() {
+        // given: m moves from A 09:00 to B 11:00-12:00; A holds a2 11:00 of order 52 with technology 82; B holds b2 13:00 of
+        // order 53 and b3 14:00 of order 54, both with technology reference 81, and the projection answers the rows of orders
+        // 53 and 54 without a technology id; the positions enter the position table in the order m, b3, b2, a2
+        Entity technology81 = mockEntity(81L);
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity b3 = position(23L, lineB, order(54L, technology81), "14:00", "15:00");
+        Entity b2 = position(22L, lineB, order(53L, technology81), "13:00", "14:00");
+        Entity a2 = position(12L, lineA, order(52L, mockEntity(82L)), "11:00", "12:00");
+
+        nullProjectionTechnologyId(53L);
+        nullProjectionTechnologyId(54L);
+
+        // when
+        ProductionMaintenanceGanttMoveService.MoveRejectedException rejection = recomputeRejection(moved, lineA, "09:00",
+                lineB, "11:00");
+
+        // then: the projection answers its rows in table order, orders 54, 53 and 52; the one projection ran over the order
+        // ids in chain order
+        List<Long> projectedOrderIds = new ArrayList<Long>();
+
+        for (Entity row : projectionRows(Arrays.asList(52L, 53L, 54L))) {
+            projectedOrderIds.add(row.getLongField(PROJECTION_ORDER_ID));
+        }
+
+        assertEquals(Arrays.asList(54L, 53L, 52L), projectedOrderIds);
+        assertEquals(Collections.singletonList(Arrays.asList(52L, 53L, 54L)), projectionQueries);
+
+        // then: the rejection names b2, the first candidate in chain order whose order's row has no technology id, with its
+        // order, row B and start
+        assertRecomputeFailed(rejection, "ORD-53", LINE_B_NUMBER, "13:00");
+        assertNull(rejection.getCause());
+        assertWarnings(warning(22L, LINE_B_ID_VALUE, 53L, NO_TECHNOLOGY_WARNING));
+        verifyZeroInteractions(productionLineScheduleService, psExecutor, ppsExecutor, sessionFactory, session);
+        assertUntouched(a2);
+        assertUntouched(b2);
+        assertUntouched(b3);
+    }
+
+    @Test
+    public final void shouldNameLaterCandidateWithoutExecutorDataWithChainLineAndStoredStart() {
+        // given: m moves from A 09:00 to B 11:00-12:00, the destination row given as an entity of row B numbered B-ROW; B
+        // holds b2 13:00 and b3 14:00, for which the executor produces no data
+        Entity destinationRow = entityWithIdOf(lineB);
+
+        stubStringField(destinationRow, ProductionLineFields.NUMBER, "B-ROW");
+
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity b2 = position(22L, lineB, order(53L), "13:00", "14:00");
+        Entity b3 = position(23L, lineB, order(54L), "14:00", "15:00");
+
+        positionsWithoutExecutorData.add(b3);
+
+        // when
+        ProductionMaintenanceGanttMoveService.MoveRejectedException rejection = recomputeRejection(moved, lineA, "09:00",
+                destinationRow, "11:00");
+
+        // then: b2 is recomputed and saved; the rejection names b3's order, the chain's row and b3's start
+        assertRecomputeFailed(rejection, "ORD-54", "B-ROW", "14:00");
+        assertNull(rejection.getCause());
+        assertWarnings(warning(23L, LINE_B_ID_VALUE, 54L, NO_EXECUTOR_DATA_WARNING));
+        verifyEachSavedOnce(b2);
+        assertEquals(PS, step(b3).executor);
+        verify(b3, never()).setField(anyString(), any());
+
+        // then: b2's save was followed by one flush and one clear; b3 was created and then neither saved, flushed nor cleared
+        assertEquals(Arrays.asList(PROJECTION_EVENT, CREATE_EVENT, SAVE_EVENT, FLUSH_EVENT, CLEAR_EVENT, CREATE_EVENT),
+                eventsAfterLastRead());
+        verifySessionFlushedAndCleared(1);
+    }
+
+    @Test
+    public final void shouldWrapSchedulingServiceFailureOfOriginCandidateWithItsOrderLineAndStart() {
+        // given: m moves from A 09:00 to B 11:00-12:00; A holds a2 11:00, for which getFinishDate throws; B holds b2 13:00
+        IllegalStateException failure = new IllegalStateException("no finish date");
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity a2Order = order(52L);
+        Entity a2 = position(12L, lineA, a2Order, "11:00", "12:00");
+        Entity b2 = position(22L, lineB, order(53L), "13:00", "14:00");
+
+        willThrow(failure).given(productionLineScheduleService).getFinishDate(Matchers.<Map<Long, Date>> any(),
+                any(Date.class), same(lineA), same(a2Order));
+
+        // when
+        ProductionMaintenanceGanttMoveService.MoveRejectedException rejection = recomputeRejection(moved, lineA, "09:00",
+                lineB, "11:00");
+
+        // then: the rejection names a2's order, row A and a2's start and keeps the failure as its cause, which the warning
+        // carries; nothing is created, saved, flushed or cleared
+        assertRecomputeFailed(rejection, "ORD-52", LINE_A_NUMBER, "11:00");
+        assertSame(failure, rejection.getCause());
+        assertWarnings(warning(12L, LINE_A_ID_VALUE, 52L, SCHEDULING_FAILED_WARNING));
+        assertSame(failure, warningThrowable());
+        verifyZeroInteractions(psExecutor, ppsExecutor, sessionFactory, session);
+        assertUntouched(a2);
+        assertUntouched(b2);
+    }
+
+    @Test
+    public final void shouldWrapSchedulingServiceFailureOfLaterCandidateWithoutSavingIt() {
+        // given: m moves from A 09:00 to B 11:00-12:00; B holds b2 13:00 and b3 14:00, for which getFinishDateWithChildren
+        // throws
+        IllegalStateException failure = new IllegalStateException("no children end");
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity b2 = position(22L, lineB, order(53L), "13:00", "14:00");
+        Entity b3 = position(23L, lineB, order(54L), "14:00", "15:00");
+
+        willThrow(failure).given(productionLineScheduleService).getFinishDateWithChildren(same(b3), any(Date.class));
+
+        // when
+        ProductionMaintenanceGanttMoveService.MoveRejectedException rejection = recomputeRejection(moved, lineA, "09:00",
+                lineB, "11:00");
+
+        // then: b2 is recomputed and saved; the rejection names b3's order, row B and b3's start with the failure as cause
+        assertRecomputeFailed(rejection, "ORD-54", LINE_B_NUMBER, "14:00");
+        assertSame(failure, rejection.getCause());
+        assertWarnings(warning(23L, LINE_B_ID_VALUE, 54L, SCHEDULING_FAILED_WARNING));
+        assertSame(failure, warningThrowable());
+        verifyEachSavedOnce(b2);
+        verify(b3, never()).setField(anyString(), any());
+        verify(productionLineScheduleService, times(1)).getPreviousOrder(Matchers.<Map<Long, Entity>> any(),
+                any(Entity.class), any(Date.class));
+
+        // then: b2's save was followed by one flush and one clear, and b3 was never created
+        assertEquals(Arrays.asList(PROJECTION_EVENT, CREATE_EVENT, SAVE_EVENT, FLUSH_EVENT, CLEAR_EVENT),
+                eventsAfterLastRead());
+        verifySessionFlushedAndCleared(1);
+    }
+
+    @Test
+    public final void shouldWrapSaveFailureWithStartTimeStoredBeforeRecompute() {
+        // given: plan for shift schedule; m moves from A 09:00 to B 11:00-12:00; B holds b2 13:00, whose start follows its
+        // setField calls and whose save throws
+        stubStringField(schedule, ProductionLineScheduleFields.DURATION_OF_ORDER_CALCULATED_ON_BASIS,
+                DurationOfOrderCalculatedOnBasis.PLAN_FOR_SHIFT.getStringValue());
+
+        RuntimeException failure = new RuntimeException("save failed", new SQLException("check violation", "23514"));
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity b2 = position(22L, lineB, order(53L), "13:00", "14:00");
+
+        stubStartTimeFollowingSetField(b2);
+        willThrow(failure).given(ppsExecutor).savePosition(same(b2), any(ProductionLinePositionNewData.class));
+
+        // when
+        ProductionMaintenanceGanttMoveService.MoveRejectedException rejection = recomputeRejection(moved, lineA, "09:00",
+                lineB, "11:00");
+
+        // then: b2 held its new start when the save failed; the rejection names the start stored before the recompute and
+        // keeps the failure as its cause, which the warning carries
+        assertEquals(at("12:15"), b2.getDateField(ProductionLineSchedulePositionFields.START_TIME));
+        assertRecomputeFailed(rejection, "ORD-53", LINE_B_NUMBER, "13:00");
+        assertSame(failure, rejection.getCause());
+        assertWarnings(warning(22L, LINE_B_ID_VALUE, 53L, SCHEDULING_FAILED_WARNING));
+        assertSame(failure, warningThrowable());
+        verify(ppsExecutor, times(1)).savePosition(same(b2), any(ProductionLinePositionNewData.class));
+        verifyZeroInteractions(psExecutor);
+
+        // then: the failed save was followed by neither a flush nor a clear
+        assertEquals(Arrays.asList(PROJECTION_EVENT, CREATE_EVENT), eventsAfterLastRead());
+        verifyZeroInteractions(sessionFactory, session);
+    }
+
+    @Test
+    public final void shouldPropagateConcurrencyConflictOfExecutorUnchanged() {
+        // given: m moves from A 09:00 to B 11:00-12:00; B holds b2 13:00, whose executor call fails with a serialization
+        // conflict
+        CannotSerializeTransactionException conflict = new CannotSerializeTransactionException("conflict");
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity b2 = position(22L, lineB, order(53L), "13:00", "14:00");
+
+        willThrow(conflict).given(psExecutor).createProductionLinePositionNewData(
+                Matchers.<Map<Long, ProductionLinePositionNewData>> any(), any(Entity.class), any(Date.class), same(b2),
+                any(Entity.class), any(Entity.class));
+
+        // when
+        try {
+            recompute(moved, lineA, "09:00", lineB, "11:00");
+
+            fail("CannotSerializeTransactionException expected");
+        } catch (CannotSerializeTransactionException e) {
+            // then
+            assertSame(conflict, e);
+        }
+
+        // then: no warning is logged; b2 is neither changed nor saved, and the session is not used
+        assertWarnings();
+        verify(psExecutor, never()).savePosition(any(Entity.class), any(ProductionLinePositionNewData.class));
+        verify(b2, never()).setField(anyString(), any());
+        verifyZeroInteractions(ppsExecutor, sessionFactory, session);
+    }
+
+    @Test
+    public final void shouldPropagateSerializationFailureOfSaveUnchanged() {
+        // given: m moves from A 09:00 to B 11:00-12:00; B holds b2 13:00, whose save fails with SQLSTATE 40001 as the cause
+        RuntimeException serializationFailure = new RuntimeException("flush failed", new SQLException(
+                "could not serialize access", "40001"));
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity b2 = position(22L, lineB, order(53L), "13:00", "14:00");
+
+        willThrow(serializationFailure).given(psExecutor).savePosition(same(b2), any(ProductionLinePositionNewData.class));
+
+        // when
+        try {
+            recompute(moved, lineA, "09:00", lineB, "11:00");
+
+            fail("RuntimeException expected");
+        } catch (RuntimeException e) {
+            // then
+            assertSame(serializationFailure, e);
+        }
+
+        // then: no warning is logged, and the failed save is followed by neither a flush nor a clear
+        assertWarnings();
+        verify(psExecutor, times(1)).savePosition(same(b2), any(ProductionLinePositionNewData.class));
+        verifyZeroInteractions(ppsExecutor, sessionFactory, session);
+    }
+
+    @Test
+    public final void shouldPropagateMoveRejectionOfExecutorUnchanged() {
+        // given: m moves from A 09:00 to B 11:00-12:00; B holds b2 13:00, whose executor call throws a move rejection
+        ProductionMaintenanceGanttMoveService.MoveRejectedException executorRejection;
+        executorRejection = new ProductionMaintenanceGanttMoveService.MoveRejectedException(
+                ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY);
+        Entity moved = position(MOVED_ID, lineB, order(51L), "11:00", "12:00");
+        Entity b2 = position(22L, lineB, order(53L), "13:00", "14:00");
+
+        willThrow(executorRejection).given(psExecutor).createProductionLinePositionNewData(
+                Matchers.<Map<Long, ProductionLinePositionNewData>> any(), any(Entity.class), any(Date.class), same(b2),
+                any(Entity.class), any(Entity.class));
+
+        // when
+        ProductionMaintenanceGanttMoveService.MoveRejectedException rejection = recomputeRejection(moved, lineA, "09:00",
+                lineB, "11:00");
+
+        // then: the executor's rejection propagates as it was thrown, and no warning is logged; b2 is neither changed nor
+        // saved, and the session is not used
+        assertSame(executorRejection, rejection);
+        assertEquals(0, rejection.getArgs().length);
+        assertWarnings();
+        verify(psExecutor, never()).savePosition(any(Entity.class), any(ProductionLinePositionNewData.class));
+        verify(b2, never()).setField(anyString(), any());
+        verifyZeroInteractions(ppsExecutor, sessionFactory, session);
+    }
+
+    /**
+     * Runs the recompute like {@link #recompute(Entity, Entity, String, Entity, String)} and returns the move rejection it
+     * throws, failing when it throws none.
+     */
+    private ProductionMaintenanceGanttMoveService.MoveRejectedException recomputeRejection(final Entity movedPosition,
+            final Entity originLine, final String vacatedStart, final Entity destinationLine, final String slotStart) {
+        try {
+            recompute(movedPosition, originLine, vacatedStart, destinationLine, slotStart);
+        } catch (ProductionMaintenanceGanttMoveService.MoveRejectedException e) {
+            return e;
+        }
+
+        throw new AssertionError("MoveRejectedException expected");
+    }
+
+    /**
+     * Asserts that the rejection has the recompute failed key and exactly the given order number, production line number and
+     * start, the start given as a time of {@value #DAY}.
+     */
+    private static void assertRecomputeFailed(final ProductionMaintenanceGanttMoveService.MoveRejectedException rejection,
+            final String orderNumber, final String lineNumber, final String startTime) {
+        assertEquals(ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, rejection.getMessageKey());
+        assertArrayEquals(new String[] { orderNumber, lineNumber, DAY + " " + startTime + ":00" }, rejection.getArgs());
+    }
+
+    /**
+     * Returns the warning the recompute service logs for a failed position of the fixture schedule.
+     */
+    private static String warning(final Long positionId, final Long lineId, final Long orderId, final String reason) {
+        return "Recompute of production line schedule position " + positionId + " (production line schedule " + SCHEDULE_ID
+                + ", production line " + lineId + ", order " + orderId + ") failed: " + reason;
+    }
+
+    /**
+     * Asserts that the recompute service logged exactly the given warn-level messages, in order.
+     */
+    private void assertWarnings(final String... expectedWarnings) {
+        List<String> warnings = new ArrayList<String>();
+
+        for (LoggingEvent event : logAppender.events) {
+            if (Level.WARN.equals(event.getLevel())) {
+                warnings.add(event.getRenderedMessage());
+            }
+        }
+
+        assertEquals(Arrays.asList(expectedWarnings), warnings);
+    }
+
+    /**
+     * Returns the throwable logged with the single warn-level event of the recompute service, or null when it has none.
+     */
+    private Throwable warningThrowable() {
+        LoggingEvent warning = null;
+
+        for (LoggingEvent event : logAppender.events) {
+            if (Level.WARN.equals(event.getLevel())) {
+                assertNull("more than one warning logged", warning);
+
+                warning = event;
+            }
+        }
+
+        assertNotNull("no warning logged", warning);
+
+        if (warning.getThrowableInformation() == null) {
+            return null;
+        }
+
+        return warning.getThrowableInformation().getThrowable();
+    }
+
+    /**
+     * Makes the position's start time answer the value its last {@code setField} call of the start time stored, starting
+     * from its stubbed start time.
+     */
+    private static void stubStartTimeFollowingSetField(final Entity position) {
+        final Date[] startTime = { position.getDateField(ProductionLineSchedulePositionFields.START_TIME) };
+
+        willAnswer(new Answer<Void>() {
+
+            @Override
+            public Void answer(final InvocationOnMock invocation) {
+                startTime[0] = (Date) invocation.getArguments()[1];
+
+                return null;
+            }
+
+        }).given(position).setField(eq(ProductionLineSchedulePositionFields.START_TIME), any());
+        willAnswer(new Answer<Date>() {
+
+            @Override
+            public Date answer(final InvocationOnMock invocation) {
+                return startTime[0];
+            }
+
+        }).given(position).getDateField(ProductionLineSchedulePositionFields.START_TIME);
+    }
 
     /**
      * Registers the vacated start and the slot start as accepted query bounds and runs the recompute for the fixture
@@ -1635,6 +2427,7 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
     private static Entity order(final Long id, final Entity technology) {
         Entity order = mockEntity(id);
 
+        stubStringField(order, OrderFields.NUMBER, ORDER_NUMBER_PREFIX + id);
         stubBelongsToField(order, OrderFields.TECHNOLOGY, technology);
 
         return order;
@@ -1716,110 +2509,115 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
     }
 
     /**
-     * Stubs the order and the technology data definitions. Every {@code find()} on either answers a new criteria builder over
-     * the loaded order table or the loaded technology table, as they are at query time, records the queried ids and adds a
-     * find event of its own.
+     * Stubs the order data definition to answer {@code find(String)} with {@link OrderTechnologyIdsFindAnswer}, and makes
+     * criteria {@code find()} on it, and every request for the technology data definition, fail the test.
      */
     private void stubOrderAndTechnologyDataDefinitions() {
         given(dataDefinitionService.get(OrdersConstants.PLUGIN_IDENTIFIER, OrdersConstants.MODEL_ORDER)).willReturn(orderDD);
         given(dataDefinitionService.get(TechnologiesConstants.PLUGIN_IDENTIFIER, TechnologiesConstants.MODEL_TECHNOLOGY))
-                .willReturn(technologyDD);
-        given(orderDD.find()).willAnswer(new IdInFindAnswer(ORDER_FIND_EVENT, orderQueries) {
-
-            @Override
-            protected Map<Long, Entity> table() {
-                return loadedOrderTable();
-            }
-
-        });
-        given(technologyDD.find()).willAnswer(new IdInFindAnswer(TECHNOLOGY_FIND_EVENT, technologyQueries) {
-
-            @Override
-            protected Map<Long, Entity> table() {
-                return loadedTechnologyTable();
-            }
-
-        });
+                .willAnswer(new FailingAnswer("request for the technology data definition"));
+        given(orderDD.find()).willAnswer(new FailingAnswer("criteria find() of the order data definition"));
+        given(orderDD.find(anyString())).willAnswer(new OrderTechnologyIdsFindAnswer());
     }
 
     /**
-     * Makes the order load return, for the given id, a new order with the given technology instead of the order of the
-     * positions, and returns that order.
+     * Makes the order technology ids query answer no row for the given order id.
      */
-    private Entity overrideLoadedOrder(final Long id, final Entity technology) {
-        Entity loadedOrder = order(id, technology);
-
-        loadedOrderOverrides.put(id, loadedOrder);
-
-        return loadedOrder;
+    private void omitProjectionRow(final Long orderId) {
+        omittedProjectionRows.add(orderId);
     }
 
     /**
-     * Makes the order load return no order for the given id.
+     * Makes the order technology ids query answer the row of the given order id with a {@code null} technology id.
      */
-    private void omitLoadedOrder(final Long id) {
-        loadedOrderOverrides.put(id, null);
+    private void nullProjectionTechnologyId(final Long orderId) {
+        projectionRowsWithoutTechnologyId.add(orderId);
     }
 
     /**
-     * Makes the technology load return no technology for the given id.
+     * Returns the projection rows the order technology ids query answers for the given bound order ids: one row for each
+     * distinct order of the position table, in table order, whose id is bound and whose row is not omitted. The row holds the
+     * order's id and the id of the order's technology reference, or {@code null} when the order has no technology reference
+     * or its row is set to have no technology id.
      */
-    private void omitLoadedTechnology(final Long id) {
-        loadedTechnologyOverrides.put(id, null);
-    }
-
-    /**
-     * Returns the loaded order table: the order of every table position under its id, with the order load overrides applied.
-     */
-    private Map<Long, Entity> loadedOrderTable() {
-        Map<Long, Entity> table = new LinkedHashMap<Long, Entity>();
+    private List<Entity> projectionRows(final List<Long> boundOrderIds) {
+        List<Entity> rows = new ArrayList<Entity>();
+        Set<Long> answeredOrderIds = new HashSet<Long>();
 
         for (Entity position : positionTable) {
             Entity order = position.getBelongsToField(ProductionLineSchedulePositionFields.ORDER);
 
-            if (order != null) {
-                table.put(order.getId(), order);
+            if (order == null) {
+                continue;
             }
-        }
 
-        applyOverrides(table, loadedOrderOverrides);
+            Long orderId = order.getId();
 
-        return table;
-    }
+            if (!boundOrderIds.contains(orderId) || omittedProjectionRows.contains(orderId) || !answeredOrderIds.add(orderId)) {
+                continue;
+            }
 
-    /**
-     * Returns the loaded technology table: the technology of every row of the loaded order table under its id, with the
-     * technology load overrides applied.
-     */
-    private Map<Long, Entity> loadedTechnologyTable() {
-        Map<Long, Entity> table = new LinkedHashMap<Long, Entity>();
-
-        for (Entity order : loadedOrderTable().values()) {
             Entity technology = order.getBelongsToField(OrderFields.TECHNOLOGY);
+            Long technologyId = null;
 
-            if (technology != null) {
-                table.put(technology.getId(), technology);
+            if (technology != null && !projectionRowsWithoutTechnologyId.contains(orderId)) {
+                technologyId = technology.getId();
             }
+
+            rows.add(mock(Entity.class, new ProjectionRowAnswer(orderId, technologyId)));
         }
 
-        applyOverrides(table, loadedTechnologyOverrides);
-
-        return table;
+        return rows;
     }
 
     /**
-     * Puts every override with a value into the table under its id and removes the table row of every override without one.
+     * Returns the events recorded after the last read event.
      */
-    private static void applyOverrides(final Map<Long, Entity> table, final Map<Long, Entity> overrides) {
-        for (Map.Entry<Long, Entity> override : overrides.entrySet()) {
-            if (override.getValue() == null) {
-                table.remove(override.getKey());
-            } else {
-                table.put(override.getKey(), override.getValue());
-            }
-        }
+    private List<String> eventsAfterLastRead() {
+        return new ArrayList<String>(events.subList(events.lastIndexOf(READ_EVENT) + 1, events.size()));
     }
 
+    /**
+     * Verifies that the current session was taken from the session factory, flushed and cleared exactly the given number of
+     * times, each flush followed by a clear before the next flush, and that neither was used otherwise.
+     */
+    private void verifySessionFlushedAndCleared(final int pairs) {
+        InOrder inOrder = inOrder(session);
+
+        for (int pair = 0; pair < pairs; pair++) {
+            inOrder.verify(session).flush();
+            inOrder.verify(session).clear();
+        }
+
+        verify(sessionFactory, times(pairs)).getCurrentSession();
+        verify(session, times(pairs)).flush();
+        verify(session, times(pairs)).clear();
+        verifyNoMoreInteractions(sessionFactory, session);
+    }
+
+    /**
+     * Records every logging event it receives.
+     */
+    private static final class RecordingAppender extends AppenderSkeleton {
+
+        private final List<LoggingEvent> events = new ArrayList<LoggingEvent>();
+
+        @Override
+        protected void append(final LoggingEvent event) {
+            events.add(event);
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+        }
+
+        @Override
+        public boolean requiresLayout() {
+            return false;
+        }
+
+    }
 
     /**
      * One recompute of one position: the chain caches and arguments the scheduling services and the executor received, and
@@ -1992,7 +2790,8 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
     /**
      * Answers {@code createProductionLinePositionNewData} of an executor service: requires the finish date and previous
      * order to be the ones {@code getFinishDateWithChildren} and {@code getPreviousOrder} answered in the current recompute
-     * step, records the call in that step and, while the fixture produces data, puts new data starting
+     * step, and the technology to be the technology reference of the step's order, records the call in that step and, while
+     * the fixture produces data and the position is not in {@code positionsWithoutExecutorData}, puts new data starting
      * {@value #CHANGEOVER_MINUTES} minutes after the finish date and ending {@value #DURATION_MINUTES} minutes after that
      * start under the id of the line it received, or of {@code executorDataLine} when that is set. The first call of a test
      * adds the rows created by {@code positionInsertedAtFirstCreate} to the position table.
@@ -2032,7 +2831,7 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
 
             events.add(CREATE_EVENT);
 
-            if (executorProducesData) {
+            if (executorProducesData && !positionsWithoutExecutorData.contains(arguments[3])) {
                 Date startDate = plusMinutes(finishDate, CHANGEOVER_MINUTES);
                 Entity dataLine = line;
 
@@ -2449,110 +3248,168 @@ public class ProductionMaintenanceGanttRecomputeServiceTest {
     }
 
     /**
-     * Answers {@code find()} on the order or the technology data definition with a new {@link IdInCriteriaBuilderAnswer}
-     * builder over the rows {@link #table()} returns at query time, records a new id query and adds the given find event.
+     * Answers {@code find(String)} on the order data definition for
+     * {@link ProductionMaintenanceGanttRecomputeService#ORDER_TECHNOLOGY_IDS_QUERY} with a new
+     * {@link OrderTechnologyIdsQueryBuilderAnswer} query builder, and fails for every other query text.
      */
-    private abstract class IdInFindAnswer implements Answer<SearchCriteriaBuilder> {
-
-        private final String event;
-
-        private final List<List<Long>> queries;
-
-        IdInFindAnswer(final String event, final List<List<Long>> queries) {
-            this.event = event;
-            this.queries = queries;
-        }
+    private final class OrderTechnologyIdsFindAnswer implements Answer<SearchQueryBuilder> {
 
         @Override
-        public SearchCriteriaBuilder answer(final InvocationOnMock invocation) {
-            List<Long> ids = new ArrayList<Long>();
+        public SearchQueryBuilder answer(final InvocationOnMock invocation) {
+            String queryText = (String) invocation.getArguments()[0];
 
-            queries.add(ids);
-            events.add(event);
+            if (!ProductionMaintenanceGanttRecomputeService.ORDER_TECHNOLOGY_IDS_QUERY.equals(queryText)) {
+                throw new AssertionError("Unexpected order query: " + queryText);
+            }
 
-            return mock(SearchCriteriaBuilder.class, new IdInCriteriaBuilderAnswer(table(), ids));
+            return mock(SearchQueryBuilder.class, new OrderTechnologyIdsQueryBuilderAnswer());
         }
-
-        /**
-         * Returns the rows of the queried table under their ids.
-         */
-        protected abstract Map<Long, Entity> table();
 
     }
 
     /**
-     * Accepts one {@code add} of an {@code id in (...)} criterion and records its ids, and answers {@code list()} with the table
-     * rows whose id is one of them. Fails on any other criterion, on a second criterion, on {@code list()} without a criterion
-     * and on every other builder method.
+     * Accepts one {@code setParameterList} of {@value #PROJECTION_ORDER_IDS_PARAMETER} with a list of order ids and answers
+     * it with the builder itself. Answers one {@code list()} after that binding by recording the bound ids as a projection
+     * query and a projection event, and returning {@link #projectionRows} of them. Fails on another parameter name, a value
+     * that is not a list of order ids, a second binding, {@code list()} before the binding, a second {@code list()} and every
+     * other method {@link SearchQueryBuilder} declares. Methods {@link Object} declares return the Mockito default.
      */
-    private static final class IdInCriteriaBuilderAnswer implements Answer<Object> {
+    private final class OrderTechnologyIdsQueryBuilderAnswer implements Answer<Object> {
 
-        private final Map<Long, Entity> table;
+        private List<Long> boundOrderIds;
 
-        private final List<Long> ids;
+        private boolean listed;
 
-        private boolean criterionAdded;
+        @Override
+        public Object answer(final InvocationOnMock invocation) throws Throwable {
+            String methodName = invocation.getMethod().getName();
+            Object[] arguments = invocation.getArguments();
 
-        private IdInCriteriaBuilderAnswer(final Map<Long, Entity> table, final List<Long> ids) {
-            this.table = table;
-            this.ids = ids;
+            if (Object.class.equals(invocation.getMethod().getDeclaringClass())) {
+                return Mockito.RETURNS_DEFAULTS.answer(invocation);
+            }
+            if ("setParameterList".equals(methodName)) {
+                bind(arguments);
+
+                return invocation.getMock();
+            }
+            if ("list".equals(methodName)) {
+                if (boundOrderIds == null) {
+                    throw new AssertionError("Order technology ids query listed before its order ids were bound");
+                }
+                if (listed) {
+                    throw new AssertionError("Order technology ids query listed twice");
+                }
+
+                listed = true;
+                projectionQueries.add(boundOrderIds);
+                events.add(PROJECTION_EVENT);
+
+                return new FixedSearchResult(projectionRows(boundOrderIds));
+            }
+
+            throw new AssertionError("Unexpected order technology ids query builder method: " + methodName);
+        }
+
+        /**
+         * Records the order ids of a {@code setParameterList(name, value)} call, or fails for another name, a value that is
+         * not a list of order ids, or a second binding.
+         */
+        private void bind(final Object[] arguments) {
+            if (boundOrderIds != null) {
+                throw new AssertionError("Order technology ids query bound twice");
+            }
+            if (!PROJECTION_ORDER_IDS_PARAMETER.equals(arguments[0]) || !(arguments[1] instanceof List)) {
+                throw new AssertionError("Unexpected order technology ids query parameter " + arguments[0] + ": "
+                        + arguments[1]);
+            }
+
+            List<Long> orderIds = new ArrayList<Long>();
+
+            for (Object orderId : (List<?>) arguments[1]) {
+                if (!(orderId instanceof Long)) {
+                    throw new AssertionError("Unexpected order id in the order technology ids query: " + orderId);
+                }
+
+                orderIds.add((Long) orderId);
+            }
+
+            boundOrderIds = orderIds;
+        }
+
+    }
+
+    /**
+     * Answers a projection row of the order technology ids query: {@code getLongField} of {@value #PROJECTION_ORDER_ID} with
+     * the order id and of {@value #PROJECTION_TECHNOLOGY_ID} with the technology id. Fails on every other method
+     * {@link Entity} declares, and on {@code getLongField} of any other field. Methods {@link Object} declares return the
+     * Mockito default.
+     */
+    private static final class ProjectionRowAnswer implements Answer<Object> {
+
+        private final Long orderId;
+
+        private final Long technologyId;
+
+        private ProjectionRowAnswer(final Long orderId, final Long technologyId) {
+            this.orderId = orderId;
+            this.technologyId = technologyId;
         }
 
         @Override
         public Object answer(final InvocationOnMock invocation) throws Throwable {
             String methodName = invocation.getMethod().getName();
+            Object[] arguments = invocation.getArguments();
 
-            if ("add".equals(methodName)) {
-                if (criterionAdded) {
-                    throw new AssertionError("Unexpected second criterion");
-                }
-
-                ids.addAll(idsOf((SearchCriterion) invocation.getArguments()[0]));
-                criterionAdded = true;
-
-                return invocation.getMock();
+            if (Object.class.equals(invocation.getMethod().getDeclaringClass())) {
+                return Mockito.RETURNS_DEFAULTS.answer(invocation);
             }
-            if ("list".equals(methodName)) {
-                if (!criterionAdded) {
-                    throw new AssertionError("list() without an id criterion");
-                }
-
-                List<Entity> selected = new ArrayList<Entity>();
-
-                for (Map.Entry<Long, Entity> row : table.entrySet()) {
-                    if (ids.contains(row.getKey())) {
-                        selected.add(row.getValue());
-                    }
-                }
-
-                return new FixedSearchResult(selected);
+            if ("getLongField".equals(methodName) && PROJECTION_ORDER_ID.equals(arguments[0])) {
+                return orderId;
             }
-            if (SearchCriteriaBuilder.class.equals(invocation.getMethod().getDeclaringClass())) {
-                throw new AssertionError("Unexpected builder method: " + methodName);
+            if ("getLongField".equals(methodName) && PROJECTION_TECHNOLOGY_ID.equals(arguments[0])) {
+                return technologyId;
             }
 
-            return Mockito.RETURNS_DEFAULTS.answer(invocation);
+            throw new AssertionError("Unexpected projection row call: " + methodName + Arrays.asList(arguments));
         }
 
-        /**
-         * Returns the values of an {@link InExpression} on the {@value #L_ID} property, read from its private fields, or fails
-         * for any other criterion.
-         */
-        private static List<Long> idsOf(final SearchCriterion criterion) {
-            Criterion hibernateCriterion = criterion.getHibernateCriterion();
+    }
 
-            if (!(hibernateCriterion instanceof InExpression)
-                    || !L_ID.equals(ReflectionTestUtils.getField(hibernateCriterion, IN_PROPERTY_NAME_FIELD))) {
-                throw new AssertionError("Unexpected criterion: " + hibernateCriterion);
-            }
+    /**
+     * Records the given event and answers {@code null}.
+     */
+    private final class EventAnswer implements Answer<Void> {
 
-            List<Long> criterionIds = new ArrayList<Long>();
+        private final String event;
 
-            for (Object value : (Object[]) ReflectionTestUtils.getField(hibernateCriterion, IN_VALUES_FIELD)) {
-                criterionIds.add((Long) value);
-            }
+        private EventAnswer(final String event) {
+            this.event = event;
+        }
 
-            return criterionIds;
+        @Override
+        public Void answer(final InvocationOnMock invocation) {
+            events.add(event);
+
+            return null;
+        }
+
+    }
+
+    /**
+     * Fails the test on every call it answers, naming the unexpected call.
+     */
+    private static final class FailingAnswer implements Answer<Object> {
+
+        private final String call;
+
+        private FailingAnswer(final String call) {
+            this.call = call;
+        }
+
+        @Override
+        public Object answer(final InvocationOnMock invocation) {
+            throw new AssertionError("Unexpected " + call);
         }
 
     }

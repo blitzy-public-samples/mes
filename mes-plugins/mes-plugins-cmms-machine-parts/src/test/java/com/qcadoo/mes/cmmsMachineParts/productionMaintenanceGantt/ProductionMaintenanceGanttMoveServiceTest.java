@@ -57,6 +57,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -109,6 +110,7 @@ import com.qcadoo.mes.productionLines.constants.WorkstationFieldsPL;
 import com.qcadoo.model.api.DataDefinition;
 import com.qcadoo.model.api.DataDefinitionService;
 import com.qcadoo.model.api.Entity;
+import com.qcadoo.model.api.FieldDefinition;
 import com.qcadoo.model.api.search.SearchCriteriaBuilder;
 import com.qcadoo.model.api.search.SearchCriterion;
 import com.qcadoo.model.api.search.SearchOrder;
@@ -129,7 +131,9 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * {@link ParameterService} returns a parameter whose {@code canChangeProdLineForAcceptedOrders} is false. The production line
  * data definition answers {@code find()} with a builder that records its criteria, orders and maximum result count, and
  * selects the fixture entities satisfying every recorded criterion. Unknown criteria, unknown orders and unknown builder
- * methods fail the test.
+ * methods fail the test. The position data definition answers {@code getFields()} with the fields of the
+ * {@code productionLineSchedulePosition} model in model order: productionLineSchedule, order, productionLine, startTime,
+ * endTime, additionalTime.
  * The planned event data definition answers {@code find(String)} of
  * {@link ProductionMaintenanceGanttChartItemResolver#SHUTDOWN_EVENTS_QUERY} with projection rows of the fixture planned
  * events the query selects, and fails on {@code find()}, on any other query and on a missing or unexpected parameter.
@@ -197,6 +201,10 @@ public class ProductionMaintenanceGanttMoveServiceTest {
     private static final String SLOT_TO = "2026-10-01 12:00:00";
 
     private static final String SHUTDOWN_EVENT_NUMBER = "EV-7";
+
+    private static final String GENERIC_VALIDATION_ERROR_KEY = "qcadooView.validate.global.error.custom";
+
+    private static final String END_TIME_ERROR_KEY = "orders.validate.global.error.endTime";
 
     private ProductionMaintenanceGanttMoveService moveService;
 
@@ -298,6 +306,13 @@ public class ProductionMaintenanceGanttMoveServiceTest {
 
         savedPosition = mockEntity(POSITION_ID, positionDD);
         given(savedPosition.isValid()).willReturn(true);
+
+        Map<String, FieldDefinition> positionFields = fieldDefinitions(
+                ProductionLineSchedulePositionFields.PRODUCTION_LINE_SCHEDULE, ProductionLineSchedulePositionFields.ORDER,
+                ProductionLineSchedulePositionFields.PRODUCTION_LINE, ProductionLineSchedulePositionFields.START_TIME,
+                ProductionLineSchedulePositionFields.END_TIME, ProductionLineSchedulePositionFields.ADDITIONAL_TIME);
+
+        given(positionDD.getFields()).willReturn(positionFields);
 
         given(item.getEntityId()).willReturn(POSITION_ID);
         given(positionDD.get(POSITION_ID)).willReturn(position);
@@ -1002,6 +1017,169 @@ public class ProductionMaintenanceGanttMoveServiceTest {
     }
 
     @Test
+    public final void shouldRejectWithFieldErrorAndItsArgumentsBeforeGenericGlobalError() {
+        // given: the framework's generic global error and an end time field error
+        Map<String, ErrorMessage> fieldErrors = new LinkedHashMap<String, ErrorMessage>();
+        fieldErrors.put(ProductionLineSchedulePositionFields.END_TIME, new ErrorMessage(END_TIME_ERROR_KEY, "10:00"));
+
+        givenInvalidSave(Collections.singletonList(new ErrorMessage(GENERIC_VALIDATION_ERROR_KEY)), fieldErrors);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, END_TIME_ERROR_KEY, "10:00");
+        assertEquals(Collections.singletonList("Save of the moved production line schedule position rejected with "
+                + END_TIME_ERROR_KEY), loggedMessages(Level.DEBUG));
+        assertNothingRecomputed();
+    }
+
+    @Test
+    public final void shouldRejectWithOptimisticLockBeforeGenericGlobalErrorAndFieldError() {
+        // given: the generic global error, then the optimistic lock global error, and an end time field error
+        Map<String, ErrorMessage> fieldErrors = new LinkedHashMap<String, ErrorMessage>();
+        fieldErrors.put(ProductionLineSchedulePositionFields.END_TIME, new ErrorMessage(END_TIME_ERROR_KEY));
+
+        givenInvalidSave(Arrays.asList(new ErrorMessage(GENERIC_VALIDATION_ERROR_KEY), new ErrorMessage(
+                ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY)), fieldErrors);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.OPTIMISTIC_LOCK_KEY);
+        assertNothingRecomputed();
+    }
+
+    @Test
+    public final void shouldRejectWithGenericGlobalErrorAndItsArgumentsWithoutFieldErrors() {
+        // given: two generic global errors and no field error
+        givenInvalidSave(Arrays.asList(new ErrorMessage(GENERIC_VALIDATION_ERROR_KEY, "first"), new ErrorMessage(
+                GENERIC_VALIDATION_ERROR_KEY, "second")), Collections.<String, ErrorMessage> emptyMap());
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, GENERIC_VALIDATION_ERROR_KEY, "first");
+        assertNothingRecomputed();
+    }
+
+    @Test
+    public final void shouldRejectWithGenericGlobalErrorWhenFieldErrorsAreNull() {
+        // given
+        givenInvalidSave(Collections.singletonList(new ErrorMessage(GENERIC_VALIDATION_ERROR_KEY)), null);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, GENERIC_VALIDATION_ERROR_KEY);
+        assertNothingRecomputed();
+    }
+
+    @Test
+    public final void shouldTakeFieldErrorsInModelFieldOrderRegardlessOfMapOrder() {
+        // given: the field error map holds the end time error before the start time error
+        Map<String, ErrorMessage> fieldErrors = new LinkedHashMap<String, ErrorMessage>();
+        fieldErrors.put(ProductionLineSchedulePositionFields.END_TIME, new ErrorMessage(END_TIME_ERROR_KEY));
+        fieldErrors.put(ProductionLineSchedulePositionFields.START_TIME, new ErrorMessage("some.field.error", "08:00"));
+
+        givenInvalidSave(Collections.singletonList(new ErrorMessage(GENERIC_VALIDATION_ERROR_KEY)), fieldErrors);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then: the model declares startTime before endTime
+        assertRejection(rejection, "some.field.error", "08:00");
+        assertNothingRecomputed();
+    }
+
+    @Test
+    public final void shouldTakeModelFieldErrorsBeforeOtherFieldErrors() {
+        // given: an error of a field the model does not declare, under a name sorting first, and an order field error
+        Map<String, ErrorMessage> fieldErrors = new LinkedHashMap<String, ErrorMessage>();
+        fieldErrors.put("aaUnknown", new ErrorMessage("unknown.field.error"));
+        fieldErrors.put(ProductionLineSchedulePositionFields.ORDER, new ErrorMessage("order.field.error"));
+
+        givenInvalidSave(Collections.<ErrorMessage> emptyList(), fieldErrors);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, "order.field.error");
+    }
+
+    @Test
+    public final void shouldTakeFieldErrorsInFieldNameOrderWithoutDataDefinition() {
+        // given: the saved position has no data definition; the map holds the start time error first
+        Map<String, ErrorMessage> fieldErrors = new LinkedHashMap<String, ErrorMessage>();
+        fieldErrors.put(ProductionLineSchedulePositionFields.START_TIME, new ErrorMessage("some.field.error"));
+        fieldErrors.put(ProductionLineSchedulePositionFields.END_TIME, new ErrorMessage(END_TIME_ERROR_KEY));
+
+        givenInvalidSave(Collections.<ErrorMessage> emptyList(), fieldErrors);
+        given(savedPosition.getDataDefinition()).willReturn(null);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then: endTime sorts before startTime
+        assertRejection(rejection, END_TIME_ERROR_KEY);
+    }
+
+    @Test
+    public final void shouldTakeFieldErrorsInFieldNameOrderWithoutFieldMap() {
+        // given: the data definition answers no field map; the map holds the start time error first
+        Map<String, ErrorMessage> fieldErrors = new LinkedHashMap<String, ErrorMessage>();
+        fieldErrors.put(ProductionLineSchedulePositionFields.START_TIME, new ErrorMessage("some.field.error"));
+        fieldErrors.put(ProductionLineSchedulePositionFields.END_TIME, new ErrorMessage(END_TIME_ERROR_KEY));
+
+        givenInvalidSave(Collections.<ErrorMessage> emptyList(), fieldErrors);
+        given(positionDD.getFields()).willReturn(null);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, END_TIME_ERROR_KEY);
+    }
+
+    @Test
+    public final void shouldTakeFieldErrorWithoutFieldNameAfterNamedFieldErrors() {
+        // given: a field error map holding a null value under a named field and an error under no field name
+        Map<String, ErrorMessage> namedAndUnnamed = new HashMap<String, ErrorMessage>();
+        namedAndUnnamed.put("aaUnknown", null);
+        namedAndUnnamed.put(null, new ErrorMessage("unnamed.field.error"));
+
+        givenInvalidSave(Collections.<ErrorMessage> emptyList(), namedAndUnnamed);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then
+        assertRejection(rejection, "unnamed.field.error");
+    }
+
+    @Test
     public final void shouldRejectWithSaveFailedWhenInvalidSaveHasNoErrors() {
         // given
         givenInvalidSave(Collections.<ErrorMessage> emptyList(), Collections.<String, ErrorMessage> emptyMap());
@@ -1129,7 +1307,33 @@ public class ProductionMaintenanceGanttMoveServiceTest {
 
     @Test
     public final void shouldWrapRecomputeExceptionAsRecomputeFailed() {
-        // given
+        // given: the saved position holds order ORD-1
+        IllegalStateException failure = new IllegalStateException("no finish date");
+
+        stubBelongsToField(savedPosition, ProductionLineSchedulePositionFields.ORDER, order);
+        givenRecomputeThrows(failure);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then: the rejection names the moved order, the target line and the dropped start, and keeps the failure as cause
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, ORDER_NUMBER, TARGET_LINE_NUMBER,
+                SLOT_FROM);
+        assertSame(failure, rejection.getCause());
+        verify(positionDD).save(position);
+        verify(recomputeService).recompute(schedule, savedPosition, lineL1, positionStart, lineL2, slotFrom);
+
+        // then: one warning names the moved position, the schedule and the target line, with the failure's stack trace
+        assertEquals(Collections.singletonList("Recompute after the Gantt move of production line schedule position 11 "
+                + "(production line schedule 7, target production line 2) failed"), loggedMessages(Level.WARN));
+        assertSame(failure, logAppender.events.get(0).getThrowableInformation().getThrowable());
+    }
+
+    @Test
+    public final void shouldWrapRecomputeExceptionWithoutOrderNumberWhenMovedPositionHasNoOrder() {
+        // given: the saved position holds no order
         IllegalStateException failure = new IllegalStateException("no finish date");
 
         givenRecomputeThrows(failure);
@@ -1140,10 +1344,56 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         MoveRejectedException rejection = rejectionOf(request);
 
         // then
-        assertRejection(rejection, ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY);
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, "", TARGET_LINE_NUMBER,
+                SLOT_FROM);
         assertSame(failure, rejection.getCause());
-        verify(positionDD).save(position);
-        verify(recomputeService).recompute(schedule, savedPosition, lineL1, positionStart, lineL2, slotFrom);
+    }
+
+    @Test
+    public final void shouldWrapRecomputeExceptionWithoutOrderNumberWhenOrderOfMovedPositionCannotBeRead() {
+        // given: reading the number of the saved position's order throws
+        IllegalStateException failure = new IllegalStateException("flush failed");
+        IllegalStateException readFailure = new IllegalStateException("Proxy can't load entity");
+        Entity unreadableOrder = mockEntity(21L);
+
+        given(unreadableOrder.getStringField(OrderFields.NUMBER)).willThrow(readFailure);
+        stubBelongsToField(savedPosition, ProductionLineSchedulePositionFields.ORDER, unreadableOrder);
+        givenRecomputeThrows(failure);
+
+        GanttChartMoveRequest request = moveRequest();
+
+        // when
+        MoveRejectedException rejection = rejectionOf(request);
+
+        // then: the rejection names no order and keeps the recompute failure as its cause; the read failure is logged at
+        // debug level after the warning
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, "", TARGET_LINE_NUMBER,
+                SLOT_FROM);
+        assertSame(failure, rejection.getCause());
+        assertEquals(2, logAppender.events.size());
+        assertEquals(Level.WARN, logAppender.events.get(0).getLevel());
+        assertEquals(Level.DEBUG, logAppender.events.get(1).getLevel());
+        assertEquals("Order number of the moved production line schedule position 11 could not be read",
+                logAppender.events.get(1).getRenderedMessage());
+        assertSame(readFailure, logAppender.events.get(1).getThrowableInformation().getThrowable());
+    }
+
+    @Test
+    public final void shouldBuildRecomputeFailedArgumentsOfOrderLineAndStart() {
+        // given
+        Entity orderWithoutNumber = mockEntity(22L);
+        Entity lineWithoutNumber = mockEntity(4L);
+
+        // when
+        String[] args = ProductionMaintenanceGanttMoveService.recomputeFailedArgs(order, lineL2, slotFrom);
+        String[] argsWithoutValues = ProductionMaintenanceGanttMoveService.recomputeFailedArgs(null, null, null);
+        String[] argsWithoutNumbers = ProductionMaintenanceGanttMoveService.recomputeFailedArgs(orderWithoutNumber,
+                lineWithoutNumber, positionStart);
+
+        // then
+        assertArrayEquals(new String[] { ORDER_NUMBER, TARGET_LINE_NUMBER, SLOT_FROM }, args);
+        assertArrayEquals(new String[] { "", "", "" }, argsWithoutValues);
+        assertArrayEquals(new String[] { "", "", POSITION_START }, argsWithoutNumbers);
     }
 
     @Test
@@ -1187,10 +1437,11 @@ public class ProductionMaintenanceGanttMoveServiceTest {
 
     @Test
     public final void shouldPropagateRecomputeRejectionUnchanged() {
-        // given
+        // given: the recompute service rejects naming a following position
         MoveRejectedException recomputeRejection = new MoveRejectedException(
-                ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY);
+                ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, OTHER_ORDER_NUMBER, TARGET_LINE_NUMBER, SLOT_TO);
 
+        stubBelongsToField(savedPosition, ProductionLineSchedulePositionFields.ORDER, order);
         givenRecomputeThrows(recomputeRejection);
 
         GanttChartMoveRequest request = moveRequest();
@@ -1198,10 +1449,13 @@ public class ProductionMaintenanceGanttMoveServiceTest {
         // when
         MoveRejectedException rejection = rejectionOf(request);
 
-        // then
+        // then: the rejection and its arguments are unchanged, and it is logged at debug level only
         assertSame(recomputeRejection, rejection);
-        assertRejection(rejection, ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY);
+        assertRejection(rejection, ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY, OTHER_ORDER_NUMBER,
+                TARGET_LINE_NUMBER, SLOT_TO);
         assertNull(rejection.getCause());
+        assertEquals(Collections.singletonList("Gantt move of production line schedule position 11 rejected with "
+                + ProductionMaintenanceGanttMoveService.RECOMPUTE_FAILED_KEY), loggedMessages(Level.DEBUG));
     }
 
     @Test
@@ -1705,6 +1959,19 @@ public class ProductionMaintenanceGanttMoveServiceTest {
             final int second, final int millis) {
         return new DateTime(year, month, day, hour, minute, second, millis, DateTimeZone.forTimeZone(TimeZone.getDefault()))
                 .toDate();
+    }
+
+    /**
+     * Returns a mocked field definition under each given field name, in the given order.
+     */
+    private static Map<String, FieldDefinition> fieldDefinitions(final String... fieldNames) {
+        Map<String, FieldDefinition> fields = new LinkedHashMap<String, FieldDefinition>();
+
+        for (String fieldName : fieldNames) {
+            fields.put(fieldName, mock(FieldDefinition.class));
+        }
+
+        return fields;
     }
 
     private static Entity productionLine(final Long id, final String number) {

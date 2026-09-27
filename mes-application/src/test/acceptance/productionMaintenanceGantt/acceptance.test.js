@@ -81,7 +81,8 @@
  *
  * http: cases post view events with Node's fetch. browser: cases drive the board in headless Chrome through the
  * DevTools Protocol with real mouse input. Database state is read, and concurrent transactions are run, with psql.
- * Every case works on its own draft schedule PMG-<caseName> of fixture.sql.
+ * Every case works on its own draft schedule PMG-<caseName> of fixture.sql, except
+ * browser:ganttButtonUnsavedChangesGuard, which reads PMG-rowMapping and writes nothing.
  */
 
 'use strict';
@@ -1124,6 +1125,11 @@ const CELL_HEIGHT_PX = 30;
 // Roles with a position in every fixture schedule.
 const POSITION_ROLES = ['A1', 'A2', 'A3', 'A4', 'A5', 'B1', 'B2', 'B3', 'B4', 'B5'];
 
+// Days from the first to the last day of the board's default date range (the ganttChart pattern's defaultStartDay 0 and
+// defaultEndDay 21, which the board view keeps). The initialize answer spans this many days from the day of the
+// schedule's earliest position.
+const BOARD_DEFAULT_RANGE_DAYS = 21;
+
 // Tables of the checksums other than the schedule's positions, keyed by checksum name.
 const PS_PPS_TABLES = {
     planOrderTimeCalculation: 'public.productionscheduling_planordertimecalculation',
@@ -1241,6 +1247,11 @@ function at(dayOffset, hhmm) {
 
     return formatWallClock(ARGS.baseDayMillis + dayOffset * 86400000 + Number(match[1]) * 3600000
         + Number(match[2]) * 60000);
+}
+
+/** Returns 'YYYY-MM-DD' of --base-day + dayOffset days, the form of the board header's dateFrom and dateTo. */
+function dayOf(dayOffset) {
+    return at(dayOffset, '00:00').slice(0, 10);
 }
 
 /** Returns the minutes from wall-clock date a to wall-clock date b. */
@@ -1846,6 +1857,25 @@ function norm(text) {
         .replace(/\s+/g, '');
 }
 
+/**
+ * Returns the text an HTML text node shows for the markup: decimal (&#58;) and hexadecimal (&#x3a;) character references
+ * become their characters, and the named entities of HTML_ENTITIES become theirs; tags and whitespace stay as they are.
+ */
+function decodeHtmlText(markup) {
+    return String(markup === undefined || markup === null ? '' : markup)
+        .replace(/&#x([0-9a-fA-F]+);|&#([0-9]+);|&(?:amp|lt|gt|quot|nbsp);/g, (entity, hex, decimal) => {
+            if (hex !== undefined) {
+                return String.fromCodePoint(parseInt(hex, 16));
+            }
+            if (decimal !== undefined) {
+                return String.fromCodePoint(parseInt(decimal, 10));
+            }
+
+            return HTML_ENTITIES[entity];
+        });
+}
+
+
 // ---------------------------------------------------------------------------------------------------------------
 // HTTP session
 // ---------------------------------------------------------------------------------------------------------------
@@ -2162,7 +2192,25 @@ function buildBody(name, scheduleId, headerParameters, args) {
     return { event, components };
 }
 
-/** Opens the board of the schedule, posts initialize and returns the gantt content with its headerParameters. */
+/**
+ * Returns the content of the board's title field in a response: the component named title next to the gantt at
+ * GANTT_PATH, or undefined when the response holds none.
+ */
+function titleContent(response) {
+    const names = GANTT_PATH.split('.').slice(0, -1).concat('title');
+    let node = { components: response && response.components };
+
+    for (const name of names) {
+        node = node && node.components ? node.components[name] : undefined;
+    }
+
+    return node ? node.content : undefined;
+}
+
+/**
+ * Opens the board of the schedule, posts initialize and returns the gantt content with its headerParameters, and the
+ * whole answer as response.
+ */
 async function initialize(session, scheduleId) {
     await session.openBoard(scheduleId);
 
@@ -2180,7 +2228,8 @@ async function initialize(session, scheduleId) {
             scale: found.content.zoomLevel,
             dateFrom: found.content.dateFrom,
             dateTo: found.content.dateTo
-        }
+        },
+        response
     };
 }
 
@@ -2217,6 +2266,36 @@ function itemById(content, id) {
     assert.equal(matches.length, 1, `exactly one item has id ${id}`);
 
     return matches[0];
+}
+
+// gantt.css: opacity of a bar, and of a hovered bar.
+const BAR_OPACITIES = [0.7, 1];
+
+// WCAG 2.x AA minimum contrast ratio of normal-size text.
+const MINIMUM_LABEL_CONTRAST = 4.5;
+
+// WCAG 2.x relative luminance weights of the red, green and blue channels.
+const LUMINANCE_WEIGHTS = [0.2126, 0.7152, 0.0722];
+
+/**
+ * Returns the WCAG 2.x contrast ratio of a black label against a strip of the #RRGGBB colour, both drawn at the bar
+ * opacity over a white background: each channel is composited as opacity * channel + (1 - opacity) * 255.
+ */
+function blackLabelContrast(stripColor, opacity) {
+    const match = /^#([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})$/.exec(String(stripColor));
+
+    assert.ok(match, `strip colour ${JSON.stringify(stripColor)} has the form #RRGGBB`);
+
+    const luminance = (channels) => channels.reduce((sum, channel, index) => {
+        const value = (opacity * channel + (1 - opacity) * 255) / 255;
+        const linear = value <= 0.03928 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4);
+
+        return sum + LUMINANCE_WEIGHTS[index] * linear;
+    }, 0);
+    const strip = luminance(match.slice(1).map((hex) => parseInt(hex, 16)));
+    const label = luminance([0, 0, 0]);
+
+    return (Math.max(strip, label) + 0.05) / (Math.min(strip, label) + 0.05);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -4347,7 +4426,6 @@ before(async () => {
         routing: message('orders.error.inappropriateProductionLineForPositionOrder'),
         shutdownWindow: message('cmmsMachineParts.productionMaintenanceGantt.move.error.shutdownWindow', 'PMG-EV-SHUTDOWN'),
         outsideWorkingHours: message('cmmsMachineParts.productionMaintenanceGantt.move.error.outsideWorkingHours'),
-        recomputeFailed: message('cmmsMachineParts.productionMaintenanceGantt.move.error.recomputeFailed'),
         optimisticLock: message('qcadooView.validate.global.optimisticLock'),
         rejectedHeader: message('qcadooView.gantt.move.rejectedHeader')
     };
@@ -5113,8 +5191,21 @@ function crossRowMoveAt0930() {
 test('http:rowMapping', { timeout: CASE_TIMEOUT_MS }, async () => {
     const fixture = fx('rowMapping');
     const session = await httpLogin();
-    const { content } = await initialize(session, fixture.scheduleId);
+    const { content, response } = await initialize(session, fixture.scheduleId);
     const stored = await positionState('rowMapping');
+
+    // Date range: from D1, the day of the schedule's earliest position, for the board's default number of days.
+    assert.deepStrictEqual({ dateFrom: content.dateFrom, dateTo: content.dateTo },
+        { dateFrom: dayOf(1), dateTo: dayOf(1 + BOARD_DEFAULT_RANGE_DAYS) }, 'the initialize answer opens on the schedule');
+
+    // Title: the schedule's number and name (fixture.sql gives both the value PMG-<case>) and its draft state.
+    const title = titleContent(response);
+
+    assert.ok(title, 'the initialize answer renders the title field');
+    assert.equal(decodeHtmlText(title.value),
+        message('cmmsMachineParts.productionMaintenanceGantt.window.mainTab.title.schedule', 'PMG-rowMapping - PMG-rowMapping',
+            message('orders.productionLineSchedule.state.value.01draft')),
+        'the title names the schedule and its state');
 
     // Rows: seed line Line, then PMG-A and PMG-B; no overlaps.
     assert.deepStrictEqual(content.rows, ['Line', 'PMG-A', 'PMG-B']);
@@ -5157,6 +5248,30 @@ test('http:rowMapping', { timeout: CASE_TIMEOUT_MS }, async () => {
         { row: 'PMG-B', idIsNull: true, dateFrom: at(3, '08:00'), dateTo: at(3, '10:00') }
     ]);
 
+    // Every event item has one full-width strip. A black label on it, both drawn at the opacity of a bar and of a
+    // hovered bar over white, reaches MINIMUM_LABEL_CONTRAST. The strip colour of PMG-EV-SHUTDOWN (requires shutdown)
+    // differs from the one strip colour of PMG-EV-DIVISION (no shutdown).
+    for (const item of shutdownItems.concat(divisionItems)) {
+        const where = `${item.info.name} on ${item.row}`;
+
+        assert.ok(Array.isArray(item.strips), `${where} has strips`);
+        assert.deepStrictEqual(item.strips.map((strip) => strip.size), [100], `${where} has one strip of size 100`);
+
+        for (const opacity of BAR_OPACITIES) {
+            const contrast = blackLabelContrast(item.strips[0].color, opacity);
+
+            assert.ok(contrast >= MINIMUM_LABEL_CONTRAST,
+                `label contrast of ${where} at opacity ${opacity} is ${contrast.toFixed(2)}:1`);
+        }
+    }
+
+    const shutdownColor = shutdownItems[0].strips[0].color.toUpperCase();
+    const divisionColors = new Set(divisionItems.map((item) => item.strips[0].color.toUpperCase()));
+
+    assert.equal(divisionColors.size, 1, 'PMG-EV-DIVISION has one strip colour on every line');
+    assert.ok(!divisionColors.has(shutdownColor),
+        `the PMG-EV-SHUTDOWN strip colour ${shutdownColor} differs from the PMG-EV-DIVISION strip colour`);
+
     // No item on row Line, and no PMG- item other than this schedule's orders and the PMG-EV- events.
     assert.deepStrictEqual(content.items.filter((item) => item.row === 'Line'), []);
 
@@ -5178,6 +5293,16 @@ test('browser:acceptedCrossRowMove', { timeout: CASE_TIMEOUT_MS }, async () => {
 
     const board = await browserOpenBoard(fixture.scheduleId, a2.positionId);
     const item = itemById(findGanttContent(board.response).content, a2.positionId);
+
+    // The board opens on the schedule: the header starts on D1 and the A2 bar lies in the unscrolled rows pane.
+    const opened = await requireBar(a2.positionId);
+    const openedCenter = { x: opened.centerX, y: opened.centerY };
+
+    assert.equal(findGanttContent(board.response).content.dateFrom, dayOf(1), 'the board opens on D1');
+    assert.equal(opened.scrollLeft, 0, 'the rows pane opens unscrolled');
+    assert.ok(isInside(openedCenter, opened.visible),
+        `the A2 bar centre ${JSON.stringify(openedCenter)} lies in the visible rows ${JSON.stringify(opened.visible)}`);
+
     const beforeMove = await positionState('acceptedCrossRowMove');
     const drag = await browserDrag({ item, targetRow: 'PMG-B', targetDate: at(1, '10:00') });
 
@@ -5459,9 +5584,13 @@ test('http:rollbackAfterPsSideEffect', { timeout: CASE_TIMEOUT_MS }, async () =>
 
     // A2 -> PMG-B at D1 07:00: B2 is recomputed, then B3 (PMG-T-ZERO) yields no data.
     const content = await postMove(session, fixture.scheduleId, board.headerParameters, item, 'PMG-B', at(1, '07:00'));
+    // The rejection names B3 with its order number, its row and its start as stored before the move.
+    const expectedRecomputeFailed = message('cmmsMachineParts.productionMaintenanceGantt.move.error.recomputeFailed',
+        fixture.roles.B3.orderNumber, 'PMG-B', fixture.roles.B3.start);
 
     assert.equal(content.moveResult.accepted, false, `the move is rejected (message: ${content.moveResult.message})`);
-    assert.equal(norm(content.moveResult.message), norm(EXPECTED.recomputeFailed), 'the rejection is recomputeFailed');
+    assert.equal(norm(content.moveResult.message), norm(expectedRecomputeFailed),
+        'the rejection is recomputeFailed naming B3');
     assert.deepStrictEqual(await checksums(fixture.scheduleId), beforeMove, 'no persisted change');
 
     // The rolled-back move inserted plan order time calculations: n_tup_ins grows once the application backends report.
@@ -5474,4 +5603,506 @@ test('http:rollbackAfterPsSideEffect', { timeout: CASE_TIMEOUT_MS }, async () =>
 
         return lastInserts > baselineInserts.value;
     }, { timeout: 10000, interval: 500, detail: () => `baseline ${baselineInserts.value}, last ${lastInserts}` });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Schedule-details entry button: unsaved-changes guard
+// ---------------------------------------------------------------------------------------------------------------
+
+const DETAILS_PATH = '/page/orders/productionLineScheduleDetails.html';
+
+// Path of the "Production and maintenance Gantt" item in the ribbon of the schedule details window.
+const GANTT_RIBBON_ITEM = 'productionMaintenanceGantt.showProductionMaintenanceGantt';
+
+// How long a click on the button may take to open the unsaved-changes confirm.
+const UNSAVED_CONFIRM_TIMEOUT_MS = 15000;
+
+// Quiet period after a declined confirm during which no request to the details view may start.
+const DECLINED_CONFIRM_QUIET_MS = 2000;
+
+/**
+ * Records every POST to DETAILS_PATH from its creation until stop(): request id, the name of the view event in its
+ * post data (read with Network.getRequestPostData when the request event omits it), HTTP status, redirect statuses,
+ * and whether it finished or failed.
+ */
+class DetailsRequestRecorder {
+    constructor(devtools) {
+        this.entries = [];
+
+        const byId = new Map();
+        const eventName = (postData) => {
+            try {
+                const event = JSON.parse(postData).event;
+
+                return event && event.name ? event.name : null;
+            } catch (error) {
+                return null;
+            }
+        };
+
+        this.unsubscribers = [
+            devtools.on('Network.requestWillBeSent', (params) => {
+                const known = byId.get(params.requestId);
+
+                if (known && params.redirectResponse) {
+                    known.redirects.push(params.redirectResponse.status);
+                    return;
+                }
+                if (params.request.method !== 'POST' || urlPath(params.request.url) !== DETAILS_PATH) {
+                    return;
+                }
+
+                const entry = {
+                    requestId: params.requestId,
+                    event: null,
+                    postDataPending: false,
+                    status: null,
+                    redirects: [],
+                    finished: false,
+                    failed: null
+                };
+
+                if (params.request.postData !== undefined) {
+                    entry.event = eventName(params.request.postData);
+                } else if (params.request.hasPostData) {
+                    entry.postDataPending = true;
+                    devtools.command('Network.getRequestPostData', { requestId: params.requestId })
+                        .then((result) => {
+                            entry.event = eventName(result.postData);
+                        }, (error) => {
+                            entry.failed = `post data unavailable: ${error.message}`;
+                        })
+                        .finally(() => {
+                            entry.postDataPending = false;
+                        });
+                }
+
+                this.entries.push(entry);
+                byId.set(params.requestId, entry);
+            }),
+            devtools.on('Network.responseReceived', (params) => {
+                const entry = byId.get(params.requestId);
+
+                if (entry && params.response) {
+                    entry.status = params.response.status;
+                }
+            }),
+            devtools.on('Network.loadingFinished', (params) => {
+                const entry = byId.get(params.requestId);
+
+                if (entry) {
+                    entry.finished = true;
+                }
+            }),
+            devtools.on('Network.loadingFailed', (params) => {
+                const entry = byId.get(params.requestId);
+
+                if (entry) {
+                    entry.failed = params.errorText || 'loading failed';
+                }
+            })
+        ];
+    }
+
+    stop() {
+        for (const unsubscribe of this.unsubscribers) {
+            unsubscribe();
+        }
+
+        this.unsubscribers = [];
+    }
+
+    /** Returns {requestId, event, status, redirects, finished, failed} of each entry, failed through diagnosticText. */
+    summary() {
+        return this.entries.map((entry) => ({
+            requestId: entry.requestId,
+            event: entry.event,
+            status: entry.status,
+            redirects: entry.redirects,
+            finished: entry.finished,
+            failed: entry.failed === null ? null : diagnosticText(entry.failed)
+        }));
+    }
+
+    /**
+     * Waits until exactly one finished request carries the event and no post data is still being read, then asserts
+     * that it answered HTTP 200 without a redirect and that no other request to DETAILS_PATH was sent. Fails at once
+     * when a request failed or a second request carries the event.
+     */
+    async single(name, timeout) {
+        const entry = await waitFor(`one ${name} request to ${DETAILS_PATH}`, () => {
+            const failed = this.entries.find((candidate) => candidate.failed);
+
+            if (failed) {
+                throw new FatalError(`request ${failed.requestId} to ${DETAILS_PATH} failed: `
+                    + diagnosticText(failed.failed));
+            }
+            if (this.entries.some((candidate) => candidate.postDataPending)) {
+                return false;
+            }
+
+            const matching = this.entries.filter((candidate) => candidate.event === name);
+
+            if (matching.length > 1) {
+                throw new FatalError(`${matching.length} ${name} requests were sent to ${DETAILS_PATH}`);
+            }
+
+            return matching.length === 1 && matching[0].finished ? matching[0] : false;
+        }, { timeout, interval: 50, detail: () => JSON.stringify(this.summary()) });
+
+        assert.equal(entry.status, 200, `the ${name} request answers HTTP 200`);
+        assert.deepStrictEqual(entry.redirects, [], `the ${name} request is not redirected`);
+        assert.deepStrictEqual(this.entries.map((candidate) => candidate.event), [name],
+            `no request to ${DETAILS_PATH} other than the ${name} request (${JSON.stringify(this.summary())})`);
+
+        return entry;
+    }
+}
+
+/**
+ * Records the JavaScript dialogs of the page from its creation until stop(): opened holds the type and message of
+ * every Page.javascriptDialogOpening event, and isOpen is true from such an event until the next
+ * Page.javascriptDialogClosed.
+ */
+class DialogRecorder {
+    constructor(devtools) {
+        this.opened = [];
+        this.isOpen = false;
+        this.unsubscribers = [
+            devtools.on('Page.javascriptDialogOpening', (params) => {
+                this.opened.push({ type: params.type, message: params.message });
+                this.isOpen = true;
+            }),
+            devtools.on('Page.javascriptDialogClosed', () => {
+                this.isOpen = false;
+            })
+        ];
+    }
+
+    stop() {
+        for (const unsubscribe of this.unsubscribers) {
+            unsubscribe();
+        }
+
+        this.unsubscribers = [];
+    }
+}
+
+/**
+ * Reads the schedule details page in the main page iframe: its path, whether W.mainController exists, the form's
+ * entity id, whether the ribbon item GANTT_RIBBON_ITEM is enabled, whether a .blockUI overlay is present, the number
+ * of inputs whose id ends with '.name_input', the value of the only one, and the form's isChanged(). Page fields are
+ * null while the iframe shows another page.
+ */
+async function readScheduleDetails() {
+    return DEVTOOLS.evaluate(frameExpression(`
+        const state = {
+            path: W ? W.location.pathname : null,
+            mainController: !!(W && W.mainController),
+            entityId: null,
+            ganttEnabled: null,
+            blocked: null,
+            nameInputs: null,
+            name: null,
+            changed: null
+        };
+        if (!state.mainController || !D || state.path !== ${JSON.stringify(DETAILS_PATH)}) { return state; }
+        const form = W.mainController.getComponentByReferenceName('form');
+        const ribbonWindow = W.mainController.getComponentByReferenceName('window');
+        if (!form || !ribbonWindow) { return state; }
+        const value = form.getValue();
+        const item = ribbonWindow.getRibbonItem(${JSON.stringify(GANTT_RIBBON_ITEM)});
+        const inputs = Array.prototype.filter.call(D.querySelectorAll('input[id]'),
+            (input) => /\\.name_input$/.test(input.id));
+        state.entityId = value && value.content && value.content.entityId != null
+            ? String(value.content.entityId) : null;
+        state.ganttEnabled = !!item && item.isEnabled();
+        state.blocked = D.querySelector('.blockUI') !== null;
+        state.nameInputs = inputs.length;
+        state.name = inputs.length === 1 ? inputs[0].value : null;
+        state.changed = form.isChanged();
+        return state;`, { requireFrame: false }));
+}
+
+/**
+ * Opens the details of the schedule in the main page iframe with the context {"form.id": scheduleId}, and waits until
+ * the form shows the schedule with the "Production and maintenance Gantt" item enabled and no .blockUI overlay.
+ * Asserts one Name input holding storedName and an unchanged form. Returns the page state of readScheduleDetails.
+ */
+async function browserOpenScheduleDetails(scheduleId, storedName) {
+    const pageUrl = `${DETAILS_PATH}?lang=en&context=`;
+
+    await DEVTOOLS.evaluate(`(() => {
+        window.goToPage(window.encodeParams(${JSON.stringify(pageUrl)}
+            + JSON.stringify({ 'form.id': ${JSON.stringify(String(scheduleId))} })), null, false);
+        return true;
+    })()`);
+
+    let state = null;
+
+    await waitFor(`the details of schedule ${scheduleId} in the main page iframe`, async () => {
+        state = await readScheduleDetails();
+
+        return state !== null && state.entityId === String(scheduleId) && state.ganttEnabled === true
+            && state.blocked === false;
+    }, { timeout: 120000, interval: 250, detail: () => JSON.stringify(state) });
+
+    assert.equal(state.nameInputs, 1, 'the details page holds one input whose id ends with .name_input');
+    assert.equal(state.name, storedName, 'the Name input holds the stored name');
+    assert.equal(state.changed, false, 'the opened form is unchanged');
+
+    return state;
+}
+
+/**
+ * Reads the anchor of the ribbon item GANTT_RIBBON_ITEM: whether the item is enabled, its centre in top-level CSS
+ * pixels, and whether it is the topmost element there (the iframe at top level, the anchor or an element inside it
+ * within the iframe). Returns null when the iframe shows no page with that item.
+ */
+async function readGanttButton() {
+    return DEVTOOLS.evaluate(frameExpression(`
+        if (!W.mainController || W.location.pathname !== ${JSON.stringify(DETAILS_PATH)}) { return null; }
+        const ribbonWindow = W.mainController.getComponentByReferenceName('window');
+        const item = ribbonWindow ? ribbonWindow.getRibbonItem(${JSON.stringify(GANTT_RIBBON_ITEM)}) : null;
+        const anchor = item && item.element && item.element[0] ? item.element[0].querySelector('a') : null;
+        if (!anchor) { return null; }
+        const frameRect = F.getBoundingClientRect();
+        const rect = anchor.getBoundingClientRect();
+        const frameX = rect.left + rect.width / 2;
+        const frameY = rect.top + rect.height / 2;
+        const centerX = frameRect.left + F.clientLeft + frameX;
+        const centerY = frameRect.top + F.clientTop + frameY;
+        const frameHit = D.elementFromPoint(frameX, frameY);
+        return {
+            enabled: item.isEnabled(),
+            centerX: centerX,
+            centerY: centerY,
+            width: rect.width,
+            height: rect.height,
+            hit: document.elementFromPoint(centerX, centerY) === F && !!frameHit
+                && (frameHit === anchor || anchor.contains(frameHit))
+        };`));
+}
+
+/**
+ * Clicks the "Production and maintenance Gantt" button with real mouse input once it is enabled, uncovered and at a
+ * stable place. Sends the mouseReleased without awaiting its reply, which Chrome sends only once a dialog the click
+ * opened is closed, and meanwhile watches dialogs.opened:
+ * - confirm === null: fails when a dialog opens, and returns once the release is acknowledged;
+ * - confirm = {message, accept}: fails with 'no unsaved-changes confirm appeared' when no dialog opens within
+ *   UNSAVED_CONFIRM_TIMEOUT_MS, asserts a 'confirm' dialog with the message, answers it with accept and awaits the
+ *   release.
+ * The release promise, settled without rejecting, is pushed onto pendingReleases, which the caller awaits in its
+ * cleanup once it has dismissed any dialog still open.
+ */
+async function clickGanttButton(dialogs, confirm, pendingReleases) {
+    let previous = null;
+    const button = await waitFor('an enabled, uncovered, stable Production and maintenance Gantt button', async () => {
+        const current = await readGanttButton();
+        const stable = previous !== null && JSON.stringify(current) === JSON.stringify(previous);
+
+        previous = current;
+
+        return stable && current !== null && current.enabled && current.hit ? current : false;
+    }, { timeout: 30000, interval: 100, detail: () => JSON.stringify(previous) });
+    const point = { x: button.centerX, y: button.centerY };
+    const dialogsBefore = dialogs.opened.length;
+    const release = { done: false, error: null };
+
+    await dispatchMouse('mouseMoved', point, { button: 'none', buttons: 0 });
+
+    try {
+        await dispatchMouse('mousePressed', point, { button: 'left', buttons: 1, clickCount: 1 });
+    } catch (error) {
+        await releaseLeftButton(point);
+        throw error;
+    }
+
+    const releaseSettled = dispatchMouse('mouseReleased', point, { button: 'left', buttons: 0, clickCount: 1 })
+        .then(() => {
+            release.done = true;
+        }, (error) => {
+            release.done = true;
+            release.error = error;
+        });
+
+    pendingReleases.push(releaseSettled);
+
+    if (confirm === null) {
+        const outcome = await waitFor('the click on the Production and maintenance Gantt button', () => {
+            if (dialogs.opened.length > dialogsBefore) {
+                return 'dialog';
+            }
+
+            return release.done ? 'released' : false;
+        }, { timeout: DEVTOOLS_COMMAND_TIMEOUT_MS + 5000, interval: 50 });
+
+        if (outcome === 'dialog') {
+            const dialog = dialogs.opened[dialogsBefore];
+
+            assert.fail(`an unexpected ${dialog.type} dialog opened on the click: ${diagnosticText(dialog.message)}`);
+        }
+        if (release.error) {
+            throw release.error;
+        }
+
+        return;
+    }
+
+    let dialog;
+
+    try {
+        dialog = await waitFor('a JavaScript dialog after the click on the Production and maintenance Gantt button',
+            () => (dialogs.opened.length > dialogsBefore ? dialogs.opened[dialogsBefore] : false),
+            { timeout: UNSAVED_CONFIRM_TIMEOUT_MS, interval: 50 });
+    } catch (error) {
+        throw new Error(`no unsaved-changes confirm appeared: ${error.message}`);
+    }
+
+    assert.equal(dialog.type, 'confirm', 'the click opens a confirm dialog');
+    assert.equal(dialog.message, confirm.message, 'the confirm asks about the unsaved changes');
+
+    await DEVTOOLS.command('Page.handleJavaScriptDialog', { accept: confirm.accept });
+    await releaseSettled;
+
+    if (release.error) {
+        throw release.error;
+    }
+}
+
+/**
+ * Waits until the main page iframe shows the board of the schedule: the board path, W.mainController, at least three
+ * rows and the bar of the position.
+ */
+async function waitForBoardInFrame(scheduleId, positionId) {
+    let frameState = null;
+
+    await waitFor(`the board of schedule ${scheduleId} in the main page iframe`, async () => {
+        frameState = await DEVTOOLS.evaluate(frameExpression(`
+            const state = {
+                path: W ? W.location.pathname : null,
+                mainController: !!(W && W.mainController),
+                rows: D ? D.querySelectorAll('.ganttRowNameElement').length : 0,
+                bar: !!D && !!D.getElementById(${JSON.stringify(barElementId(positionId))})
+            };
+            state.ready = state.path === ${JSON.stringify(BOARD_PATH)} && state.mainController && state.rows >= 3
+                && state.bar;
+            return state;`, { requireFrame: false }));
+
+        return frameState !== null && frameState !== undefined && frameState.ready;
+    }, { timeout: 120000, interval: 250, detail: () => JSON.stringify(frameState) });
+}
+
+/** Returns the stored name of the schedule. */
+async function scheduleName(scheduleId) {
+    const row = await psqlJson(`
+SELECT json_build_object('name', s.name)
+FROM public.orders_productionlineschedule s
+WHERE s.id = ${Number(scheduleId)};
+`);
+
+    return row.name;
+}
+
+test('browser:ganttButtonUnsavedChangesGuard', { timeout: CASE_TIMEOUT_MS }, async () => {
+    // Reads schedule PMG-rowMapping and persists nothing.
+    const fixture = fx('rowMapping');
+    const boardBarId = fixture.roles.A1.positionId;
+    const storedName = await scheduleName(fixture.scheduleId);
+    const unsavedName = `${storedName}-UNSAVED`;
+    const expectedConfirm = message('qcadooView.backWithChangesConfirmation');
+    const dialogs = new DialogRecorder(DEVTOOLS);
+    const recorders = [];
+    const pendingReleases = [];
+    const record = () => {
+        const recorder = new DetailsRequestRecorder(DEVTOOLS);
+
+        recorders.push(recorder);
+
+        return recorder;
+    };
+
+    try {
+        await browserLogin();
+
+        // (a) Unchanged form: the button opens the board without a dialog.
+        await browserOpenScheduleDetails(fixture.scheduleId, storedName);
+
+        const unchangedRequests = record();
+
+        await clickGanttButton(dialogs, null, pendingReleases);
+        await unchangedRequests.single('showProductionMaintenanceGantt', 60000);
+        await waitForBoardInFrame(fixture.scheduleId, boardBarId);
+        assert.equal(dialogs.opened.length, 0, 'no dialog opens for an unchanged form');
+
+        // (b) Unsaved Name edit, confirm declined: nothing is sent and the edit stays on the page.
+        await browserOpenScheduleDetails(fixture.scheduleId, storedName);
+
+        const focused = await DEVTOOLS.evaluate(frameExpression(`
+            const input = Array.prototype.filter.call(D.querySelectorAll('input[id]'),
+                (candidate) => /\\.name_input$/.test(candidate.id))[0];
+            input.focus();
+            input.select();
+            return D.activeElement === input && input.selectionStart === 0
+                && input.selectionEnd === input.value.length;`));
+
+        assert.equal(focused, true, 'the Name input is focused with its whole value selected');
+
+        await DEVTOOLS.command('Input.insertText', { text: unsavedName });
+
+        const edited = await readScheduleDetails();
+
+        assert.deepStrictEqual({ name: edited.name, changed: edited.changed }, { name: unsavedName, changed: true },
+            'the typed name is in the Name input and the form is changed');
+
+        const declinedRequests = record();
+
+        await clickGanttButton(dialogs, { message: expectedConfirm, accept: false }, pendingReleases);
+        await pause(DECLINED_CONFIRM_QUIET_MS);
+
+        assert.deepStrictEqual(declinedRequests.summary(), [],
+            `no request to ${DETAILS_PATH} after the declined confirm`);
+
+        const afterDecline = await readScheduleDetails();
+
+        assert.deepStrictEqual({
+            path: afterDecline.path,
+            entityId: afterDecline.entityId,
+            name: afterDecline.name,
+            changed: afterDecline.changed
+        }, {
+            path: DETAILS_PATH,
+            entityId: String(fixture.scheduleId),
+            name: unsavedName,
+            changed: true
+        }, 'the details page still shows the schedule with the unsaved name');
+
+        // (c) Confirm accepted: one showProductionMaintenanceGantt request, and the board opens.
+        const acceptedRequests = record();
+
+        await clickGanttButton(dialogs, { message: expectedConfirm, accept: true }, pendingReleases);
+        await acceptedRequests.single('showProductionMaintenanceGantt', 60000);
+        await waitForBoardInFrame(fixture.scheduleId, boardBarId);
+        assert.equal(dialogs.opened.length, 2, 'one confirm per click on the changed form');
+
+        // (d) The unsaved name never reached the database.
+        assert.equal(await scheduleName(fixture.scheduleId), storedName, 'the stored name is unchanged');
+    } finally {
+        if (dialogs.isOpen) {
+            try {
+                await DEVTOOLS.command('Page.handleJavaScriptDialog', { accept: false });
+            } catch (error) {
+                process.stderr.write(`acceptance.test.js: dismissing the dialog left open by `
+                    + `browser:ganttButtonUnsavedChangesGuard failed: ${error.message}\n`);
+            }
+        }
+
+        await Promise.all(pendingReleases);
+
+        for (const recorder of recorders) {
+            recorder.stop();
+        }
+
+        dialogs.stop();
+    }
 });

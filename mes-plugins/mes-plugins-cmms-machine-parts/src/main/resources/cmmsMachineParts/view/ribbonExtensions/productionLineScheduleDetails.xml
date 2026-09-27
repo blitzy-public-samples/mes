@@ -56,11 +56,17 @@
                         attributeFilter: ["class"]
                     });
 
-                    // Cancels the anchor's default navigation for a click on the disabled item, in the capture phase,
-                    // before the ribbon's own click handler runs.
+                    // Handles a click on the item in the capture phase, before the ribbon's own click handler runs:
+                    // disabled item - cancels the anchor's default navigation;
+                    // enabled item - asks window.canClose() and, when it returns false (unsaved changes, confirm
+                    // declined), cancels the anchor's default navigation and stops the click, so neither the ribbon's
+                    // handler nor the button's action runs and the form keeps its values.
                     showProductionMaintenanceGanttItem.element[0].addEventListener("click", function(event) {
                         if (!showProductionMaintenanceGanttItem.isEnabled()) {
                             event.preventDefault();
+                        } else if (!window.canClose()) {
+                            event.preventDefault();
+                            event.stopImmediatePropagation();
                         }
                     }, true);
 

@@ -35,6 +35,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
@@ -44,7 +45,9 @@ import static org.springframework.test.util.ReflectionTestUtils.setField;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -59,6 +62,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 import org.junit.Before;
 import org.junit.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Matchers;
 import org.mockito.Mock;
@@ -70,6 +74,13 @@ import org.springframework.dao.ConcurrencyFailureException;
 import com.qcadoo.localization.api.TranslationService;
 import com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt.ProductionMaintenanceGanttChartItemResolver;
 import com.qcadoo.mes.cmmsMachineParts.productionMaintenanceGantt.ProductionMaintenanceGanttMoveService;
+import com.qcadoo.mes.orders.constants.OrdersConstants;
+import com.qcadoo.mes.orders.states.constants.ScheduleState;
+import com.qcadoo.mes.orders.states.constants.ScheduleStateStringValues;
+import com.qcadoo.model.api.DataDefinition;
+import com.qcadoo.model.api.DataDefinitionService;
+import com.qcadoo.model.api.Entity;
+import com.qcadoo.model.api.search.SearchQueryBuilder;
 import com.qcadoo.view.api.ComponentState.MessageType;
 import com.qcadoo.view.api.ViewDefinitionState;
 import com.qcadoo.view.api.components.FieldComponent;
@@ -97,8 +108,12 @@ import com.qcadoo.view.internal.components.ganttChart.GanttChartMoveRequest;
  * propagates the resolver exception of the refresh after the move without calling the move service again, after which the
  * component fails to render.
  * <p>
- * Two tests cover {@link ProductionMaintenanceGanttListeners#fillTitle(ViewDefinitionState)} with a mocked
- * {@link TranslationService}: on an initialized view and on a view after reload.
+ * The tests of {@link ProductionMaintenanceGanttListeners#fillTitle(ViewDefinitionState)} run with a mocked
+ * {@link TranslationService}, a mocked schedule data definition answering the title query, and a spy of a real
+ * {@link ProductionMaintenanceGanttChartItemResolver} parsing the schedule id the mocked Gantt component's context holds.
+ * They cover the caption for a missing, malformed or unknown schedule id and for a schedule with neither number nor name;
+ * the title naming the schedule by number and name, by number alone and by name alone, as plain text; the state label of
+ * every declared state, of a blank state and of an undeclared state; and a view after reload, which is left untouched.
  */
 public class ProductionMaintenanceGanttListenersTest {
 
@@ -124,6 +139,8 @@ public class ProductionMaintenanceGanttListenersTest {
 
     private static final String L_TRANSLATED_PREFIX = "translated:";
 
+    private static final String L_SCHEDULE_STATE_PREFIX = "orders.productionLineSchedule.state.value.";
+
     private ProductionMaintenanceGanttListeners productionMaintenanceGanttListeners;
 
     @Mock
@@ -138,6 +155,17 @@ public class ProductionMaintenanceGanttListenersTest {
     @Mock
     private GanttChartItem item;
 
+    @Mock
+    private DataDefinitionService dataDefinitionService;
+
+    @Mock
+    private DataDefinition scheduleDD;
+
+    @Mock
+    private SearchQueryBuilder scheduleQuery;
+
+    private ProductionMaintenanceGanttChartItemResolver productionMaintenanceGanttChartItemResolver;
+
     private GanttChartMoveRequest moveRequest;
 
     @Before
@@ -145,9 +173,13 @@ public class ProductionMaintenanceGanttListenersTest {
         MockitoAnnotations.initMocks(this);
 
         productionMaintenanceGanttListeners = new ProductionMaintenanceGanttListeners();
+        productionMaintenanceGanttChartItemResolver = spy(new ProductionMaintenanceGanttChartItemResolver());
 
         setField(productionMaintenanceGanttListeners, "productionMaintenanceGanttMoveService",
                 productionMaintenanceGanttMoveService);
+        setField(productionMaintenanceGanttListeners, "dataDefinitionService", dataDefinitionService);
+        setField(productionMaintenanceGanttListeners, "productionMaintenanceGanttChartItemResolver",
+                productionMaintenanceGanttChartItemResolver);
 
         given(item.getEntityId()).willReturn(L_POSITION_ID);
 
@@ -468,12 +500,10 @@ public class ProductionMaintenanceGanttListenersTest {
     public final void shouldFillTitleWithTranslatedLabelWhenViewIsInitialized() {
         // given
         TranslationService translationService = injectTranslationService();
-        FieldComponent title = mock(FieldComponent.class);
+        FieldComponent title = stubTitleView(null);
         String translatedTitle = "Produktions- und Instandhaltungskalender";
 
-        given(view.isViewAfterReload()).willReturn(false);
         given(view.getLocale()).willReturn(Locale.GERMAN);
-        given(view.getComponentByReference("title")).willReturn(title);
         given(translationService.translate(ProductionMaintenanceGanttListeners.TITLE_TRANSLATION_KEY, Locale.GERMAN))
                 .willReturn(translatedTitle);
 
@@ -489,6 +519,250 @@ public class ProductionMaintenanceGanttListenersTest {
                 Locale.GERMAN);
         verify(title, times(1)).setFieldValue(translatedTitle);
         verify(title, times(1)).requestComponentUpdateState();
+        verify(gantt, times(1)).getContextValue(ProductionMaintenanceGanttChartItemResolver.CONTEXT_SCHEDULE_ID);
+        verifyZeroInteractions(dataDefinitionService);
+    }
+
+    @Test
+    public final void shouldFillTitleWithScheduleNumberNameAndState() {
+        // given
+        injectTitleTranslations(Collections.<String, String> emptyMap());
+        FieldComponent title = stubTitleView(L_SCHEDULE_ID);
+        stubScheduleRow(5L, "PS-1", "Week 41", ScheduleStateStringValues.DRAFT);
+
+        // when
+        productionMaintenanceGanttListeners.fillTitle(view);
+
+        // then
+        InOrder inOrder = inOrder(title);
+        inOrder.verify(title).setFieldValue(scheduleTitle("PS-1 - Week 41", L_SCHEDULE_STATE_PREFIX
+                + ScheduleStateStringValues.DRAFT));
+        inOrder.verify(title).requestComponentUpdateState();
+
+        verify(title, times(1)).setFieldValue(Matchers.anyObject());
+        verify(dataDefinitionService, times(1)).get(OrdersConstants.PLUGIN_IDENTIFIER,
+                OrdersConstants.MODEL_PRODUCTION_LINE_SCHEDULE);
+        verify(scheduleDD, times(1)).find(ProductionMaintenanceGanttListeners.SCHEDULE_TITLE_QUERY);
+        verify(scheduleQuery, times(1)).setLong("scheduleId", 5L);
+        verify(scheduleQuery, times(1)).uniqueResult();
+        verifyNoMoreInteractions(dataDefinitionService, scheduleDD, scheduleQuery);
+    }
+
+    @Test
+    public final void shouldReadPaddedScheduleIdOfGanttContext() {
+        // given
+        injectTitleTranslations(Collections.<String, String> emptyMap());
+        FieldComponent title = stubTitleView(" 5 ");
+        stubScheduleRow(5L, "PS-1", "Week 41", ScheduleStateStringValues.APPROVED);
+
+        // when
+        productionMaintenanceGanttListeners.fillTitle(view);
+
+        // then
+        verify(title).setFieldValue(scheduleTitle("PS-1 - Week 41", L_SCHEDULE_STATE_PREFIX
+                + ScheduleStateStringValues.APPROVED));
+        verify(productionMaintenanceGanttChartItemResolver, times(1)).parseScheduleId(" 5 ");
+    }
+
+    @Test
+    public final void shouldPassScheduleNumberAndNameToTitleAsPlainText() {
+        // given
+        injectTitleTranslations(Collections.<String, String> emptyMap());
+        FieldComponent title = stubTitleView(L_SCHEDULE_ID);
+        stubScheduleRow(5L, "<b>PS-1</b>", "Week & <i>41</i>", ScheduleStateStringValues.DRAFT);
+
+        // when
+        productionMaintenanceGanttListeners.fillTitle(view);
+
+        // then
+        verify(title).setFieldValue(scheduleTitle("<b>PS-1</b> - Week & <i>41</i>",
+                L_SCHEDULE_STATE_PREFIX + ScheduleStateStringValues.DRAFT));
+    }
+
+    @Test
+    public final void shouldPassTranslatedStateLabelToTitleAsPlainText() {
+        // given
+        injectTitleTranslations(Collections.singletonMap(L_SCHEDULE_STATE_PREFIX + ScheduleStateStringValues.REJECTED,
+                "<b>Rejected</b>"));
+        FieldComponent title = stubTitleView(L_SCHEDULE_ID);
+        stubScheduleRow(5L, "PS-1", "Week 41", ScheduleStateStringValues.REJECTED);
+
+        // when
+        productionMaintenanceGanttListeners.fillTitle(view);
+
+        // then
+        verify(title).setFieldValue(scheduleTitle("PS-1 - Week 41", "<b>Rejected</b>"));
+    }
+
+    @Test
+    public final void shouldUseEmptyStateLabelWhenStateTranslationIsMissing() {
+        // given
+        Map<String, String> translations = new HashMap<String, String>();
+        translations.put(L_SCHEDULE_STATE_PREFIX + ScheduleStateStringValues.DRAFT, null);
+        injectTitleTranslations(translations);
+        FieldComponent title = stubTitleView(L_SCHEDULE_ID);
+        stubScheduleRow(5L, "PS-1", "Week 41", ScheduleStateStringValues.DRAFT);
+
+        // when
+        productionMaintenanceGanttListeners.fillTitle(view);
+
+        // then
+        verify(title).setFieldValue(scheduleTitle("PS-1 - Week 41", ""));
+    }
+
+    @Test
+    public final void shouldIdentifyScheduleByTrimmedNumberWhenNameIsBlank() {
+        // given
+        injectTitleTranslations(Collections.<String, String> emptyMap());
+        FieldComponent title = stubTitleView(L_SCHEDULE_ID);
+        stubScheduleRow(5L, " PS-1 ", " \t ", ScheduleStateStringValues.DRAFT);
+
+        // when
+        productionMaintenanceGanttListeners.fillTitle(view);
+
+        // then
+        verify(title).setFieldValue(scheduleTitle("PS-1", L_SCHEDULE_STATE_PREFIX + ScheduleStateStringValues.DRAFT));
+    }
+
+    @Test
+    public final void shouldIdentifyScheduleByTrimmedNameWhenNumberIsBlank() {
+        // given
+        injectTitleTranslations(Collections.<String, String> emptyMap());
+        FieldComponent title = stubTitleView(L_SCHEDULE_ID);
+        stubScheduleRow(5L, null, " Week 41 ", ScheduleStateStringValues.DRAFT);
+
+        // when
+        productionMaintenanceGanttListeners.fillTitle(view);
+
+        // then
+        verify(title).setFieldValue(scheduleTitle("Week 41", L_SCHEDULE_STATE_PREFIX + ScheduleStateStringValues.DRAFT));
+    }
+
+    @Test
+    public final void shouldFillCaptionWhenScheduleHasNeitherNumberNorName() {
+        // given
+        TranslationService translationService = injectTitleTranslations(Collections.<String, String> emptyMap());
+        FieldComponent title = stubTitleView(L_SCHEDULE_ID);
+        stubScheduleRow(5L, " ", null, ScheduleStateStringValues.DRAFT);
+
+        // when
+        productionMaintenanceGanttListeners.fillTitle(view);
+
+        // then
+        verify(title).setFieldValue(ProductionMaintenanceGanttListeners.TITLE_TRANSLATION_KEY);
+        verify(translationService, never()).translate(
+                Matchers.eq(ProductionMaintenanceGanttListeners.SCHEDULE_TITLE_TRANSLATION_KEY), any(Locale.class),
+                Matchers.<String> anyVararg());
+        verify(translationService, never()).translate(
+                Matchers.eq(L_SCHEDULE_STATE_PREFIX + ScheduleStateStringValues.DRAFT), any(Locale.class),
+                Matchers.<String> anyVararg());
+    }
+
+    @Test
+    public final void shouldLabelEveryDeclaredScheduleStateWithItsStateTranslation() {
+        // given
+        injectTitleTranslations(Collections.<String, String> emptyMap());
+        FieldComponent title = stubTitleView(L_SCHEDULE_ID);
+        List<String> expectedTitles = new ArrayList<String>();
+
+        for (ScheduleState state : ScheduleState.values()) {
+            expectedTitles.add(scheduleTitle("PS-1 - Week 41", L_SCHEDULE_STATE_PREFIX + state.getStringValue()));
+        }
+
+        // when
+        for (ScheduleState state : ScheduleState.values()) {
+            stubScheduleRow(5L, "PS-1", "Week 41", state.getStringValue());
+
+            productionMaintenanceGanttListeners.fillTitle(view);
+        }
+
+        // then
+        ArgumentCaptor<Object> titleCaptor = ArgumentCaptor.forClass(Object.class);
+
+        verify(title, times(ScheduleState.values().length)).setFieldValue(titleCaptor.capture());
+        assertEquals(3, ScheduleState.values().length);
+        assertEquals(expectedTitles, titleCaptor.getAllValues());
+    }
+
+    @Test
+    public final void shouldLabelScheduleWithoutStateAsUnspecified() {
+        // given
+        injectTitleTranslations(Collections.<String, String> emptyMap());
+        FieldComponent title = stubTitleView(L_SCHEDULE_ID);
+        String expectedTitle = scheduleTitle("PS-1 - Week 41",
+                ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNSPECIFIED_KEY);
+
+        // when
+        stubScheduleRow(5L, "PS-1", "Week 41", null);
+        productionMaintenanceGanttListeners.fillTitle(view);
+        stubScheduleRow(5L, "PS-1", "Week 41", "  ");
+        productionMaintenanceGanttListeners.fillTitle(view);
+
+        // then
+        verify(title, times(2)).setFieldValue(expectedTitle);
+    }
+
+    @Test
+    public final void shouldLabelScheduleWithUndeclaredStateAsUnknownWithoutTranslatingTheState() {
+        // given
+        TranslationService translationService = injectTitleTranslations(Collections.<String, String> emptyMap());
+        FieldComponent title = stubTitleView(L_SCHEDULE_ID);
+        stubScheduleRow(5L, "PS-1", "Week 41", "09archived");
+
+        // when
+        productionMaintenanceGanttListeners.fillTitle(view);
+
+        // then
+        verify(title).setFieldValue(scheduleTitle("PS-1 - Week 41",
+                ProductionMaintenanceGanttChartItemResolver.ITEM_STATE_UNKNOWN_KEY));
+        verify(translationService, never()).translate(Matchers.eq(L_SCHEDULE_STATE_PREFIX + "09archived"),
+                any(Locale.class), Matchers.<String> anyVararg());
+    }
+
+    @Test
+    public final void shouldFillCaptionWithoutQueryWhenScheduleIdIsMissing() {
+        // given
+        injectTitleTranslations(Collections.<String, String> emptyMap());
+        FieldComponent title = stubTitleView(null);
+
+        // when
+        productionMaintenanceGanttListeners.fillTitle(view);
+
+        // then
+        verify(title).setFieldValue(ProductionMaintenanceGanttListeners.TITLE_TRANSLATION_KEY);
+        verify(title).requestComponentUpdateState();
+        verifyZeroInteractions(dataDefinitionService);
+    }
+
+    @Test
+    public final void shouldFillCaptionWithoutQueryWhenScheduleIdIsMalformed() {
+        // given
+        injectTitleTranslations(Collections.<String, String> emptyMap());
+        FieldComponent title = stubTitleView("5a");
+
+        // when
+        productionMaintenanceGanttListeners.fillTitle(view);
+
+        // then
+        verify(title).setFieldValue(ProductionMaintenanceGanttListeners.TITLE_TRANSLATION_KEY);
+        verify(productionMaintenanceGanttChartItemResolver, times(1)).parseScheduleId("5a");
+        verifyZeroInteractions(dataDefinitionService);
+    }
+
+    @Test
+    public final void shouldFillCaptionWhenScheduleIsUnknown() {
+        // given
+        injectTitleTranslations(Collections.<String, String> emptyMap());
+        FieldComponent title = stubTitleView(L_SCHEDULE_ID);
+        stubScheduleRow(5L, null);
+
+        // when
+        productionMaintenanceGanttListeners.fillTitle(view);
+
+        // then
+        verify(title).setFieldValue(ProductionMaintenanceGanttListeners.TITLE_TRANSLATION_KEY);
+        verify(scheduleQuery, times(1)).setLong("scheduleId", 5L);
+        verify(scheduleQuery, times(1)).uniqueResult();
     }
 
     @Test
@@ -504,7 +778,7 @@ public class ProductionMaintenanceGanttListenersTest {
         // then
         verify(view, never()).getComponentByReference(anyString());
         verify(view, never()).getLocale();
-        verifyZeroInteractions(translationService);
+        verifyZeroInteractions(translationService, gantt, dataDefinitionService, productionMaintenanceGanttChartItemResolver);
     }
 
     private TranslationService injectTranslationService() {
@@ -513,6 +787,122 @@ public class ProductionMaintenanceGanttListenersTest {
         setField(productionMaintenanceGanttListeners, "translationService", translationService);
 
         return translationService;
+    }
+
+    /**
+     * Injects a translation service that answers every code of the given map with its text, and every other code with the
+     * code followed by its arguments in brackets when there are any.
+     */
+    private TranslationService injectTitleTranslations(final Map<String, String> translations) {
+        TranslationService translationService = injectTranslationService();
+
+        given(translationService.translate(anyString(), any(Locale.class), Matchers.<String> anyVararg())).willAnswer(
+                new TitleTranslationAnswer(translations));
+
+        return translationService;
+    }
+
+    /**
+     * Stubs an initialized view in {@link Locale#ENGLISH} whose {@code title} reference is a new field mock, which is
+     * returned, and whose {@code gantt} reference is the mocked component holding the given schedule id context value.
+     */
+    private FieldComponent stubTitleView(final String contextScheduleId) {
+        FieldComponent title = mock(FieldComponent.class);
+
+        given(view.isViewAfterReload()).willReturn(false);
+        given(view.getLocale()).willReturn(Locale.ENGLISH);
+        given(view.getComponentByReference("title")).willReturn(title);
+        given(view.getComponentByReference("gantt")).willReturn(gantt);
+        given(gantt.getContextValue(ProductionMaintenanceGanttChartItemResolver.CONTEXT_SCHEDULE_ID)).willReturn(
+                contextScheduleId);
+
+        return title;
+    }
+
+    /**
+     * Stubs the {@link ProductionMaintenanceGanttListeners#SCHEDULE_TITLE_QUERY} of the given schedule id to answer a row
+     * with the given number, name and state.
+     */
+    private void stubScheduleRow(final Long scheduleId, final String number, final String name, final String state) {
+        Entity row = mock(Entity.class);
+
+        given(row.getStringField("scheduleNumber")).willReturn(number);
+        given(row.getStringField("scheduleName")).willReturn(name);
+        given(row.getStringField("scheduleState")).willReturn(state);
+
+        stubScheduleRow(scheduleId, row);
+    }
+
+    /**
+     * Stubs the {@link ProductionMaintenanceGanttListeners#SCHEDULE_TITLE_QUERY} of the given schedule id to answer the given
+     * row, null for an unknown schedule.
+     */
+    private void stubScheduleRow(final Long scheduleId, final Entity row) {
+        given(dataDefinitionService.get(OrdersConstants.PLUGIN_IDENTIFIER, OrdersConstants.MODEL_PRODUCTION_LINE_SCHEDULE))
+                .willReturn(scheduleDD);
+        given(scheduleDD.find(ProductionMaintenanceGanttListeners.SCHEDULE_TITLE_QUERY)).willReturn(scheduleQuery);
+        given(scheduleQuery.setLong("scheduleId", scheduleId)).willReturn(scheduleQuery);
+        given(scheduleQuery.uniqueResult()).willReturn(row);
+    }
+
+    /**
+     * Returns the title {@link TitleTranslationAnswer} gives for the given identification and state label code or text.
+     */
+    private static String scheduleTitle(final String identification, final String stateLabel) {
+        return ProductionMaintenanceGanttListeners.SCHEDULE_TITLE_TRANSLATION_KEY + "[" + identification + "|" + stateLabel
+                + "]";
+    }
+
+    /**
+     * Answers a translation of a code of the given map with its text, and of every other code with the code followed by
+     * its arguments, joined with {@code |}, in brackets when there are any.
+     */
+    private static final class TitleTranslationAnswer implements Answer<String> {
+
+        private final Map<String, String> translations;
+
+        private TitleTranslationAnswer(final Map<String, String> translations) {
+            this.translations = translations;
+        }
+
+        @Override
+        public String answer(final InvocationOnMock invocation) {
+            Object[] arguments = invocation.getArguments();
+            String code = (String) arguments[0];
+
+            if (translations.containsKey(code)) {
+                return translations.get(code);
+            }
+
+            List<String> translationArgs = new ArrayList<String>();
+
+            for (int index = 2; index < arguments.length; index++) {
+                Object argument = arguments[index];
+
+                if (argument instanceof String[]) {
+                    translationArgs.addAll(Arrays.asList((String[]) argument));
+                } else {
+                    translationArgs.add((String) argument);
+                }
+            }
+
+            if (translationArgs.isEmpty()) {
+                return code;
+            }
+
+            StringBuilder translation = new StringBuilder(code).append('[');
+
+            for (int index = 0; index < translationArgs.size(); index++) {
+                if (index > 0) {
+                    translation.append('|');
+                }
+
+                translation.append(translationArgs.get(index));
+            }
+
+            return translation.append(']').toString();
+        }
+
     }
 
 }
